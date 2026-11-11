@@ -4,6 +4,7 @@ from alembic import context
 from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import Connection
 
+from civitas.infrastructure.db import jobs_models, ledger_models  # noqa: F401
 from civitas.infrastructure.db.models import Base
 
 

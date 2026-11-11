@@ -20,9 +20,10 @@ USER_ID = 456
 JOINED_AT = datetime(2026, 11, 11, tzinfo=UTC)
 
 
-def fake_interaction(guild_id=GUILD_ID, user_id=USER_ID):
+def fake_interaction(guild_id=GUILD_ID, user_id=USER_ID, locale=discord.Locale.russian):
     return SimpleNamespace(
         guild_id=guild_id,
+        locale=locale,
         user=SimpleNamespace(id=user_id),
         response=SimpleNamespace(
             send_message=AsyncMock(),
@@ -69,6 +70,18 @@ async def test_setup_syncs_commands_only_in_configured_guild(monkeypatch):
     }
     assert get_command(bot, "register").qualified_name == "citizen register"
     assert bot.intents.value == discord.Intents.none().value
+    group = bot.tree.get_command("citizen", guild=bot.guild_scope)
+    payload = await group.get_translated_payload(bot.tree, bot.tree.translator)
+    assert payload["description"] == "Civitas citizenship"
+    assert payload["description_localizations"] == {"ru": "Гражданство Civitas"}
+    assert payload["options"][0]["name"] == "register"
+    assert payload["options"][0]["description_localizations"] == {"ru": "Оформить гражданство"}
+
+
+def test_role_sync_enables_only_the_guild_intent():
+    bot = create_bot(citizens_service=Mock(spec=CitizensService), guild_id=GUILD_ID, sync_roles=True)
+
+    assert bot.intents == discord.Intents(guilds=True)
 
 
 @pytest.mark.asyncio
@@ -84,6 +97,26 @@ async def test_start_links_registration_and_profile():
     assert response.kwargs == {"ephemeral": True}
     assert "/citizen register" in response.args[0]
     assert "/profile" in response.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locale", [discord.Locale.american_english, discord.Locale.german])
+async def test_english_registration_and_profile(locale):
+    service = Mock(spec=CitizensService)
+    record = citizen_record(CitizenStatus.VERIFIED)
+    service.register.return_value = RegistrationResult(record, RegistrationOutcome.CREATED)
+    service.get_profile.return_value = record
+    bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
+
+    registration = fake_interaction(locale=locale)
+    await get_command(bot, "register").callback(registration)
+    assert registration.followup.send.await_args.args[0].startswith(
+        "Citizenship granted. Citizenship status: verified."
+    )
+
+    profile = fake_interaction(locale=locale)
+    await get_command(bot, "profile").callback(profile)
+    profile.followup.send.assert_awaited_once_with("Citizenship status: verified.", ephemeral=True)
 
 
 @pytest.mark.asyncio

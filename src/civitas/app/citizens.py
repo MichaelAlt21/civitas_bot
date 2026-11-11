@@ -1,6 +1,6 @@
 """Authorize registration and profile access for the configured guild."""
 
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -53,13 +53,14 @@ class CitizensRepository(Protocol):
     async def append_audit(self, event: CitizenAuditEvent) -> None: ...
 
 
-class CitizensService:
+class CitizensService[Repository: CitizensRepository]:
     def __init__(
         self,
-        unit_of_work: Callable[[], AbstractAsyncContextManager[CitizensRepository]],
+        unit_of_work: Callable[[], AbstractAsyncContextManager[Repository]],
         *,
         guild_id: int,
         allowed_user_ids: Iterable[int],
+        fund_verified: Callable[[Repository, Citizen], Awaitable[object]] | None = None,
     ) -> None:
         if not is_discord_id(guild_id):
             raise ValueError("guild_id must be a Discord snowflake")
@@ -69,6 +70,7 @@ class CitizensService:
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
         self._allowed_user_ids = frozenset(allowed_ids)
+        self._fund_verified = fund_verified
 
     def authorize(self, guild_id: int | None, user_id: int) -> None:
         if not is_discord_id(guild_id) or guild_id != self._guild_id:
@@ -85,17 +87,20 @@ class CitizensService:
                 await repository.append_audit(
                     CitizenAuditEvent(citizen, CitizenAuditAction.REGISTERED, now, "discord_allowlist")
                 )
-                return RegistrationResult(citizen, RegistrationOutcome.CREATED)
-
-            if citizen.status == CitizenStatus.LEFT:
+                outcome = RegistrationOutcome.CREATED
+            elif citizen.status == CitizenStatus.LEFT:
                 citizen = replace(citizen, status=CitizenStatus.VERIFIED, verified_at=now)
                 await repository.restore(citizen)
                 await repository.append_audit(
                     CitizenAuditEvent(citizen, CitizenAuditAction.RESTORED, now, "discord_allowlist")
                 )
-                return RegistrationResult(citizen, RegistrationOutcome.RESTORED)
+                outcome = RegistrationOutcome.RESTORED
+            else:
+                outcome = RegistrationOutcome.EXISTING
 
-            return RegistrationResult(citizen, RegistrationOutcome.EXISTING)
+            if self._fund_verified is not None and citizen.status is CitizenStatus.VERIFIED:
+                await self._fund_verified(repository, citizen)
+            return RegistrationResult(citizen, outcome)
 
     async def get_profile(self, guild_id: int | None, user_id: int) -> Citizen | None:
         self.authorize(guild_id, user_id)

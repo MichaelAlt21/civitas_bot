@@ -38,6 +38,7 @@ class CitizenRow(Base):
     __tablename__ = "citizens"
     __table_args__ = (
         UniqueConstraint("guild_id", "discord_user_id", name="uq_citizens_guild_user"),
+        UniqueConstraint("guild_id", "id", name="uq_citizens_guild_id"),
         CheckConstraint(
             "discord_user_id BETWEEN 1 AND 18446744073709551615",
             name="ck_citizens_discord_user_id",

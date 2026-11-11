@@ -38,6 +38,15 @@ class PostgresCitizensRepository:
         )
         return _to_citizen(row) if row is not None else None
 
+    async def list_role_members(self, guild_id: int) -> tuple[Citizen, ...]:
+        rows = await self._session.scalars(
+            select(CitizenRow)
+            .join(GuildRow, GuildRow.id == CitizenRow.guild_id)
+            .where(GuildRow.discord_guild_id == Decimal(guild_id))
+            .order_by(CitizenRow.id)
+        )
+        return tuple(_to_citizen(row) for row in rows)
+
     async def _get_or_create_guild(self, guild_id: int, now: datetime) -> int:
         discord_guild_id = Decimal(guild_id)
         local_id = await self._session.scalar(

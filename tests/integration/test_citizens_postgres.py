@@ -48,7 +48,7 @@ async def _table_counts(engine: AsyncEngine) -> tuple[int, int, int]:
 async def test_migration_and_registration_audit(pg_engine: AsyncEngine) -> None:
     async with pg_engine.connect() as connection:
         tables = await connection.run_sync(lambda conn: inspect(conn).get_table_names())
-    assert set(tables) == {"guilds", "citizens", "audit_events", "alembic_version"}
+    assert {"guilds", "citizens", "audit_events", "alembic_version"} <= set(tables)
 
     service = _service(pg_engine)
     assert await service.get_profile(GUILD_ID, USER_ID) is None
@@ -166,3 +166,41 @@ async def test_denied_registrations_do_not_write(pg_engine: AsyncEngine) -> None
         with pytest.raises(CitizenshipAccessError):
             await service.register(guild_id, user_id)
     assert await _table_counts(pg_engine) == (0, 0, 0)
+
+
+async def test_role_reconciliation_reads_all_statuses_in_one_guild(
+    pg_engine: AsyncEngine,
+) -> None:
+    unit_of_work = PostgresCitizenUnitOfWork(pg_engine)
+    async with unit_of_work() as repository:
+        assert await repository.list_role_members(GUILD_ID) == ()
+    assert await _table_counts(pg_engine) == (0, 0, 0)
+
+    statuses = {
+        USER_ID: CitizenStatus.VERIFIED,
+        USER_ID - 1: CitizenStatus.PENDING,
+        USER_ID - 2: CitizenStatus.SUSPENDED,
+        USER_ID - 3: CitizenStatus.LEFT,
+    }
+    service = CitizensService(
+        unit_of_work, guild_id=GUILD_ID, allowed_user_ids=statuses.keys()
+    )
+    for user_id, status in statuses.items():
+        citizen = (await service.register(GUILD_ID, user_id)).citizen
+        async with pg_engine.begin() as connection:
+            await connection.execute(
+                update(CitizenRow).where(CitizenRow.id == citizen.id).values(status=status.value)
+            )
+
+    foreign_guild = GUILD_ID - 1
+    foreign_service = CitizensService(
+        unit_of_work, guild_id=foreign_guild, allowed_user_ids={USER_ID}
+    )
+    foreign_citizen = (await foreign_service.register(foreign_guild, USER_ID)).citizen
+
+    async with unit_of_work() as repository:
+        members = await repository.list_role_members(GUILD_ID)
+        assert await repository.list_role_members(foreign_guild) == (foreign_citizen,)
+        assert await repository.list_role_members(GUILD_ID - 2) == ()
+    assert [(member.discord_user_id, member.status) for member in members] == list(statuses.items())
+    assert await _table_counts(pg_engine) == (2, 5, 5)

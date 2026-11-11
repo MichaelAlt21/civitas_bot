@@ -67,6 +67,7 @@
 - Unit: налогообложение, разрешённые переходы статусов, валидация бюджетов, RBAC.
 - Integration: реальные PostgreSQL transactions, concurrent transfers, unique constraints, повторная выдача, row-locks, backfill.
 - Discord stub: обработчики взаимодействий, ephemeral, ошибки прав, идентификаторы.
+- Для гражданства Discord stub проверяет RU/EN для ответов и описаний, английский для остальных локалей, выдачу и снятие настроенной роли по статусу, повтор после сбоя и отсутствие изменений при совпадении роли со статусом.
 - Manual test-guild: roles, button click, timeout, text length, accessibility.
 - Recovery: DB backup/restore, повтор worker после kill, отказ сети Discord.
 
