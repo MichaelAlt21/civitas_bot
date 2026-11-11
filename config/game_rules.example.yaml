@@ -1,0 +1,80 @@
+# Civitas — предлагаемые параметры, НЕ утверждённые настройки production.
+# После обсуждения нужно явно зафиксировать их как GAME_RULES v1.
+project:
+  name: "Civitas"
+  mode: "discord_only"
+  currency_name: "кредит"
+  currency_symbol: "₵"
+  timezone: "UTC"  # ВРЕМЕННЫЙ пример; подтвердить часовой пояс игрового сервера
+  max_expected_players: 30
+
+citizenship:
+  requires_manual_approval: true   # PROPOSED; режим допуска уточнить
+  starter_grant: 250
+  starter_grant_once: true
+  citizen_per_discord_user_per_guild: 1
+
+government:
+  structure: "parliamentary_presidential_republic"
+  permanent_offices_min_eligible_citizens: 10
+  president_seats: 1
+  parliament_seats: 3
+  term_days: 28
+  election_voting_hours: 48
+  quorum_fraction: 0.40
+  quorum_min_votes: 4
+  law_discussion_hours: 24
+  parliamentary_vote_hours: 48
+  ordinary_law_min_yes_votes: 2
+  election_result_certification_reviewers: 2  # исключения описываются и аудируются
+
+economy:
+  currency_unit: "integer"
+  treasury_genesis: 8000
+  company_registration_fee: 150
+  company_sales_tax_bp: 1000 # 1000 basis points = 10%
+  secondhand_asset_tax_bp: 200 # R1.1+, 2%
+  default_private_transfer_tax_bp: 0
+  ordinary_accounts_can_be_negative: false
+  discretionary_mint_enabled: false
+  discretionary_mint_weekly_cap: 400 # ИСПОЛЬЗОВАТЬ ТОЛЬКО если emission_enabled будет утверждено
+  company_limit_per_founder: 1
+
+budget:
+  period: "weekly"
+  overall_spending_cap: 800
+  npc_work_cap: 300
+  government_wages_cap: 120
+  public_contracts_cap: 250
+  events_and_grants_cap: 130
+  # сумма статей = 800; начисления NPC-работ = трансфер из казны
+
+jobs:
+  npc_work_weekly_per_citizen_cap: 100
+  npc_work_reward_min: 10
+  npc_work_reward_max: 40
+  automated_random_unlimited_rewards: false
+
+assets:
+  primary_market_enabled: true
+  secondary_market_enabled: false
+  rentals_enabled: false
+  mortgage_enabled: false
+  player_character_stats: false
+
+features:
+  citizens: true
+  ledger: true
+  companies: true
+  npc_jobs: true
+  company_orders: true
+  treasury: true
+  property_primary_market: true
+  external_election_protocols: true
+  automated_elections: false
+  automated_lawmaking: false
+  long_term_employment_contracts: false
+  character_system: false
+  health_system: false
+  aging_and_inheritance: false
+  website: false
