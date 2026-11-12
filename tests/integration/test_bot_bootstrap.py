@@ -6,13 +6,13 @@ from sqlalchemy import func, select
 
 from civitas import __main__ as entrypoint
 from civitas.bot.client import CivitasBot
-from civitas.config import JobsSettings, Settings, WalletSettings
+from civitas.config import JobsSettings, MarketSettings, Settings, TreasurySettings, WalletSettings
 from civitas.domain.ledger import TransactionKind
 from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
 
 
 @pytest.mark.asyncio
-async def test_bot_bootstrap_wires_citizens_wallet_and_jobs_without_discord(pg_engine, monkeypatch):
+async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, monkeypatch):
     settings = Settings(
         database_url="unused-by-test",
         discord_token="test-token",
@@ -29,6 +29,15 @@ async def test_bot_bootstrap_wires_citizens_wallet_and_jobs_without_discord(pg_e
             budget_timezone=UTC,
             cooldown_minutes=0,
         ),
+        market=MarketSettings(
+            company_fee=150, company_limit_per_owner=1, sales_tax_basis_points=1000,
+            arbiter_ids=frozenset({201}),
+        ),
+        asset_issuer_ids=frozenset({201}),
+        treasury=TreasurySettings(
+            initiator_ids=frozenset({201}), approver_ids=frozenset({202}), budget_weekly_limit=800,
+            contract_weekly_limit=250, budget_timezone=UTC,
+        ),
     )
     command_names = set()
     sync = AsyncMock()
@@ -44,7 +53,9 @@ async def test_bot_bootstrap_wires_citizens_wallet_and_jobs_without_discord(pg_e
     monkeypatch.setattr(CivitasBot, "start", start_without_network)
     await entrypoint.run_bot(settings)
 
-    assert command_names == {"start", "citizen", "profile", "wallet", "jobs"}
+    assert command_names == {
+        "start", "citizen", "profile", "wallet", "jobs", "company", "market", "assets", "treasury", "contracts",
+    }
     assert sync.await_count == 1
     async with pg_engine.connect() as connection:
         assert await connection.scalar(

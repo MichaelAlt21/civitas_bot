@@ -72,3 +72,4 @@ class BudgetPeriod:
     caps: BudgetCaps
     spent_total: int
     spent_npc: int
+    reserved_total: int = 0

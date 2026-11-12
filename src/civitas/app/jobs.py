@@ -335,7 +335,7 @@ class JobService:
         period = await repository.get_or_create_budget_period(
             task.guild_id, start, end, now, self._rules.caps, week_start_date=week_start_date
         )
-        if period.spent_total + task.reward > period.caps.overall:
+        if period.spent_total + period.reserved_total + task.reward > period.caps.overall:
             raise JobError(JobErrorReason.OVERALL_LIMIT)
         if period.spent_npc + task.reward > period.caps.npc:
             raise JobError(JobErrorReason.NPC_LIMIT)

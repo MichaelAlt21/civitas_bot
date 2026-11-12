@@ -12,6 +12,8 @@ class AccountKind(StrEnum):
     ISSUER = "ISSUER"
     TREASURY = "TREASURY"
     PERSONAL = "PERSONAL"
+    COMPANY = "COMPANY"
+    ESCROW = "ESCROW"
 
 
 class TransactionKind(StrEnum):
@@ -19,6 +21,12 @@ class TransactionKind(StrEnum):
     STARTER_GRANT = "STARTER_GRANT"
     TRANSFER = "TRANSFER"
     NPC_PAYOUT = "NPC_PAYOUT"
+    COMPANY_FEE = "COMPANY_FEE"
+    ORDER_FUND = "ORDER_FUND"
+    ORDER_SETTLE = "ORDER_SETTLE"
+    ORDER_REFUND = "ORDER_REFUND"
+    ASSET_PURCHASE = "ASSET_PURCHASE"
+    STATE_CONTRACT_PAYOUT = "STATE_CONTRACT_PAYOUT"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +35,8 @@ class Account:
     guild_id: int
     kind: AccountKind
     citizen_id: int | None
+    company_id: int | None = None
+    order_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

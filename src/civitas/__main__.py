@@ -5,22 +5,30 @@ import logging
 import os
 import sys
 
+from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
 from civitas.app.jobs import JobService, JobsRules
+from civitas.app.market import MarketRules, MarketService
+from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.bot import create_bot
+from civitas.bot.assets import add_asset_commands
 from civitas.bot.jobs import add_job_commands
+from civitas.bot.market import add_market_commands
 from civitas.bot.roles import run_role_sync
+from civitas.bot.treasury import add_treasury_commands
 from civitas.config import ConfigurationError, Settings, load_settings
+from civitas.domain.jobs import BudgetCaps
 from civitas.infrastructure.db import create_db_engine
-from civitas.infrastructure.db.jobs import PostgresJobsUnitOfWork
+from civitas.infrastructure.db.treasury import PostgresTreasuryUnitOfWork
 
 
 async def run_bot(settings: Settings) -> None:
     engine = create_db_engine(settings.database_url)
     try:
-        unit_of_work = PostgresJobsUnitOfWork(engine)
+        unit_of_work = PostgresTreasuryUnitOfWork(engine)
         wallet_settings = settings.wallet
+        currency_symbol = wallet_settings.currency_symbol if wallet_settings else "₵"
         funding = None
         if wallet_settings is not None:
             funding = WalletFunding(
@@ -47,7 +55,7 @@ async def run_bot(settings: Settings) -> None:
             guild_id=settings.guild_id,
             sync_roles=settings.citizen_role_id is not None,
             wallet_service=wallet,
-            currency_symbol=wallet_settings.currency_symbol if wallet_settings else "₵",
+            currency_symbol=currency_symbol,
         )
         job_settings = settings.jobs
         if job_settings is not None:
@@ -70,7 +78,59 @@ async def run_bot(settings: Settings) -> None:
                 bot.tree,
                 guild_scope=bot.guild_scope,
                 job_service=jobs,
-                currency_symbol=wallet_settings.currency_symbol if wallet_settings else "₵",
+                currency_symbol=currency_symbol,
+            )
+        market_settings = settings.market
+        if market_settings is not None and funding is not None:
+            market = MarketService(
+                unit_of_work,
+                guild_id=settings.guild_id,
+                authorize=service.authorize,
+                arbiter_user_ids=market_settings.arbiter_ids,
+                rules=MarketRules(
+                    registration_fee=market_settings.company_fee,
+                    sales_tax_bp=market_settings.sales_tax_basis_points,
+                    company_limit=market_settings.company_limit_per_owner,
+                ),
+                funding=funding,
+            )
+            add_market_commands(
+                bot.tree,
+                guild_scope=bot.guild_scope,
+                market_service=market,
+                currency_symbol=currency_symbol,
+            )
+        if settings.asset_issuer_ids and funding is not None:
+            assets = AssetService(
+                unit_of_work,
+                guild_id=settings.guild_id,
+                authorize=service.authorize,
+                staff_user_ids=settings.asset_issuer_ids,
+                funding=funding,
+            )
+            add_asset_commands(
+                bot.tree, guild_scope=bot.guild_scope, asset_service=assets, currency_symbol=currency_symbol,
+            )
+        treasury_settings = settings.treasury
+        if treasury_settings is not None:
+            treasury = TreasuryService(
+                unit_of_work,
+                guild_id=settings.guild_id,
+                authorize=service.authorize,
+                initiator_user_ids=treasury_settings.initiator_ids,
+                approver_user_ids=treasury_settings.approver_ids,
+                rules=TreasuryRules(
+                    caps=BudgetCaps(
+                        overall=treasury_settings.budget_weekly_limit,
+                        npc=job_settings.npc_weekly_limit if job_settings else 0,
+                        per_citizen=job_settings.personal_weekly_limit if job_settings else 0,
+                    ),
+                    contracts_weekly_limit=treasury_settings.contract_weekly_limit,
+                    budget_timezone=treasury_settings.budget_timezone,
+                ),
+            )
+            add_treasury_commands(
+                bot.tree, guild_scope=bot.guild_scope, treasury_service=treasury, currency_symbol=currency_symbol,
             )
         async with bot, run_role_sync(
             bot, unit_of_work, guild_id=settings.guild_id, role_id=settings.citizen_role_id

@@ -52,12 +52,13 @@
 | `/assets catalog` | гражданин | каталог государственного имущества |
 | `/assets buy` | гражданин/компания | купить объект |
 | `/assets mine` | собственник | список имущества |
+| `/assets staff issue` | уполномоченный сотрудник | выставить уникальный объект от государства с ценой и основанием |
 | `/treasury report` | все | публичный отчёт |
 | `/government offices` | все | действующие чиновники и сроки |
 | `/election results` | все | подтверждённый протокол голосования |
 | `/help` | все | навигация |
 
-Администраторские: `/admin audit`, `/admin budgets`, `/admin election certify`, `/admin assets issue`, `/admin maintenance`. Доступ — из внутреннего authorization layer.
+Администраторские: `/admin audit`, `/admin budgets`, `/admin election certify`, `/admin maintenance`. Доступ — из внутреннего authorization layer.
 
 `/law propose` и `/law vote` — этап NEXT; на R1 инициативы можно оформлять форумными темами и опросами.
 

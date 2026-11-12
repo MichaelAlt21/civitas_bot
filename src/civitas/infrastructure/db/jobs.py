@@ -230,6 +230,7 @@ class PostgresJobsRepository(PostgresLedgerRepository):
             caps=BudgetCaps(overall=period.overall_cap, npc=article.cap, per_citizen=article.personal_cap),
             spent_total=period.spent_total,
             spent_npc=article.spent,
+            reserved_total=period.reserved_total,
         )
 
     async def _create_budget_period(

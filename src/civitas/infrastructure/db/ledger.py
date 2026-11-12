@@ -21,6 +21,7 @@ from civitas.domain.ledger import (
 )
 
 from .citizens import PostgresCitizensRepository, _to_citizen
+from .jobs_models import BudgetPeriodRow
 from .ledger_models import FinancialAccountRow, FinancialTransactionRow, LedgerEntryRow
 from .models import CitizenRow, GuildRow
 
@@ -51,9 +52,29 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
     async def ensure_account(
         self, guild_id: int, kind: AccountKind, citizen_id: int | None = None
     ) -> Account:
+        return await self._ensure_account(guild_id, kind, citizen_id=citizen_id)
+
+    async def ensure_company_account(self, guild_id: int, company_id: int) -> Account:
+        return await self._ensure_account(guild_id, AccountKind.COMPANY, company_id=company_id)
+
+    async def ensure_escrow_account(self, guild_id: int, order_id: int) -> Account:
+        return await self._ensure_account(guild_id, AccountKind.ESCROW, order_id=order_id)
+
+    async def _ensure_account(
+        self,
+        guild_id: int,
+        kind: AccountKind,
+        *,
+        citizen_id: int | None = None,
+        company_id: int | None = None,
+        order_id: int | None = None,
+    ) -> Account:
         row = await self._session.scalar(
             insert(FinancialAccountRow)
-            .values(guild_id=guild_id, kind=kind.value, citizen_id=citizen_id)
+            .values(
+                guild_id=guild_id, kind=kind.value, citizen_id=citizen_id,
+                organization_id=company_id, order_id=order_id,
+            )
             .on_conflict_do_nothing(constraint="uq_financial_accounts_owner")
             .returning(FinancialAccountRow)
         )
@@ -64,11 +85,14 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
                         FinancialAccountRow.guild_id == guild_id,
                         FinancialAccountRow.kind == kind.value,
                         FinancialAccountRow.citizen_id == citizen_id,
+                        FinancialAccountRow.organization_id == company_id,
+                        FinancialAccountRow.order_id == order_id,
                     )
                 )
             ).one()
         return Account(
-            id=row.id, guild_id=row.guild_id, kind=AccountKind(row.kind), citizen_id=row.citizen_id
+            id=row.id, guild_id=row.guild_id, kind=AccountKind(row.kind),
+            citizen_id=row.citizen_id, company_id=row.organization_id, order_id=row.order_id,
         )
 
     async def get_balance(self, account_id: int) -> int:
@@ -78,6 +102,14 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
             )
         )
         return int(balance)
+
+    async def _reserved_treasury_cash(self, guild_id: int) -> int:
+        reserved = await self._session.scalar(
+            select(func.coalesce(func.sum(BudgetPeriodRow.reserved_total), 0)).where(
+                BudgetPeriodRow.guild_id == guild_id
+            )
+        )
+        return int(reserved)
 
     async def get_history(self, account_id: int, limit: int) -> tuple[HistoryEntry, ...]:
         rows = await self._session.execute(
@@ -191,6 +223,12 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
             balance = current.get(account.id, 0) + entries[account.id]
             if account.kind != AccountKind.ISSUER and balance < 0:
                 raise LedgerError(LedgerErrorReason.INSUFFICIENT_FUNDS)
+            if (
+                account.kind == AccountKind.TREASURY
+                and entries[account.id] < 0
+                and balance < await self._reserved_treasury_cash(guild_id)
+            ):
+                raise LedgerError(LedgerErrorReason.INSUFFICIENT_FUNDS)
             if not _MIN_BIGINT <= balance <= MAX_AMOUNT:
                 raise LedgerError(LedgerErrorReason.BALANCE_OVERFLOW)
 
@@ -234,6 +272,37 @@ def _validate_accounts(
     accounts: list[FinancialAccountRow],
     entries: Mapping[int, int],
 ) -> None:
+    if kind == TransactionKind.STATE_CONTRACT_PAYOUT:
+        if (
+            len(accounts) == 2
+            and key.startswith("state_contract_payout:")
+            and any(account.kind == AccountKind.TREASURY and entries[account.id] < 0
+                    for account in accounts)
+            and any(account.kind in (AccountKind.PERSONAL, AccountKind.COMPANY)
+                    and entries[account.id] > 0 for account in accounts)
+        ):
+            return
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
+    if kind == TransactionKind.ASSET_PURCHASE:
+        if (
+            len(accounts) == 2
+            and key.startswith("asset_purchase:")
+            and any(account.kind in (AccountKind.PERSONAL, AccountKind.COMPANY)
+                    and entries[account.id] < 0 for account in accounts)
+            and any(account.kind == AccountKind.TREASURY and entries[account.id] > 0
+                    for account in accounts)
+        ):
+            return
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
+    if kind in {
+        TransactionKind.COMPANY_FEE, TransactionKind.ORDER_FUND,
+        TransactionKind.ORDER_SETTLE, TransactionKind.ORDER_REFUND,
+    }:
+        _validate_market_accounts(kind, key, accounts, entries)
+        return
+
     if kind == TransactionKind.NPC_PAYOUT:
         if (
             len(accounts) == 2
@@ -247,7 +316,9 @@ def _validate_accounts(
         raise LedgerError(LedgerErrorReason.INVALID_POSTING)
 
     issuers = [account for account in accounts if account.kind == AccountKind.ISSUER]
-    if kind == TransactionKind.TRANSFER and not issuers:
+    if kind == TransactionKind.TRANSFER and all(
+        account.kind in (AccountKind.PERSONAL, AccountKind.TREASURY) for account in accounts
+    ):
         return
     if len(accounts) == 2 and len(issuers) == 1 and entries[issuers[0].id] < 0:
         recipient = next(account for account in accounts if account.id != issuers[0].id)
@@ -264,6 +335,33 @@ def _validate_accounts(
         ):
             return
     raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
+
+def _validate_market_accounts(
+    kind: TransactionKind,
+    key: str,
+    accounts: list[FinancialAccountRow],
+    entries: Mapping[int, int],
+) -> None:
+    if not key.startswith(f"{kind.value.lower()}:"):
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
+    debits = [AccountKind(account.kind) for account in accounts if entries[account.id] < 0]
+    credits = [AccountKind(account.kind) for account in accounts if entries[account.id] > 0]
+    if kind == TransactionKind.COMPANY_FEE:
+        valid = debits == [AccountKind.PERSONAL] and credits == [AccountKind.TREASURY]
+    elif kind == TransactionKind.ORDER_FUND:
+        valid = len(debits) == 1 and debits[0] in (AccountKind.PERSONAL, AccountKind.COMPANY)
+        valid = valid and credits == [AccountKind.ESCROW]
+    elif kind == TransactionKind.ORDER_REFUND:
+        valid = debits == [AccountKind.ESCROW] and len(credits) == 1
+        valid = valid and credits[0] in (AccountKind.PERSONAL, AccountKind.COMPANY)
+    else:
+        valid = debits == [AccountKind.ESCROW] and 1 <= len(credits) <= 2
+        valid = valid and set(credits) <= {AccountKind.COMPANY, AccountKind.TREASURY}
+        valid = valid and len(credits) == len(set(credits))
+    if not valid:
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
 
 
 class PostgresLedgerUnitOfWork:

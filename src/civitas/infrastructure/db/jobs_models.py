@@ -20,7 +20,8 @@ class BudgetPeriodRow(Base):
             "EXTRACT(ISODOW FROM week_start_date) = 1", name="ck_budget_periods_week_monday"
         ),
         CheckConstraint(
-            "overall_cap >= 0 AND spent_total BETWEEN 0 AND overall_cap",
+            "overall_cap >= 0 AND spent_total BETWEEN 0 AND overall_cap "
+            "AND reserved_total BETWEEN 0 AND overall_cap - spent_total",
             name="ck_budget_periods_cap",
         ),
     )
@@ -32,6 +33,7 @@ class BudgetPeriodRow(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     overall_cap: Mapped[int] = mapped_column(BigInteger)
     spent_total: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    reserved_total: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
 
 
 class BudgetArticleRow(Base):
@@ -39,7 +41,7 @@ class BudgetArticleRow(Base):
     __table_args__ = (
         UniqueConstraint("period_id", "code", name="uq_budget_articles_period_code"),
         CheckConstraint(
-            "personal_cap >= 0 AND spent BETWEEN 0 AND cap",
+            "personal_cap >= 0 AND spent BETWEEN 0 AND cap AND reserved BETWEEN 0 AND cap - spent",
             name="ck_budget_articles_cap",
         ),
     )
@@ -50,6 +52,7 @@ class BudgetArticleRow(Base):
     cap: Mapped[int] = mapped_column(BigInteger)
     personal_cap: Mapped[int] = mapped_column(BigInteger)
     spent: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
+    reserved: Mapped[int] = mapped_column(BigInteger, server_default=text("0"))
 
 
 class WorkTaskRow(Base):

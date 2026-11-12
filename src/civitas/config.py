@@ -35,6 +35,23 @@ class JobsSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketSettings:
+    company_fee: int
+    company_limit_per_owner: int
+    sales_tax_basis_points: int
+    arbiter_ids: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class TreasurySettings:
+    initiator_ids: frozenset[int]
+    approver_ids: frozenset[int]
+    budget_weekly_limit: int
+    contract_weekly_limit: int
+    budget_timezone: tzinfo
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str = field(repr=False)
     discord_token: str = field(repr=False)
@@ -43,6 +60,9 @@ class Settings:
     citizen_role_id: int | None = None
     wallet: WalletSettings | None = None
     jobs: JobsSettings | None = None
+    market: MarketSettings | None = None
+    asset_issuer_ids: frozenset[int] = frozenset()
+    treasury: TreasurySettings | None = None
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -65,6 +85,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     if role_id == guild_id:
         raise ConfigurationError("CIVITAS_CITIZEN_ROLE_ID не может указывать на @everyone.")
     wallet = _load_wallet_settings(env)
+    asset_issuer_ids = _discord_ids(env, "CIVITAS_ASSET_ISSUER_IDS")
+    if asset_issuer_ids and wallet is None:
+        raise ConfigurationError("Для продажи имущества настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
     return Settings(
         database_url=database_url,
         discord_token=token,
@@ -73,6 +96,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         citizen_role_id=role_id,
         wallet=wallet,
         jobs=_load_jobs_settings(env, wallet),
+        market=_load_market_settings(env, wallet),
+        asset_issuer_ids=asset_issuer_ids,
+        treasury=_load_treasury_settings(env, wallet),
     )
 
 
@@ -101,7 +127,7 @@ def _load_jobs_settings(env: Mapping[str, str], wallet: WalletSettings | None) -
     )
     values = tuple(env.get(key, "").strip() for key in keys)
     reviewers = _discord_ids(env, "CIVITAS_NPC_REVIEWER_IDS")
-    if not reviewers and not any(values):
+    if not reviewers and not any(values[1:]):
         return None
     if wallet is None:
         raise ConfigurationError("Для NPC-заданий настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
@@ -113,11 +139,6 @@ def _load_jobs_settings(env: Mapping[str, str], wallet: WalletSettings | None) -
     )
     if not 1 <= minimum <= maximum or npc > total:
         raise ConfigurationError("Проверьте порядок размеров наград и недельных лимитов NPC.")
-    timezone_name = env.get("CIVITAS_BUDGET_TIMEZONE", "UTC").strip() or "UTC"
-    try:
-        timezone = UTC if timezone_name == "UTC" else ZoneInfo(timezone_name)
-    except (ZoneInfoNotFoundError, ValueError):
-        raise ConfigurationError("Проверьте часовой пояс CIVITAS_BUDGET_TIMEZONE.") from None
     cooldown_key = "CIVITAS_NPC_COOLDOWN_MINUTES"
     cooldown = _money(env.get(cooldown_key, "").strip() or "0", cooldown_key)
     return JobsSettings(
@@ -127,9 +148,38 @@ def _load_jobs_settings(env: Mapping[str, str], wallet: WalletSettings | None) -
         personal_weekly_limit=personal,
         reward_min=minimum,
         reward_max=maximum,
-        budget_timezone=timezone,
+        budget_timezone=_budget_timezone(env),
         cooldown_minutes=cooldown,
     )
+
+
+def _load_treasury_settings(env: Mapping[str, str], wallet: WalletSettings | None) -> TreasurySettings | None:
+    initiator_key = "CIVITAS_TREASURY_INITIATOR_IDS"
+    approver_key = "CIVITAS_TREASURY_APPROVER_IDS"
+    contract_key = "CIVITAS_CONTRACT_WEEKLY_LIMIT"
+    overall_key = "CIVITAS_BUDGET_WEEKLY_LIMIT"
+    initiators = _discord_ids(env, initiator_key)
+    approvers = _discord_ids(env, approver_key)
+    contract_limit = env.get(contract_key, "").strip()
+    if not initiators and not approvers and not contract_limit:
+        return None
+    if wallet is None:
+        raise ConfigurationError("Для казённых контрактов настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
+    if not initiators or not approvers:
+        raise ConfigurationError(f"Задайте {initiator_key} и {approver_key}.")
+    overall = _money(_required(env, overall_key), overall_key)
+    contracts = _money(contract_limit, contract_key)
+    if contracts > overall:
+        raise ConfigurationError(f"{contract_key} не может превышать {overall_key}.")
+    return TreasurySettings(initiators, approvers, overall, contracts, _budget_timezone(env))
+
+
+def _budget_timezone(env: Mapping[str, str]) -> tzinfo:
+    timezone_name = env.get("CIVITAS_BUDGET_TIMEZONE", "UTC").strip() or "UTC"
+    try:
+        return UTC if timezone_name == "UTC" else ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ConfigurationError("Проверьте часовой пояс CIVITAS_BUDGET_TIMEZONE.") from None
 
 
 def _money(value: str, name: str) -> int:
@@ -139,6 +189,22 @@ def _money(value: str, name: str) -> int:
     if amount > 2**63 - 1:
         raise ConfigurationError(f"Значение {name} превышает диапазон BIGINT.")
     return amount
+
+
+def _load_market_settings(env: Mapping[str, str], wallet: WalletSettings | None) -> MarketSettings | None:
+    keys = ("CIVITAS_COMPANY_FEE", "CIVITAS_COMPANY_LIMIT", "CIVITAS_SALES_TAX_BP")
+    values = tuple(env.get(key, "").strip() for key in keys)
+    arbiters = _discord_ids(env, "CIVITAS_MARKET_ARBITER_IDS")
+    if not arbiters and not any(values):
+        return None
+    if wallet is None:
+        raise ConfigurationError("Для рынка настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
+    fee, company_limit, tax_rate = (_money(value, key) for key, value in zip(keys, values, strict=True))
+    if company_limit == 0:
+        raise ConfigurationError("CIVITAS_COMPANY_LIMIT должен быть больше нуля.")
+    if tax_rate > 10_000:
+        raise ConfigurationError("CIVITAS_SALES_TAX_BP должен быть в пределах 0–10000.")
+    return MarketSettings(fee, company_limit, tax_rate, arbiters)
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
