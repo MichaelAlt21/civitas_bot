@@ -60,6 +60,9 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
     async def ensure_escrow_account(self, guild_id: int, order_id: int) -> Account:
         return await self._ensure_account(guild_id, AccountKind.ESCROW, order_id=order_id)
 
+    async def ensure_private_job_escrow(self, guild_id: int, job_id: int) -> Account:
+        return await self._ensure_account(guild_id, AccountKind.ESCROW, private_job_id=job_id)
+
     async def _ensure_account(
         self,
         guild_id: int,
@@ -68,12 +71,13 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
         citizen_id: int | None = None,
         company_id: int | None = None,
         order_id: int | None = None,
+        private_job_id: int | None = None,
     ) -> Account:
         row = await self._session.scalar(
             insert(FinancialAccountRow)
             .values(
                 guild_id=guild_id, kind=kind.value, citizen_id=citizen_id,
-                organization_id=company_id, order_id=order_id,
+                organization_id=company_id, order_id=order_id, private_job_id=private_job_id,
             )
             .on_conflict_do_nothing(constraint="uq_financial_accounts_owner")
             .returning(FinancialAccountRow)
@@ -87,12 +91,14 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
                         FinancialAccountRow.citizen_id == citizen_id,
                         FinancialAccountRow.organization_id == company_id,
                         FinancialAccountRow.order_id == order_id,
+                        FinancialAccountRow.private_job_id == private_job_id,
                     )
                 )
             ).one()
         return Account(
             id=row.id, guild_id=row.guild_id, kind=AccountKind(row.kind),
             citizen_id=row.citizen_id, company_id=row.organization_id, order_id=row.order_id,
+            private_job_id=row.private_job_id,
         )
 
     async def get_balance(self, account_id: int) -> int:
@@ -272,6 +278,19 @@ def _validate_accounts(
     accounts: list[FinancialAccountRow],
     entries: Mapping[int, int],
 ) -> None:
+    if kind in (TransactionKind.PRIVATE_JOB_FUND, TransactionKind.PRIVATE_JOB_PAY, TransactionKind.PRIVATE_JOB_REFUND):
+        if len(accounts) == 2:
+            debit = next(account for account in accounts if entries[account.id] < 0)
+            credit = next(account for account in accounts if entries[account.id] > 0)
+            escrow, counterparty = (credit, debit) if kind == TransactionKind.PRIVATE_JOB_FUND else (debit, credit)
+            expected = AccountKind.PERSONAL if kind == TransactionKind.PRIVATE_JOB_PAY else AccountKind.COMPANY
+            if (
+                escrow.kind == AccountKind.ESCROW and escrow.private_job_id is not None
+                and counterparty.kind == expected and key == f"{kind.value.lower()}:{escrow.private_job_id}"
+            ):
+                return
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
     if kind == TransactionKind.STATE_CONTRACT_PAYOUT:
         if (
             len(accounts) == 2

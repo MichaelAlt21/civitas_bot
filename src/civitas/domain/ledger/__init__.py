@@ -27,6 +27,9 @@ class TransactionKind(StrEnum):
     ORDER_REFUND = "ORDER_REFUND"
     ASSET_PURCHASE = "ASSET_PURCHASE"
     STATE_CONTRACT_PAYOUT = "STATE_CONTRACT_PAYOUT"
+    PRIVATE_JOB_FUND = "PRIVATE_JOB_FUND"
+    PRIVATE_JOB_PAY = "PRIVATE_JOB_PAY"
+    PRIVATE_JOB_REFUND = "PRIVATE_JOB_REFUND"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +40,7 @@ class Account:
     citizen_id: int | None
     company_id: int | None = None
     order_id: int | None = None
+    private_job_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

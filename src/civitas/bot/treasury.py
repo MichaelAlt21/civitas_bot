@@ -201,7 +201,10 @@ def add_treasury_commands(
         locale = interaction.locale
         apply = treasury_service.reserve_contract if action == "reserve" else treasury_service.pay_contract
         async with _treasury_response(interaction):
-            contract = await treasury_service.get_contract(interaction.guild_id, interaction.user.id, contract_id)
+            contract = await treasury_service.preview_contract_action(
+                interaction.guild_id, interaction.user.id, contract_id,
+                action="reserve" if action == "reserve" else "pay",
+            )
             prompt = message(
                 locale,
                 f"contracts.{action}.preview",

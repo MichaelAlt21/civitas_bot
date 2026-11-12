@@ -9,24 +9,26 @@ from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
 from civitas.app.jobs import JobService, JobsRules
 from civitas.app.market import MarketRules, MarketService
+from civitas.app.reports import ReportService
 from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.bot import create_bot
 from civitas.bot.assets import add_asset_commands
 from civitas.bot.jobs import add_job_commands
 from civitas.bot.market import add_market_commands
+from civitas.bot.reports import add_report_commands, run_report_publisher
 from civitas.bot.roles import run_role_sync
 from civitas.bot.treasury import add_treasury_commands
 from civitas.config import ConfigurationError, Settings, load_settings
 from civitas.domain.jobs import BudgetCaps
 from civitas.infrastructure.db import create_db_engine
-from civitas.infrastructure.db.treasury import PostgresTreasuryUnitOfWork
+from civitas.infrastructure.db.reports import PostgresReportUnitOfWork
 
 
 async def run_bot(settings: Settings) -> None:
     engine = create_db_engine(settings.database_url)
     try:
-        unit_of_work = PostgresTreasuryUnitOfWork(engine)
+        unit_of_work = PostgresReportUnitOfWork(engine)
         wallet_settings = settings.wallet
         currency_symbol = wallet_settings.currency_symbol if wallet_settings else "₵"
         funding = None
@@ -132,8 +134,23 @@ async def run_bot(settings: Settings) -> None:
             add_treasury_commands(
                 bot.tree, guild_scope=bot.guild_scope, treasury_service=treasury, currency_symbol=currency_symbol,
             )
-        async with bot, run_role_sync(
-            bot, unit_of_work, guild_id=settings.guild_id, role_id=settings.citizen_role_id
+        publication_channel = settings.treasury_report_channel_id
+        reports = None
+        if wallet_settings is not None or publication_channel is not None:
+            reports = ReportService(
+                unit_of_work, guild_id=settings.guild_id, timezone=settings.report_timezone,
+                publication_channel_id=publication_channel,
+            )
+            add_report_commands(
+                bot.tree, guild_scope=bot.guild_scope, service=reports, currency_symbol=currency_symbol,
+            )
+        async with (
+            bot,
+            run_role_sync(bot, unit_of_work, guild_id=settings.guild_id, role_id=settings.citizen_role_id),
+            run_report_publisher(
+                bot, reports if publication_channel is not None else None,
+                guild_id=settings.guild_id, currency_symbol=currency_symbol,
+            ),
         ):
             await bot.start(settings.discord_token)
     finally:

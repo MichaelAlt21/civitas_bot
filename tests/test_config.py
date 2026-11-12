@@ -122,6 +122,17 @@ def test_state_contracts_share_budget_settings_without_enabling_npc(env: dict[st
         load_settings(env)
 
 
+def test_report_publication_accepts_a_channel_snowflake_and_uses_budget_timezone(env: dict[str, str]) -> None:
+    assert load_settings(env).treasury_report_channel_id is None
+    env.update(CIVITAS_TREASURY_REPORT_CHANNEL_ID="18446744073709551615", CIVITAS_BUDGET_TIMEZONE="Europe/Moscow")
+    settings = load_settings(env)
+    assert settings.treasury_report_channel_id == 18446744073709551615
+    assert str(settings.report_timezone) == "Europe/Moscow"
+    env["CIVITAS_TREASURY_REPORT_CHANNEL_ID"] = "#budget"
+    with pytest.raises(ConfigurationError, match="CIVITAS_TREASURY_REPORT_CHANNEL_ID"):
+        load_settings(env)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

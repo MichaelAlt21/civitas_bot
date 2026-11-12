@@ -5,7 +5,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, tzinfo
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from civitas.app.citizens import CitizenshipAccessError, is_discord_id
 from civitas.app.jobs import JobError, JobErrorReason, JobsRepository, budget_week
@@ -365,6 +365,14 @@ class TreasuryService:
                 raise TreasuryError(TreasuryErrorReason.NOT_CONTRACT_PARTY)
             return contract
 
+    async def preview_contract_action(
+        self, guild_id: int | None, user_id: int, contract_id: int, *, action: Literal["reserve", "pay"],
+    ) -> StateContract:
+        async with self._change(
+            guild_id, user_id, contract_id, f"contract.{action}", approver=True, lock=False,
+        ) as (_, _, contract, _):
+            return contract
+
     async def list_contracts(self, guild_id: int | None, user_id: int) -> tuple[StateContract, ...]:
         self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
@@ -373,7 +381,8 @@ class TreasuryService:
 
     @asynccontextmanager
     async def _change(
-        self, guild_id: int | None, user_id: int, contract_id: int, action: str, *, approver: bool = False
+        self, guild_id: int | None, user_id: int, contract_id: int, action: str, *,
+        approver: bool = False, lock: bool = True,
     ) -> AsyncIterator[tuple[TreasuryRepository, Citizen, StateContract, Citizen | None]]:
         async with self._audit_denial(guild_id, user_id, action, contract_id):
             self._authorize(guild_id, user_id)
@@ -381,9 +390,9 @@ class TreasuryService:
                 self._require_approver(user_id)
             async with self._unit_of_work() as repository:
                 actor = await self._citizen(repository, user_id)
-                contract = await self._contract(repository, actor.guild_id, contract_id, lock=True)
+                contract = await self._contract(repository, actor.guild_id, contract_id, lock=lock)
                 citizens = await repository.get_citizens(
-                    self._guild_id, (user_id, contract.recipient_discord_user_id), lock=True
+                    self._guild_id, (user_id, contract.recipient_discord_user_id), lock=lock
                 )
                 verified = {citizen.id: citizen for citizen in citizens if citizen.status == CitizenStatus.VERIFIED}
                 actor = verified.get(actor.id)

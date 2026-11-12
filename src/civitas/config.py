@@ -63,6 +63,8 @@ class Settings:
     market: MarketSettings | None = None
     asset_issuer_ids: frozenset[int] = frozenset()
     treasury: TreasurySettings | None = None
+    treasury_report_channel_id: int | None = None
+    report_timezone: tzinfo = UTC
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -85,6 +87,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     if role_id == guild_id:
         raise ConfigurationError("CIVITAS_CITIZEN_ROLE_ID не может указывать на @everyone.")
     wallet = _load_wallet_settings(env)
+    report_channel_key = "CIVITAS_TREASURY_REPORT_CHANNEL_ID"
+    report_channel = env.get(report_channel_key, "").strip()
+    report_channel_id = _discord_id(report_channel, report_channel_key) if report_channel else None
     asset_issuer_ids = _discord_ids(env, "CIVITAS_ASSET_ISSUER_IDS")
     if asset_issuer_ids and wallet is None:
         raise ConfigurationError("Для продажи имущества настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
@@ -99,6 +104,8 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         market=_load_market_settings(env, wallet),
         asset_issuer_ids=asset_issuer_ids,
         treasury=_load_treasury_settings(env, wallet),
+        treasury_report_channel_id=report_channel_id,
+        report_timezone=_budget_timezone(env) if wallet is not None or report_channel_id is not None else UTC,
     )
 
 

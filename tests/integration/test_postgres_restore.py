@@ -37,6 +37,7 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         "entries": "SELECT transaction_id, account_id, delta FROM ledger_entries ORDER BY 1, 2",
         "claims": "SELECT id, status, payout_transaction_id, budget_period_id FROM work_claims ORDER BY id",
         "budget": "SELECT id, spent_total, reserved_total FROM budget_periods ORDER BY id",
+        "budget_articles": "SELECT period_id, code, spent, reserved FROM budget_articles ORDER BY period_id, code",
         "budget_approvals": "SELECT period_id, activated_by_citizen_id FROM contract_budget_approvals ORDER BY period_id",
         "state_contracts": "SELECT id, status, budget_period_id, amount, payout_transaction_id FROM state_contracts ORDER BY id",
         "orders": "SELECT id, status, price, tax_bp, buyer_account_id FROM orders ORDER BY id",
@@ -60,6 +61,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert pg_dump.is_file() and pg_restore.is_file()
 
     uow = PostgresTreasuryUnitOfWork(pg_engine)
+    now = datetime(2026, 11, 12, 12, tzinfo=UTC)
     funding = WalletFunding(starter_grant=250, treasury_genesis=8000)
     citizens = CitizensService(
         uow, guild_id=101, allowed_user_ids={201, 202, 203}, fund_verified=funding.fund_registered_citizen,
@@ -68,6 +70,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     jobs = JobService(
         uow, guild_id=101, authorize=citizens.authorize, staff_user_ids={201},
         rules=JobsRules(overall_weekly_limit=800, npc_weekly_limit=300, personal_weekly_limit=100, reward_min=10, reward_max=40),
+        clock=lambda: now,
     )
     await citizens.register(101, 201)
     await citizens.register(101, 202)
@@ -75,7 +78,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     task = await jobs.publish(
         101, 201, category=JobCategory.LOGISTICS, title="Test delivery",
         requirements="Deliver a fictional parcel", reward=30,
-        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        expires_at=now + timedelta(hours=1),
     )
     await jobs.claim(101, 202, task.id)
     await jobs.submit(101, 202, task.id, "Fictional delivery complete")
@@ -113,12 +116,13 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     treasury = TreasuryService(
         uow, guild_id=101, authorize=citizens.authorize, initiator_user_ids={202}, approver_user_ids={203},
         rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
+        clock=lambda: now,
     )
     await treasury.activate_budget(101, 203, reason="Approved fixture budget")
     for key, amount in (("restore-contract-paid", 50), ("restore-contract-reserved", 30)):
         contract = await treasury.propose_contract(
             101, 202, recipient_company_id=company.id, title="Fictional public contract", terms="Verified work",
-            amount=amount, deadline=datetime.now(UTC) + timedelta(hours=1), reason="Fixture need",
+            amount=amount, deadline=now + timedelta(hours=1), reason="Fixture need",
             idempotency_key=key,
         )
         await treasury.reserve_contract(101, 203, contract.id, reason="Verified available budget")
@@ -129,6 +133,10 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
 
     expected = await _snapshot(pg_engine)
     assert [(row.status, row.amount) for row in expected["state_contracts"]] == [("PAID", 50), ("RESERVED", 30)]
+    assert [(row.spent_total, row.reserved_total) for row in expected["budget"]] == [(80, 30)]
+    assert [(row.code, row.spent, row.reserved) for row in expected["budget_articles"]] == [
+        ("npc_work", 30, 0), ("state_contracts", 50, 30),
+    ]
     async with pg_engine.connect() as connection:
         schema = await connection.scalar(text("SELECT current_schema()"))
     database = f"civitas_restore_{uuid4().hex}"
@@ -168,6 +176,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
                     PostgresTreasuryUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     initiator_user_ids={202}, approver_user_ids={203},
                     rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
+                    clock=lambda: now + timedelta(days=7),
                 )
                 paid, reserved = expected["state_contracts"]
                 await restored_treasury.pay_contract(101, 203, paid.id, reason="Accepted fixture result")

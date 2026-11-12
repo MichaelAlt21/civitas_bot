@@ -38,6 +38,7 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
             initiator_ids=frozenset({201}), approver_ids=frozenset({202}), budget_weekly_limit=800,
             contract_weekly_limit=250, budget_timezone=UTC,
         ),
+        treasury_report_channel_id=500,
     )
     command_names = set()
     sync = AsyncMock()
@@ -47,6 +48,8 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         monkeypatch.setattr(bot.tree, "sync", sync)
         await bot.setup_hook()
         command_names.update(command.name for command in bot.tree.get_commands(guild=bot.guild_scope))
+        treasury = bot.tree.get_command("treasury", guild=bot.guild_scope)
+        assert {command.name for command in treasury.commands} == {"budget", "approve_budget", "report"}
         assert not bot.tree.get_commands()
 
     monkeypatch.setattr(entrypoint, "create_db_engine", lambda _url: pg_engine)
