@@ -202,6 +202,48 @@ async def test_dispute_evidence_stays_private_and_independent_refund_restores_co
     assert await _posting_count(pg_engine, TransactionKind.PRIVATE_JOB_REFUND) == 1
 
 
+async def test_same_worker_claim_retry_keeps_full_claimant_identity(scenario: Scenario) -> None:
+    jobs = scenario.jobs()
+    job = await _publish(scenario, key="same-worker")
+    first, repeat = await asyncio.wait_for(asyncio.gather(
+        jobs.claim_job(GUILD, WORKER, job.id), jobs.claim_job(GUILD, WORKER, job.id),
+    ), timeout=10)
+    assert first == repeat
+    assert repeat.status is PrivateJobStatus.CLAIMED and repeat.worker_discord_user_id == WORKER
+
+
+async def test_overdue_submission_can_be_recovered_by_independent_arbiter(
+    pg_engine: AsyncEngine, scenario: Scenario,
+) -> None:
+    jobs = scenario.jobs()
+    job = await _publish(scenario, key="overdue-dispute")
+    await jobs.claim_job(GUILD, WORKER, job.id)
+    await jobs.submit_job(GUILD, WORKER, job.id, evidence="Unreviewed proof")
+    with pytest.raises(PrivateJobError) as early:
+        await jobs.dispute_job(GUILD, ARBITER, job.id, reason="Still within the deadline")
+    assert early.value.reason is PrivateJobErrorReason.NOT_JOB_PARTY
+
+    at_deadline = scenario.jobs(now=DEADLINE)
+    assert [item.id for item in await at_deadline.list_my_jobs(GUILD, ARBITER)] == [job.id]
+    assert (await at_deadline.get_job(GUILD, ARBITER, job.id)).evidence == "Unreviewed proof"
+    assert await at_deadline.list_my_jobs(GUILD, OUTSIDER) == ()
+    await at_deadline.dispute_job(GUILD, ARBITER, job.id, reason="Review overdue work")
+
+    outcomes = await asyncio.wait_for(asyncio.gather(
+        at_deadline.resolve_job(GUILD, ARBITER, job.id, pay=True, reason="Proof accepted"),
+        at_deadline.resolve_job(GUILD, ARBITER, job.id, pay=False, reason="Proof rejected"),
+        return_exceptions=True,
+    ), timeout=10)
+    assert len([result for result in outcomes if isinstance(result, PrivateJob)]) == 1
+    assert [error.reason for error in outcomes if isinstance(error, PrivateJobError)] == [
+        PrivateJobErrorReason.INVALID_STATUS,
+    ]
+    pay_count = await _posting_count(pg_engine, TransactionKind.PRIVATE_JOB_PAY)
+    refund_count = await _posting_count(pg_engine, TransactionKind.PRIVATE_JOB_REFUND)
+    assert pay_count + refund_count == 1
+    assert await _balances(scenario, job, WORKER) == (110 + 70 * refund_count, 0, 1000 + 70 * pay_count, 8170)
+
+
 async def test_expired_job_blocks_claim_or_submission_but_allows_repeated_voluntary_cancel(
     pg_engine: AsyncEngine, scenario: Scenario,
 ) -> None:
@@ -226,6 +268,15 @@ async def test_expired_job_blocks_claim_or_submission_but_allows_repeated_volunt
     assert await _balances(scenario, claimed, WORKER) == (110, 0, 1000, 8170)
     assert await _balances(scenario, open_job, OTHER_WORKER) == (110, 70, 1000, 8170)
     assert await _posting_count(pg_engine, TransactionKind.PRIVATE_JOB_REFUND) == 1
+
+    with pytest.raises(PrivateJobError) as stranger:
+        await at_deadline.cancel_job(GUILD, OUTSIDER, open_job.id, reason="Cannot cancel another company's job")
+    assert stranger.value.reason is PrivateJobErrorReason.NOT_JOB_PARTY
+    assert [item.id for item in await at_deadline.list_my_jobs(GUILD, ARBITER)] == [open_job.id]
+    recovered = await at_deadline.cancel_job(GUILD, ARBITER, open_job.id, reason="Release expired reserve")
+    assert recovered.status is PrivateJobStatus.CANCELLED
+    assert await _balances(scenario, open_job, OTHER_WORKER) == (180, 0, 1000, 8170)
+    assert await _posting_count(pg_engine, TransactionKind.PRIVATE_JOB_REFUND) == 2
 
 
 async def test_funded_job_terms_cannot_be_changed_at_database_level(

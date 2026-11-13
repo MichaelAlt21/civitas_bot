@@ -18,7 +18,7 @@ async def test_market_migration_preserves_existing_accounts_and_postings(pg_engi
         config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
         config.attributes["connection"] = connection
         if upgrade:
-            command.upgrade(config, "0004_market")
+            command.upgrade(config, "head")
         else:
             command.downgrade(config, "0003_npc_jobs")
 

@@ -6,7 +6,7 @@ from sqlalchemy import func, select
 
 from civitas import __main__ as entrypoint
 from civitas.bot.client import CivitasBot
-from civitas.config import JobsSettings, MarketSettings, Settings, TreasurySettings, WalletSettings
+from civitas.config import GovernmentSettings, JobsSettings, MarketSettings, Settings, TreasurySettings, WalletSettings
 from civitas.domain.ledger import TransactionKind
 from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
 
@@ -39,6 +39,11 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
             contract_weekly_limit=250, budget_timezone=UTC,
         ),
         treasury_report_channel_id=500,
+        government=GovernmentSettings(
+            commissioner_ids=frozenset({201, 202}), poll_hosts=frozenset({"discord.com"}), min_eligible=10,
+            quorum_bp=4000, quorum_min=4, parliament_seats=3, term_days=28, voting_hours=48,
+            extension_hours=24, president_role_id=501, parliament_role_id=502,
+        ),
     )
     command_names = set()
     sync = AsyncMock()
@@ -47,6 +52,7 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         assert token == "test-token"
         monkeypatch.setattr(bot.tree, "sync", sync)
         await bot.setup_hook()
+        assert bot.intents.guilds
         command_names.update(command.name for command in bot.tree.get_commands(guild=bot.guild_scope))
         treasury = bot.tree.get_command("treasury", guild=bot.guild_scope)
         assert {command.name for command in treasury.commands} == {"budget", "approve_budget", "report"}
@@ -57,7 +63,8 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
     await entrypoint.run_bot(settings)
 
     assert command_names == {
-        "start", "citizen", "profile", "wallet", "jobs", "company", "market", "assets", "treasury", "contracts",
+        "start", "citizen", "profile", "wallet", "jobs", "company", "market", "work", "assets", "treasury", "contracts",
+        "government", "election", "help",
     }
     assert sync.await_count == 1
     async with pg_engine.connect() as connection:

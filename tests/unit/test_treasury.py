@@ -8,6 +8,7 @@ import pytest
 from civitas.app.citizens import CitizensService
 from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryRepository, TreasuryRules, TreasuryService
 from civitas.domain.citizens import Citizen, CitizenStatus
+from civitas.domain.government import OfficeKind
 from civitas.domain.jobs import BudgetCaps, BudgetPeriod
 from civitas.domain.ledger import Account, AccountKind, PostResult, TransactionKind
 from civitas.domain.market import Company
@@ -81,7 +82,7 @@ def repository() -> AsyncMock:
 
 @pytest.fixture
 def service_factory(repository: AsyncMock):
-    def create(*, approvers=(APPROVER.discord_user_id,), now=NOW, transactions=None) -> TreasuryService:
+    def create(*, approvers=(APPROVER.discord_user_id,), now=NOW, transactions=None, elected=False) -> TreasuryService:
         @asynccontextmanager
         async def unit_of_work():
             if transactions is not None:
@@ -104,6 +105,7 @@ def service_factory(repository: AsyncMock):
             unit_of_work, guild_id=DISCORD_GUILD, authorize=citizens.authorize,
             initiator_user_ids=[PROPOSER.discord_user_id], approver_user_ids=approvers,
             rules=TreasuryRules(caps=CAPS, contracts_weekly_limit=250), clock=lambda: now,
+            elected_authority=elected,
         )
 
     return create
@@ -120,6 +122,30 @@ def proposal(*, company_id=None) -> dict:
         "reason": DRAFT.proposal_reason,
         "idempotency_key": DRAFT.request_key,
     }
+
+
+@pytest.mark.asyncio
+async def test_elected_treasury_uses_current_offices_instead_of_manual_lists(repository, service_factory):
+    service = service_factory(elected=True)
+    repository.has_active_office.side_effect = lambda guild, citizen, office, at: (
+        guild == GUILD and at == NOW and (citizen, office) in {
+            (OUTSIDER.id, OfficeKind.PRESIDENT), (APPROVER.id, OfficeKind.PARLIAMENT),
+        }
+    )
+
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.INITIATOR_REQUIRED):
+        await service.propose_contract(DISCORD_GUILD, PROPOSER.discord_user_id, **proposal())
+    created = await service.propose_contract(DISCORD_GUILD, OUTSIDER.discord_user_id, **proposal())
+    assert created.proposer_citizen_id == OUTSIDER.id
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.APPROVER_REQUIRED):
+        await service.activate_budget(DISCORD_GUILD, OUTSIDER.discord_user_id, reason="Not a deputy")
+    assert await service.activate_budget(DISCORD_GUILD, APPROVER.discord_user_id, reason="Approved") == BUDGET
+
+    repository.has_active_office.side_effect = None
+    repository.has_active_office.return_value = False
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.APPROVER_REQUIRED):
+        await service.preview_contract_action(DISCORD_GUILD, APPROVER.discord_user_id, created.id, action="reserve")
+    repository.append_contract_denial.assert_awaited()
 
 
 @pytest.mark.asyncio

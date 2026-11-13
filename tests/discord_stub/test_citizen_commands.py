@@ -67,6 +67,7 @@ async def test_setup_syncs_commands_only_in_configured_guild(monkeypatch):
         "start",
         "citizen",
         "profile",
+        "help",
     }
     assert get_command(bot, "register").qualified_name == "citizen register"
     assert bot.intents.value == discord.Intents.none().value
@@ -167,6 +168,40 @@ async def test_profile_shows_current_status_or_registration_instructions(record,
     interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
     assert expected in interaction.followup.send.await_args.args[0]
     assert interaction.followup.send.await_args.kwargs == {"ephemeral": True}
+
+
+@pytest.mark.asyncio
+async def test_profile_lists_office_company_and_asset_without_a_balance():
+    from civitas.app.profile import ProfileDetails
+    from civitas.domain.government import OfficeKind
+
+    citizens = Mock(spec=CitizensService)
+    profile_service = Mock()
+    profile_service.get_profile = AsyncMock(return_value=ProfileDetails(
+        citizen_record(CitizenStatus.VERIFIED), (OfficeKind.PARLIAMENT,), ("Workshop",), ("Office",),
+    ))
+    bot = create_bot(citizens_service=citizens, guild_id=GUILD_ID, profile_service=profile_service)
+    interaction = fake_interaction(locale=discord.Locale.american_english)
+    await get_command(bot, "profile").callback(interaction)
+
+    response = interaction.followup.send.await_args
+    assert response.kwargs == {"ephemeral": True}
+    assert "Public offices: Member of Parliament" in response.args[0]
+    assert "Workshop" in response.args[0] and "Office" in response.args[0]
+    assert "balance" not in response.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_help_lists_guild_commands_in_interaction_language():
+    bot = create_bot(citizens_service=Mock(spec=CitizensService), guild_id=GUILD_ID)
+    interaction = fake_interaction(locale=discord.Locale.russian)
+    await get_command(bot, "help").callback(interaction)
+
+    response = interaction.response.send_message.await_args
+    assert response.kwargs == {"ephemeral": True}
+    assert "Команды Civitas" in response.args[0]
+    assert "`/citizen register`" in response.args[0]
+    assert "/wallet" not in response.args[0]
 
 
 @pytest.mark.asyncio

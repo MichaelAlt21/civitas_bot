@@ -12,6 +12,7 @@ from .localization import CommandTranslator, command_description, message
 from .wallet import add_wallet_commands
 
 if TYPE_CHECKING:
+    from civitas.app.profile import ProfileService
     from civitas.app.wallet import WalletService
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class CivitasBot(discord.Client):
         sync_roles: bool = False,
         wallet_service: WalletService | None = None,
         currency_symbol: str = "₵",
+        profile_service: ProfileService | None = None,
     ) -> None:
         intents = discord.Intents.none()
         intents.guilds = sync_roles
@@ -35,7 +37,7 @@ class CivitasBot(discord.Client):
         )
         self.guild_scope = discord.Object(id=guild_id)
         self.tree = app_commands.CommandTree(self)
-        self._add_citizen_commands(citizens_service)
+        self._add_citizen_commands(citizens_service, profile_service)
         if wallet_service is not None:
             add_wallet_commands(
                 self.tree,
@@ -48,7 +50,7 @@ class CivitasBot(discord.Client):
         await self.tree.set_translator(CommandTranslator())
         await self.tree.sync(guild=self.guild_scope)
 
-    def _add_citizen_commands(self, service: CitizensService) -> None:
+    def _add_citizen_commands(self, service: CitizensService, profile_service: ProfileService | None) -> None:
         citizen = app_commands.Group(name="citizen", description=command_description("citizen"))
         self.tree.add_command(citizen, guild=self.guild_scope)
 
@@ -96,7 +98,12 @@ class CivitasBot(discord.Client):
         async def profile(interaction: discord.Interaction) -> None:
             await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                record = await service.get_profile(interaction.guild_id, interaction.user.id)
+                details = None
+                if profile_service is None:
+                    record = await service.get_profile(interaction.guild_id, interaction.user.id)
+                else:
+                    details = await profile_service.get_profile(interaction.guild_id, interaction.user.id)
+                    record = details.citizen if details else None
             except CitizenshipAccessError as error:
                 await interaction.followup.send(
                     message(interaction.locale, f"access.{error.reason.value}"), ephemeral=True
@@ -109,7 +116,29 @@ class CivitasBot(discord.Client):
             else:
                 status = message(locale, f"status.{record.status.value.lower()}")
                 reply = message(locale, "profile.status", status=status)
+            if details is not None:
+                sections = (
+                    ("offices", tuple(message(locale, f"profile.office.{office.value.lower()}") for office in details.offices)),
+                    ("companies", details.companies), ("assets", details.assets),
+                )
+                for key, values in sections:
+                    shown = ", ".join(discord.utils.escape_markdown(name) for name in values) or message(locale, "profile.none")
+                    reply += "\n" + message(locale, f"profile.{key}", values=shown)
             await interaction.followup.send(reply, ephemeral=True)
+
+        @self.tree.command(name="help", description=command_description("help"), guild=self.guild_scope)
+        async def help_command(interaction: discord.Interaction) -> None:
+            if interaction.guild_id != self.guild_scope.id:
+                await interaction.response.send_message(message(interaction.locale, "access.wrong_guild"), ephemeral=True)
+                return
+            visible = []
+            for command in self.tree.walk_commands(guild=self.guild_scope):
+                if isinstance(command, app_commands.Command) and command.name != "help":
+                    if not ({"staff", "commission"} & set(command.qualified_name.split())):
+                        visible.append(f"`/{command.qualified_name}`")
+            await interaction.response.send_message(
+                message(interaction.locale, "help.commands", commands=", ".join(visible)), ephemeral=True,
+            )
 
         @self.tree.error
         async def report_error(
@@ -134,6 +163,7 @@ def create_bot(
     sync_roles: bool = False,
     wallet_service: WalletService | None = None,
     currency_symbol: str = "₵",
+    profile_service: ProfileService | None = None,
 ) -> CivitasBot:
     return CivitasBot(
         citizens_service=citizens_service,
@@ -141,4 +171,5 @@ def create_bot(
         sync_roles=sync_roles,
         wallet_service=wallet_service,
         currency_symbol=currency_symbol,
+        profile_service=profile_service,
     )

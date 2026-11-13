@@ -133,6 +133,27 @@ def test_report_publication_accepts_a_channel_snowflake_and_uses_budget_timezone
         load_settings(env)
 
 
+def test_election_settings_and_elected_treasury_are_opt_in(env: dict[str, str]) -> None:
+    assert load_settings(env).government is None
+    env.update(
+        CIVITAS_STARTER_GRANT="250", CIVITAS_TREASURY_GENESIS="8000", CIVITAS_BUDGET_WEEKLY_LIMIT="800",
+        CIVITAS_CONTRACT_WEEKLY_LIMIT="250", CIVITAS_ELECTED_TREASURY="true",
+    )
+    with pytest.raises(ConfigurationError, match="CIVITAS_ELECTED_TREASURY"):
+        load_settings(env)
+
+    env.update(CIVITAS_ELECTION_COMMISSIONER_IDS="12,34", CIVITAS_ELECTION_POLL_HOSTS="discord.com, Example.org")
+    settings = load_settings(env)
+    assert settings.government is not None and settings.government.poll_hosts == {"discord.com", "example.org"}
+    assert settings.government.min_eligible == 10
+    assert settings.treasury is not None and settings.treasury.elected_authority
+    assert not settings.treasury.initiator_ids and not settings.treasury.approver_ids
+
+    env.update(CIVITAS_PRESIDENT_ROLE_ID="2001", CIVITAS_PARLIAMENT_ROLE_ID="2001")
+    with pytest.raises(ConfigurationError, match="отдельные ID"):
+        load_settings(env)
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [

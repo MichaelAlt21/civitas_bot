@@ -14,6 +14,7 @@ from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH, Accoun
 from civitas.domain.private_jobs import PrivateJob, PrivateJobStatus
 
 _PAGE_SIZE = 10
+_OVERDUE_REVIEWABLE = (PrivateJobStatus.OPEN, PrivateJobStatus.CLAIMED, PrivateJobStatus.SUBMITTED)
 
 
 class PrivateJobErrorReason(StrEnum):
@@ -59,6 +60,7 @@ class PrivateJobRepository(MarketRepository, Protocol):
 
     async def list_my_private_jobs(
         self, guild_id: int, citizen_id: int, limit: int, *, offset: int = 0, include_disputes: bool = False,
+        overdue_at: datetime | None = None,
     ) -> tuple[PrivateJob, ...]: ...
 
     async def ensure_private_job_escrow(self, guild_id: int, job_id: int) -> Account: ...
@@ -167,6 +169,7 @@ class PrivateJobService:
             return await repository.list_my_private_jobs(
                 viewer.guild_id, viewer.id, _PAGE_SIZE, offset=offset,
                 include_disputes=user_id in self._arbiter_user_ids,
+                overdue_at=self._clock(),
             )
 
     async def get_job(self, guild_id: int | None, user_id: int, job_id: int) -> PrivateJob:
@@ -176,7 +179,10 @@ class PrivateJobService:
             job = await self._job(repository, viewer.guild_id, job_id)
             if (
                 job.status == PrivateJobStatus.OPEN or viewer.id in (job.owner_citizen_id, job.worker_citizen_id)
-                or (job.disputed_at is not None and user_id in self._arbiter_user_ids)
+                or (user_id in self._arbiter_user_ids and (
+                    job.disputed_at is not None
+                    or (job.status in _OVERDUE_REVIEWABLE and self._clock() >= job.deadline)
+                ))
             ):
                 return job
             raise PrivateJobError(PrivateJobErrorReason.NOT_JOB_PARTY)
@@ -220,7 +226,8 @@ class PrivateJobService:
 
     async def cancel_job(self, guild_id: int | None, user_id: int, job_id: int, *, reason: str) -> PrivateJob:
         async with self._action(guild_id, user_id, job_id) as (repository, actor, job, _):
-            self._require_party(actor, job.owner_citizen_id, job.worker_citizen_id)
+            if not (user_id in self._arbiter_user_ids and self._clock() >= job.deadline):
+                self._require_party(actor, job.owner_citizen_id, job.worker_citizen_id)
             reason = _text(reason, 200)
             if job.status == PrivateJobStatus.CANCELLED:
                 return job
@@ -229,13 +236,15 @@ class PrivateJobService:
 
     async def dispute_job(self, guild_id: int | None, user_id: int, job_id: int, *, reason: str) -> PrivateJob:
         async with self._action(guild_id, user_id, job_id) as (repository, actor, job, _):
-            self._require_party(actor, job.owner_citizen_id, job.worker_citizen_id)
             reason = _text(reason, 200)
+            now = self._clock()
+            if not (user_id in self._arbiter_user_ids and now >= job.deadline):
+                self._require_party(actor, job.owner_citizen_id, job.worker_citizen_id)
             if job.disputed_by_citizen_id == actor.id and job.dispute_reason == reason:
                 return job
             self._require_status(job, PrivateJobStatus.SUBMITTED)
             disputed = replace(
-                job, status=PrivateJobStatus.DISPUTED, disputed_at=self._clock(),
+                job, status=PrivateJobStatus.DISPUTED, disputed_at=now,
                 disputed_by_citizen_id=actor.id, dispute_reason=reason,
             )
             await repository.update_private_job(disputed)

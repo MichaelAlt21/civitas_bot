@@ -7,28 +7,33 @@ import sys
 
 from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
+from civitas.app.government import ElectionRules, GovernmentService
 from civitas.app.jobs import JobService, JobsRules
 from civitas.app.market import MarketRules, MarketService
+from civitas.app.private_jobs import PrivateJobService
+from civitas.app.profile import ProfileService
 from civitas.app.reports import ReportService
 from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.bot import create_bot
 from civitas.bot.assets import add_asset_commands
+from civitas.bot.government import add_government_commands, run_office_role_sync
 from civitas.bot.jobs import add_job_commands
 from civitas.bot.market import add_market_commands
+from civitas.bot.private_jobs import add_private_job_commands
 from civitas.bot.reports import add_report_commands, run_report_publisher
 from civitas.bot.roles import run_role_sync
 from civitas.bot.treasury import add_treasury_commands
 from civitas.config import ConfigurationError, Settings, load_settings
 from civitas.domain.jobs import BudgetCaps
 from civitas.infrastructure.db import create_db_engine
-from civitas.infrastructure.db.reports import PostgresReportUnitOfWork
+from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 
 
 async def run_bot(settings: Settings) -> None:
     engine = create_db_engine(settings.database_url)
     try:
-        unit_of_work = PostgresReportUnitOfWork(engine)
+        unit_of_work = PostgresGovernmentUnitOfWork(engine)
         wallet_settings = settings.wallet
         currency_symbol = wallet_settings.currency_symbol if wallet_settings else "₵"
         funding = None
@@ -52,12 +57,16 @@ async def run_bot(settings: Settings) -> None:
                 funding=funding,
             )
             await wallet.initialize_guild()
+        government_settings = settings.government
+        president_role = government_settings.president_role_id if government_settings else None
+        parliament_role = government_settings.parliament_role_id if government_settings else None
         bot = create_bot(
             citizens_service=service,
             guild_id=settings.guild_id,
-            sync_roles=settings.citizen_role_id is not None,
+            sync_roles=any(role is not None for role in (settings.citizen_role_id, president_role, parliament_role)),
             wallet_service=wallet,
             currency_symbol=currency_symbol,
+            profile_service=ProfileService(unit_of_work, authorize=service.authorize),
         )
         job_settings = settings.jobs
         if job_settings is not None:
@@ -102,6 +111,18 @@ async def run_bot(settings: Settings) -> None:
                 market_service=market,
                 currency_symbol=currency_symbol,
             )
+            private_jobs = PrivateJobService(
+                unit_of_work,
+                guild_id=settings.guild_id,
+                authorize=service.authorize,
+                arbiter_user_ids=market_settings.arbiter_ids,
+            )
+            add_private_job_commands(
+                bot.tree,
+                guild_scope=bot.guild_scope,
+                private_jobs_service=private_jobs,
+                currency_symbol=currency_symbol,
+            )
         if settings.asset_issuer_ids and funding is not None:
             assets = AssetService(
                 unit_of_work,
@@ -130,6 +151,7 @@ async def run_bot(settings: Settings) -> None:
                     contracts_weekly_limit=treasury_settings.contract_weekly_limit,
                     budget_timezone=treasury_settings.budget_timezone,
                 ),
+                elected_authority=treasury_settings.elected_authority,
             )
             add_treasury_commands(
                 bot.tree, guild_scope=bot.guild_scope, treasury_service=treasury, currency_symbol=currency_symbol,
@@ -144,12 +166,29 @@ async def run_bot(settings: Settings) -> None:
             add_report_commands(
                 bot.tree, guild_scope=bot.guild_scope, service=reports, currency_symbol=currency_symbol,
             )
+        government = None
+        if government_settings is not None:
+            government = GovernmentService(
+                unit_of_work, guild_id=settings.guild_id, authorize=service.authorize,
+                commissioner_user_ids=government_settings.commissioner_ids,
+                rules=ElectionRules(
+                    min_eligible=government_settings.min_eligible, quorum_bp=government_settings.quorum_bp,
+                    quorum_min=government_settings.quorum_min, parliament_seats=government_settings.parliament_seats,
+                    term_days=government_settings.term_days, voting_hours=government_settings.voting_hours,
+                    extension_hours=government_settings.extension_hours, poll_hosts=government_settings.poll_hosts,
+                ),
+            )
+            add_government_commands(bot.tree, guild_scope=bot.guild_scope, government_service=government)
         async with (
             bot,
             run_role_sync(bot, unit_of_work, guild_id=settings.guild_id, role_id=settings.citizen_role_id),
             run_report_publisher(
                 bot, reports if publication_channel is not None else None,
                 guild_id=settings.guild_id, currency_symbol=currency_symbol,
+            ),
+            run_office_role_sync(
+                bot, government, guild_id=settings.guild_id,
+                president_role_id=president_role, parliament_role_id=parliament_role,
             ),
         ):
             await bot.start(settings.discord_token)

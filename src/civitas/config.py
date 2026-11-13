@@ -49,6 +49,22 @@ class TreasurySettings:
     budget_weekly_limit: int
     contract_weekly_limit: int
     budget_timezone: tzinfo
+    elected_authority: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class GovernmentSettings:
+    commissioner_ids: frozenset[int]
+    poll_hosts: frozenset[str]
+    min_eligible: int
+    quorum_bp: int
+    quorum_min: int
+    parliament_seats: int
+    term_days: int
+    voting_hours: int
+    extension_hours: int
+    president_role_id: int | None
+    parliament_role_id: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +81,7 @@ class Settings:
     treasury: TreasurySettings | None = None
     treasury_report_channel_id: int | None = None
     report_timezone: tzinfo = UTC
+    government: GovernmentSettings | None = None
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -93,6 +110,14 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     asset_issuer_ids = _discord_ids(env, "CIVITAS_ASSET_ISSUER_IDS")
     if asset_issuer_ids and wallet is None:
         raise ConfigurationError("Для продажи имущества настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
+    government = _load_government_settings(env)
+    treasury = _load_treasury_settings(env, wallet)
+    if treasury is not None and treasury.elected_authority and government is None:
+        raise ConfigurationError("Для CIVITAS_ELECTED_TREASURY сначала настройте выборы.")
+    roles = [role for role in (role_id, government.president_role_id if government else None,
+                              government.parliament_role_id if government else None) if role is not None]
+    if guild_id in roles or len(roles) != len(set(roles)):
+        raise ConfigurationError("Укажите отдельные ID для роли гражданина и выборных ролей.")
     return Settings(
         database_url=database_url,
         discord_token=token,
@@ -103,9 +128,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         jobs=_load_jobs_settings(env, wallet),
         market=_load_market_settings(env, wallet),
         asset_issuer_ids=asset_issuer_ids,
-        treasury=_load_treasury_settings(env, wallet),
+        treasury=treasury,
         treasury_report_channel_id=report_channel_id,
         report_timezone=_budget_timezone(env) if wallet is not None or report_channel_id is not None else UTC,
+        government=government,
     )
 
 
@@ -168,17 +194,63 @@ def _load_treasury_settings(env: Mapping[str, str], wallet: WalletSettings | Non
     initiators = _discord_ids(env, initiator_key)
     approvers = _discord_ids(env, approver_key)
     contract_limit = env.get(contract_key, "").strip()
-    if not initiators and not approvers and not contract_limit:
+    elected = _enabled(env, "CIVITAS_ELECTED_TREASURY")
+    if not initiators and not approvers and not contract_limit and not elected:
         return None
     if wallet is None:
         raise ConfigurationError("Для казённых контрактов настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
-    if not initiators or not approvers:
+    if not elected and (not initiators or not approvers):
         raise ConfigurationError(f"Задайте {initiator_key} и {approver_key}.")
     overall = _money(_required(env, overall_key), overall_key)
     contracts = _money(contract_limit, contract_key)
     if contracts > overall:
         raise ConfigurationError(f"{contract_key} не может превышать {overall_key}.")
-    return TreasurySettings(initiators, approvers, overall, contracts, _budget_timezone(env))
+    return TreasurySettings(initiators, approvers, overall, contracts, _budget_timezone(env), elected)
+
+
+def _enabled(env: Mapping[str, str], key: str) -> bool:
+    value = env.get(key, "").strip().lower()
+    if value in ("", "false", "0"):
+        return False
+    if value in ("true", "1"):
+        return True
+    raise ConfigurationError(f"Для {key} укажите true или false.")
+
+
+def _load_government_settings(env: Mapping[str, str]) -> GovernmentSettings | None:
+    commissioners = _discord_ids(env, "CIVITAS_ELECTION_COMMISSIONER_IDS")
+    if not commissioners:
+        return None
+    if len(commissioners) < 2:
+        raise ConfigurationError("Для выборов задайте минимум два разных CIVITAS_ELECTION_COMMISSIONER_IDS.")
+    poll_hosts_key = "CIVITAS_ELECTION_POLL_HOSTS"
+    hosts = frozenset(host.strip().lower() for host in _required(env, poll_hosts_key).split(","))
+    if any(not host or any(not (ch.isascii() and (ch.isalnum() or ch in ".-")) for ch in host) for host in hosts):
+        raise ConfigurationError(f"Укажите имена хостов без URL в {poll_hosts_key}.")
+
+    def integer(name: str, default: int, minimum: int, maximum: int) -> int:
+        key = f"CIVITAS_ELECTION_{name}"
+        amount = _money(env.get(key, "").strip() or str(default), key)
+        if not minimum <= amount <= maximum:
+            raise ConfigurationError(f"Проверьте диапазон {key}.")
+        return amount
+
+    def role_id(key: str) -> int | None:
+        value = env.get(key, "").strip()
+        return _discord_id(value, key) if value else None
+
+    return GovernmentSettings(
+        commissioner_ids=commissioners, poll_hosts=hosts,
+        min_eligible=integer("MIN_ELIGIBLE", 10, 1, 10_000),
+        quorum_bp=integer("QUORUM_BP", 4000, 1, 10_000),
+        quorum_min=integer("QUORUM_MIN", 4, 1, 10_000),
+        parliament_seats=integer("PARLIAMENT_SEATS", 3, 1, 100),
+        term_days=integer("TERM_DAYS", 28, 1, 3650),
+        voting_hours=integer("VOTING_HOURS", 48, 1, 8760),
+        extension_hours=integer("EXTENSION_HOURS", 24, 1, 8760),
+        president_role_id=role_id("CIVITAS_PRESIDENT_ROLE_ID"),
+        parliament_role_id=role_id("CIVITAS_PARLIAMENT_ROLE_ID"),
+    )
 
 
 def _budget_timezone(env: Mapping[str, str]) -> tzinfo:

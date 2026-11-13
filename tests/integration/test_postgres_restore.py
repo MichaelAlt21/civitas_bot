@@ -12,12 +12,13 @@ from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
 from civitas.app.jobs import JobService, JobsRules
 from civitas.app.market import MarketRules, MarketService
+from civitas.app.private_jobs import PrivateJobService
 from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.domain.assets import AssetKind
 from civitas.domain.jobs import BudgetCaps, JobCategory
 from civitas.infrastructure.db import create_db_engine
-from civitas.infrastructure.db.treasury import PostgresTreasuryUnitOfWork
+from civitas.infrastructure.db.private_jobs import PostgresPrivateJobUnitOfWork
 
 
 async def _run_postgres_tool(tool: Path, arguments: list[str], environment: dict[str, str]) -> None:
@@ -40,6 +41,7 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         "budget_articles": "SELECT period_id, code, spent, reserved FROM budget_articles ORDER BY period_id, code",
         "budget_approvals": "SELECT period_id, activated_by_citizen_id FROM contract_budget_approvals ORDER BY period_id",
         "state_contracts": "SELECT id, status, budget_period_id, amount, payout_transaction_id FROM state_contracts ORDER BY id",
+        "private_jobs": "SELECT id, status, amount, worker_citizen_id, payout_transaction_id FROM private_jobs ORDER BY id",
         "orders": "SELECT id, status, price, tax_bp, buyer_account_id FROM orders ORDER BY id",
         "assets": "SELECT id, status, owner_citizen_id, owner_company_id FROM assets ORDER BY id",
         "titles": "SELECT asset_id, kind, buyer_company_id, transaction_id FROM asset_transfers ORDER BY asset_id, kind",
@@ -60,7 +62,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     pg_restore = Path(bin_path) / f"pg_restore{suffix}"
     assert pg_dump.is_file() and pg_restore.is_file()
 
-    uow = PostgresTreasuryUnitOfWork(pg_engine)
+    uow = PostgresPrivateJobUnitOfWork(pg_engine)
     now = datetime(2026, 11, 12, 12, tzinfo=UTC)
     funding = WalletFunding(starter_grant=250, treasury_genesis=8000)
     citizens = CitizensService(
@@ -131,8 +133,24 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             await treasury.pay_contract(101, 203, contract.id, reason="Accepted fixture result")
     assert await market.company_balance(101, 201, company.id) == 160
 
+    private_jobs = PrivateJobService(uow, guild_id=101, authorize=citizens.authorize, arbiter_user_ids={203}, clock=lambda: now)
+    paid_job = await private_jobs.publish_job(
+        101, 201, company_id=company.id, title="Inspect a fixture", terms="Return a brief inspection",
+        amount=40, deadline=now + timedelta(hours=1), reason="Fixture work", idempotency_key="restore-job-paid",
+    )
+    await private_jobs.claim_job(101, 202, paid_job.id)
+    await private_jobs.submit_job(101, 202, paid_job.id, evidence="Inspection complete")
+    await private_jobs.accept_job(101, 201, paid_job.id, reason="Inspection accepted")
+    open_job = await private_jobs.publish_job(
+        101, 201, company_id=company.id, title="Check an open fixture", terms="Return a checklist",
+        amount=20, deadline=now + timedelta(hours=1), reason="Fixture work", idempotency_key="restore-job-open",
+    )
+    assert await wallet.balance(101, 202) == 120
+    assert await market.company_balance(101, 201, company.id) == 100
+
     expected = await _snapshot(pg_engine)
     assert [(row.status, row.amount) for row in expected["state_contracts"]] == [("PAID", 50), ("RESERVED", 30)]
+    assert [(row.status, row.amount) for row in expected["private_jobs"]] == [("PAID", 40), ("OPEN", 20)]
     assert [(row.spent_total, row.reserved_total) for row in expected["budget"]] == [(80, 30)]
     assert [(row.code, row.spent, row.reserved) for row in expected["budget_articles"]] == [
         ("npc_work", 30, 0), ("state_contracts", 50, 30),
@@ -166,14 +184,14 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             try:
                 assert await _snapshot(restored) == expected
                 restored_assets = AssetService(
-                    PostgresTreasuryUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     staff_user_ids={202}, funding=funding,
                 )
                 assert [
                     item.id for item in await restored_assets.list_owned_assets(101, 201, company_id=company.id)
                 ] == [asset.id]
                 restored_treasury = TreasuryService(
-                    PostgresTreasuryUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     initiator_user_ids={202}, approver_user_ids={203},
                     rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
                     clock=lambda: now + timedelta(days=7),
@@ -188,6 +206,16 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
                     ("PAID", 50), ("CANCELLED", 30),
                 ]
                 assert [row.reserved_total for row in recovered["budget"]] == [0]
+                restored_jobs = PrivateJobService(
+                    PostgresPrivateJobUnitOfWork(restored), guild_id=101,
+                    authorize=citizens.authorize, arbiter_user_ids={203}, clock=lambda: now + timedelta(days=7),
+                )
+                await restored_jobs.accept_job(101, 201, paid_job.id, reason="Inspection accepted")
+                await restored_jobs.cancel_job(101, 201, open_job.id, reason="Cancelled after restore")
+                final = await _snapshot(restored)
+                assert [(row.status, row.amount) for row in final["private_jobs"]] == [("PAID", 40), ("CANCELLED", 20)]
+                assert final["transactions"][:-1] == expected["transactions"]
+                assert final["transactions"][-1].kind == "PRIVATE_JOB_REFUND"
             finally:
                 await restored.dispose()
         finally:

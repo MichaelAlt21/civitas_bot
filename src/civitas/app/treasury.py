@@ -11,6 +11,7 @@ from civitas.app.citizens import CitizenshipAccessError, is_discord_id
 from civitas.app.jobs import JobError, JobErrorReason, JobsRepository, budget_week
 from civitas.app.market import MarketRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
+from civitas.domain.government import OfficeKind
 from civitas.domain.jobs import BudgetCaps, BudgetPeriod
 from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH, AccountKind, LedgerError, TransactionKind
 from civitas.domain.treasury import ContractBudget, ContractStatus, StateContract
@@ -64,6 +65,8 @@ class TreasuryRules:
 
 
 class TreasuryRepository(JobsRepository, MarketRepository, Protocol):
+    async def has_active_office(self, guild_id: int, citizen_id: int, office: OfficeKind, at: datetime) -> bool: ...
+
     async def get_contract(self, guild_id: int, contract_id: int, *, lock: bool = False) -> StateContract | None: ...
 
     async def get_contract_by_key(self, guild_id: int, key: str) -> StateContract | None: ...
@@ -144,6 +147,7 @@ class TreasuryService:
         initiator_user_ids: Iterable[int],
         approver_user_ids: Iterable[int],
         rules: TreasuryRules,
+        elected_authority: bool = False,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         initiators, approvers = tuple(initiator_user_ids), tuple(approver_user_ids)
@@ -156,6 +160,7 @@ class TreasuryService:
         self._approver_user_ids = frozenset(approvers)
         self._rules = rules
         self._clock = clock
+        self._elected_authority = elected_authority
 
     async def current_budget(self, guild_id: int | None, user_id: int) -> ContractBudget | None:
         self._authorize(guild_id, user_id)
@@ -166,11 +171,13 @@ class TreasuryService:
     async def activate_budget(self, guild_id: int | None, user_id: int, *, reason: str) -> ContractBudget:
         async with self._audit_denial(guild_id, user_id, "budget.activate"):
             self._authorize(guild_id, user_id)
-            self._require_approver(user_id)
+            if not self._elected_authority:
+                self._require_approver(user_id)
             reason = _text(reason, 200)
             async with self._unit_of_work() as repository:
                 actor = await self._citizen(repository, user_id, lock=True)
                 now = self._clock()
+                await self._require_mandate(repository, actor, OfficeKind.PARLIAMENT, now)
                 existing = await repository.get_contract_budget(actor.guild_id, now, lock=True)
                 if existing is not None:
                     return existing
@@ -204,7 +211,7 @@ class TreasuryService:
     ) -> StateContract:
         async with self._audit_denial(guild_id, user_id, "contract.propose"):
             self._authorize(guild_id, user_id)
-            if user_id not in self._initiator_user_ids:
+            if not self._elected_authority and user_id not in self._initiator_user_ids:
                 raise TreasuryError(TreasuryErrorReason.INITIATOR_REQUIRED)
             if (recipient_user_id is None) == (recipient_company_id is None):
                 raise TreasuryError(TreasuryErrorReason.RECIPIENT_REQUIRED)
@@ -223,6 +230,7 @@ class TreasuryService:
             title, terms, reason = _text(title, 80), _text(terms, 500), _text(reason, 200)
             async with self._unit_of_work() as repository:
                 proposer = await self._citizen(repository, user_id, lock=True)
+                await self._require_mandate(repository, proposer, OfficeKind.PRESIDENT, self._clock())
                 prior = await repository.get_contract_by_key(proposer.guild_id, idempotency_key)
                 if prior is None:
                     now = self._clock()
@@ -361,7 +369,7 @@ class TreasuryService:
         async with self._unit_of_work() as repository:
             actor = await self._citizen(repository, user_id)
             contract = await self._contract(repository, actor.guild_id, contract_id)
-            if not self._is_staff(user_id) and actor.id not in (contract.recipient_citizen_id, contract.proposer_citizen_id):
+            if actor.id not in (contract.recipient_citizen_id, contract.proposer_citizen_id) and not await self._is_staff(repository, actor):
                 raise TreasuryError(TreasuryErrorReason.NOT_CONTRACT_PARTY)
             return contract
 
@@ -377,7 +385,9 @@ class TreasuryService:
         self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._citizen(repository, user_id)
-            return await repository.list_contracts(actor.guild_id, actor.id, include_all=self._is_staff(user_id), limit=_LIST_LIMIT)
+            return await repository.list_contracts(
+                actor.guild_id, actor.id, include_all=await self._is_staff(repository, actor), limit=_LIST_LIMIT,
+            )
 
     @asynccontextmanager
     async def _change(
@@ -386,7 +396,7 @@ class TreasuryService:
     ) -> AsyncIterator[tuple[TreasuryRepository, Citizen, StateContract, Citizen | None]]:
         async with self._audit_denial(guild_id, user_id, action, contract_id):
             self._authorize(guild_id, user_id)
-            if approver:
+            if approver and not self._elected_authority:
                 self._require_approver(user_id)
             async with self._unit_of_work() as repository:
                 actor = await self._citizen(repository, user_id)
@@ -398,6 +408,8 @@ class TreasuryService:
                 actor = verified.get(actor.id)
                 if actor is None:
                     raise TreasuryError(TreasuryErrorReason.CITIZEN_NOT_VERIFIED)
+                if approver:
+                    await self._require_mandate(repository, actor, OfficeKind.PARLIAMENT, self._clock())
                 if approver and actor.id in (contract.recipient_citizen_id, contract.proposer_citizen_id):
                     raise TreasuryError(TreasuryErrorReason.CONFLICT_OF_INTEREST)
                 yield repository, actor, contract, verified.get(contract.recipient_citizen_id)
@@ -460,8 +472,24 @@ class TreasuryService:
         if user_id not in self._approver_user_ids:
             raise TreasuryError(TreasuryErrorReason.APPROVER_REQUIRED)
 
-    def _is_staff(self, user_id: int) -> bool:
-        return user_id in self._initiator_user_ids or user_id in self._approver_user_ids
+    async def _require_mandate(
+        self, repository: TreasuryRepository, actor: Citizen, office: OfficeKind, at: datetime,
+    ) -> None:
+        if self._elected_authority and not await repository.has_active_office(actor.guild_id, actor.id, office, at):
+            reason = (
+                TreasuryErrorReason.INITIATOR_REQUIRED if office == OfficeKind.PRESIDENT
+                else TreasuryErrorReason.APPROVER_REQUIRED
+            )
+            raise TreasuryError(reason)
+
+    async def _is_staff(self, repository: TreasuryRepository, actor: Citizen) -> bool:
+        if not self._elected_authority:
+            return actor.discord_user_id in self._initiator_user_ids or actor.discord_user_id in self._approver_user_ids
+        now = self._clock()
+        return (
+            await repository.has_active_office(actor.guild_id, actor.id, OfficeKind.PRESIDENT, now)
+            or await repository.has_active_office(actor.guild_id, actor.id, OfficeKind.PARLIAMENT, now)
+        )
 
     @staticmethod
     def _require_recipient(recipient: Citizen | None) -> None:

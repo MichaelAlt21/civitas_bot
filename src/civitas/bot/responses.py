@@ -7,19 +7,23 @@ _MESSAGE_LIMIT = 2000
 
 
 async def send_private_lines(interaction: discord.Interaction, *parts: str) -> None:
+    await send_lines(interaction, *parts, ephemeral=True)
+
+
+async def send_lines(interaction: discord.Interaction, *parts: str, ephemeral: bool) -> None:
     page = ""
     for part in parts:
         candidate = f"{page}\n{part}" if page else part
         if page and len(candidate.encode("utf-16-le")) // 2 > _MESSAGE_LIMIT:
-            await _send_page(interaction, page)
+            await _send_page(interaction, page, ephemeral=ephemeral)
             page = part
         else:
             page = candidate
     if page:
-        await _send_page(interaction, page)
+        await _send_page(interaction, page, ephemeral=ephemeral)
 
 
-async def _send_page(interaction: discord.Interaction, content: str) -> None:
+async def _send_page(interaction: discord.Interaction, content: str, *, ephemeral: bool) -> None:
     await interaction.followup.send(
-        content, ephemeral=True, allowed_mentions=_NO_MENTIONS, suppress_embeds=True
+        content, ephemeral=ephemeral, allowed_mentions=_NO_MENTIONS, suppress_embeds=True
     )

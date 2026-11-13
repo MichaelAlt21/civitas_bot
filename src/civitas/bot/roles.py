@@ -20,18 +20,43 @@ class DiscordCitizenRoleGateway:
         self._role = role
 
     async def set_citizen_role(self, discord_user_id: int, *, present: bool) -> None:
-        try:
-            member = await self._guild.fetch_member(discord_user_id)
-        except discord.NotFound as error:
-            if error.code == _UNKNOWN_MEMBER:
-                return
-            raise
+        await set_member_role(
+            self._guild, self._role, discord_user_id, present=present, reason="Civitas citizenship sync"
+        )
 
-        has_role = member.get_role(self._role.id) is not None
-        if present and not has_role:
-            await member.add_roles(self._role, reason="Civitas citizenship sync")
-        elif not present and has_role:
-            await member.remove_roles(self._role, reason="Civitas citizenship sync")
+
+def safe_assignable_role(guild: discord.Guild, role_id: int) -> discord.Role | None:
+    role = guild.get_role(role_id)
+    bot_member = guild.me
+    if (
+        role is None
+        or bot_member is None
+        or not bot_member.guild_permissions.manage_roles
+        or not role.is_assignable()
+    ):
+        return None
+
+    permissions = role.permissions
+    if permissions.administrator or permissions.manage_guild or permissions.manage_roles:
+        return None
+    return role
+
+
+async def set_member_role(
+    guild: discord.Guild, role: discord.Role, discord_user_id: int, *, present: bool, reason: str
+) -> None:
+    try:
+        member = await guild.fetch_member(discord_user_id)
+    except discord.NotFound as error:
+        if error.code == _UNKNOWN_MEMBER:
+            return
+        raise
+
+    has_role = member.get_role(role.id) is not None
+    if present and not has_role:
+        await member.add_roles(role, reason=reason)
+    elif not present and has_role:
+        await member.remove_roles(role, reason=reason)
 
 
 async def _reconcile_once(
@@ -45,20 +70,9 @@ async def _reconcile_once(
         logger.warning("Сервер Discord недоступен для синхронизации роли гражданина")
         return
 
-    role = guild.get_role(role_id)
-    bot_member = guild.me
-    if (
-        role is None
-        or bot_member is None
-        or not bot_member.guild_permissions.manage_roles
-        or not role.is_assignable()
-    ):
+    role = safe_assignable_role(guild, role_id)
+    if role is None:
         logger.warning("Проверьте ID роли гражданина, иерархию ролей и право Manage Roles у бота")
-        return
-
-    permissions = role.permissions
-    if permissions.administrator or permissions.manage_guild or permissions.manage_roles:
-        logger.warning("Выберите роль гражданина без Administrator, Manage Server и Manage Roles")
         return
 
     gateway = DiscordCitizenRoleGateway(guild, role)
