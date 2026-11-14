@@ -48,6 +48,14 @@ class Offer:
 
 
 @dataclass(frozen=True, slots=True)
+class OfferWithdrawal:
+    offer_id: int
+    withdrawn_at: datetime
+    withdrawn_by_citizen_id: int
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class OrderQuote:
     offer: Offer
     seller: Company

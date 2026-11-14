@@ -1,6 +1,6 @@
 """Use cases for personal wallets and configured one-time funding."""
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from enum import StrEnum
 from typing import Protocol
@@ -46,6 +46,8 @@ class WalletRepository(Protocol):
     async def ensure_account(
         self, guild_id: int, kind: AccountKind, citizen_id: int | None = None
     ) -> Account: ...
+
+    async def get_personal_account_id(self, guild_id: int, citizen_id: int) -> int | None: ...
 
     async def get_post(
         self, guild_id: int, kind: TransactionKind, key: str
@@ -140,15 +142,34 @@ class WalletService:
 
     async def balance(self, guild_id: int | None, user_id: int) -> int:
         self._authorize(guild_id, user_id)
-        async with self._unit_of_work() as repository:
-            account = await self._personal_account(repository, user_id)
-            return await repository.get_balance(account.id)
+        return await self._read_wallet(user_id, lambda repo, account_id: repo.get_balance(account_id), empty=0)
 
     async def history(self, guild_id: int | None, user_id: int) -> tuple[HistoryEntry, ...]:
         self._authorize(guild_id, user_id)
+        return await self._read_wallet(
+            user_id, lambda repo, account_id: repo.get_history(account_id, HISTORY_LIMIT), empty=(),
+        )
+
+    async def _read_wallet[Result](
+        self, user_id: int, read: Callable[[WalletRepository, int], Awaitable[Result]], *, empty: Result,
+    ) -> Result:
+        try:
+            async with self._unit_of_work() as repository:
+                account = await self._personal_account(repository, user_id)
+                return await read(repository, account.id)
+        except LedgerError as error:
+            if error.reason != LedgerErrorReason.ECONOMY_READ_ONLY:
+                raise
+
+        # A verified citizen may predate the configured grant. Read existing
+        # postings in a fresh transaction if the funding attempt was rolled back.
         async with self._unit_of_work() as repository:
-            account = await self._personal_account(repository, user_id)
-            return await repository.get_history(account.id, HISTORY_LIMIT)
+            citizens = await repository.get_citizens(self._guild_id, (user_id,))
+            if not citizens or citizens[0].status != CitizenStatus.VERIFIED:
+                raise WalletError(WalletErrorReason.CITIZEN_NOT_VERIFIED)
+            citizen = citizens[0]
+            account_id = await repository.get_personal_account_id(citizen.guild_id, citizen.id)
+            return await read(repository, account_id) if account_id is not None else empty
 
     async def prepare_transfer(
         self, guild_id: int | None, user_id: int, recipient_user_id: int, amount: int

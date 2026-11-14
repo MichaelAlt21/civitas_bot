@@ -66,6 +66,7 @@ def repository() -> AsyncMock:
     repo.list_owned_companies.return_value = ()
     repo.create_company.side_effect = create_company
     repo.get_offer.return_value = OFFER
+    repo.get_offer_withdrawal.return_value = None
     repo.get_offer_by_key.return_value = None
     repo.create_offer.return_value = OFFER
     repo.get_order.return_value = FUNDED

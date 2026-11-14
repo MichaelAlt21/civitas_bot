@@ -12,7 +12,9 @@ from civitas.app.citizens import is_discord_id
 from civitas.app.wallet import WalletFunding, WalletRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH, Account, AccountKind, TransactionKind
-from civitas.domain.market import BASIS_POINTS, MAX_DELIVERY_HOURS, Company, MarketOrder, Offer, OrderQuote, OrderStatus, sales_tax
+from civitas.domain.market import (
+    BASIS_POINTS, MAX_DELIVERY_HOURS, Company, MarketOrder, Offer, OfferWithdrawal, OrderQuote, OrderStatus, sales_tax,
+)
 
 _LIST_LIMIT = 10
 
@@ -24,6 +26,7 @@ class MarketErrorReason(StrEnum):
     NAME_TAKEN = "name_taken"
     COMPANY_LIMIT = "company_limit"
     OFFER_NOT_FOUND = "offer_not_found"
+    OFFER_WITHDRAWN = "offer_withdrawn"
     ORDER_NOT_FOUND = "order_not_found"
     NOT_ORDER_PARTY = "not_order_party"
     ARBITER_REQUIRED = "arbiter_required"
@@ -84,7 +87,11 @@ class MarketRepository(WalletRepository, Protocol):
         created_at: datetime,
     ) -> Company | None: ...
 
-    async def get_offer(self, guild_id: int, offer_id: int) -> Offer | None: ...
+    async def get_offer(self, guild_id: int, offer_id: int, *, lock: bool = False) -> Offer | None: ...
+
+    async def get_offer_withdrawal(self, guild_id: int, offer_id: int) -> OfferWithdrawal | None: ...
+
+    async def create_offer_withdrawal(self, guild_id: int, withdrawal: OfferWithdrawal) -> None: ...
 
     async def get_offer_by_key(self, guild_id: int, key: str) -> Offer | None: ...
 
@@ -316,6 +323,22 @@ class MarketService:
             citizen = await self._citizen(repository, user_id)
             return await repository.list_offers(citizen.guild_id, _LIST_LIMIT)
 
+    async def withdraw_offer(
+        self, guild_id: int | None, user_id: int, offer_id: int, *, reason: str,
+    ) -> OfferWithdrawal:
+        self._authorize(guild_id, user_id)
+        reason = _text(reason, 200)
+        async with self._unit_of_work() as repository:
+            owner = await self._citizen(repository, user_id, lock=True)
+            offer = await self._offer(repository, owner.guild_id, offer_id, lock=True)
+            await self._owned_company(repository, owner, offer.company_id)
+            existing = await repository.get_offer_withdrawal(owner.guild_id, offer.id)
+            if existing is not None:
+                return existing
+            withdrawal = OfferWithdrawal(offer.id, self._clock(), owner.id, reason)
+            await repository.create_offer_withdrawal(owner.guild_id, withdrawal)
+            return withdrawal
+
     async def quote_order(
         self, guild_id: int | None, user_id: int, offer_id: int, *, buyer_company_id: int | None = None
     ) -> OrderQuote:
@@ -337,7 +360,9 @@ class MarketService:
             prior = await repository.get_order_by_key(buyer.guild_id, idempotency_key)
             if prior is not None:
                 return self._replay_order(prior, buyer.id, quote)
-            offer, seller = await self._trade_parties(repository, buyer, quote.offer.id, quote.buyer_company_id)
+            offer, seller = await self._trade_parties(
+                repository, buyer, quote.offer.id, quote.buyer_company_id, lock=True,
+            )
             now = self._clock()
             if (
                 quote.offer != offer
@@ -529,14 +554,22 @@ class MarketService:
             raise MarketError(MarketErrorReason.COMPANY_NOT_OWNED)
         return company
 
-    async def _trade_parties(
-        self, repository: MarketRepository, buyer: Citizen, offer_id: int, buyer_company_id: int | None
-    ) -> tuple[Offer, Company]:
+    @staticmethod
+    async def _offer(repository: MarketRepository, guild_id: int, offer_id: int, *, lock: bool) -> Offer:
         if not _valid_id(offer_id):
             raise MarketError(MarketErrorReason.OFFER_NOT_FOUND)
-        offer = await repository.get_offer(buyer.guild_id, offer_id)
+        offer = await repository.get_offer(guild_id, offer_id, lock=lock)
         if offer is None:
             raise MarketError(MarketErrorReason.OFFER_NOT_FOUND)
+        return offer
+
+    async def _trade_parties(
+        self, repository: MarketRepository, buyer: Citizen, offer_id: int, buyer_company_id: int | None,
+        *, lock: bool = False,
+    ) -> tuple[Offer, Company]:
+        offer = await self._offer(repository, buyer.guild_id, offer_id, lock=lock)
+        if await repository.get_offer_withdrawal(buyer.guild_id, offer.id) is not None:
+            raise MarketError(MarketErrorReason.OFFER_WITHDRAWN)
         seller = await self._company(repository, buyer.guild_id, offer.company_id)
         if seller.owner_citizen_id == buyer.id:
             raise MarketError(MarketErrorReason.SELF_TRADE)

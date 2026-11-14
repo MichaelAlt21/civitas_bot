@@ -109,6 +109,12 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
         )
         return int(balance)
 
+    async def get_personal_account_id(self, guild_id: int, citizen_id: int) -> int | None:
+        return await self._session.scalar(select(FinancialAccountRow.id).where(
+            FinancialAccountRow.guild_id == guild_id, FinancialAccountRow.citizen_id == citizen_id,
+            FinancialAccountRow.kind == AccountKind.PERSONAL.value,
+        ))
+
     async def _reserved_treasury_cash(self, guild_id: int) -> int:
         reserved = await self._session.scalar(
             select(func.coalesce(func.sum(BudgetPeriodRow.reserved_total), 0)).where(

@@ -215,6 +215,19 @@ def add_market_commands(
                 interaction.locale, "market.offer.published", id=str(offer.id), title=_label(offer.title)
             ))
 
+    @market.command(name="withdraw", description=command_description("market.withdraw"))
+    @app_commands.describe(
+        offer_id=command_description("market.offer_id"), reason=command_description("market.withdraw.reason"),
+    )
+    async def withdraw_offer(
+        interaction: discord.Interaction, offer_id: app_commands.Range[int, 1], reason: app_commands.Range[str, 1, 200],
+    ) -> None:
+        async with _market_response(interaction):
+            withdrawal = await market_service.withdraw_offer(
+                interaction.guild_id, interaction.user.id, offer_id, reason=reason,
+            )
+            await _reply(interaction, message(interaction.locale, "market.offer.withdrawn", id=str(withdrawal.offer_id)))
+
     @market.command(name="buy", description=command_description("market.buy"))
     @app_commands.describe(
         offer_id=command_description("market.offer_id"), buyer_company_id=command_description("market.buyer_company_id")

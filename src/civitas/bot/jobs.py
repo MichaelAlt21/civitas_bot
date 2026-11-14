@@ -28,6 +28,8 @@ async def _job_response(interaction: discord.Interaction) -> AsyncIterator[None]
     except LedgerError as error:
         if error.reason == LedgerErrorReason.INSUFFICIENT_FUNDS:
             key = "jobs.error.treasury_insufficient_funds"
+        elif error.reason == LedgerErrorReason.ECONOMY_READ_ONLY:
+            key = "wallet.error.economy_read_only"
         else:
             key = "error.temporary"
         await _reply(interaction, message(interaction.locale, key))

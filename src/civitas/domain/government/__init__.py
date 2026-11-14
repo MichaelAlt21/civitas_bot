@@ -38,6 +38,17 @@ class ElectionProtocol:
 
 
 @dataclass(frozen=True, slots=True)
+class CrisisResolution:
+    election_id: int
+    proposed_by_citizen_id: int
+    proposed_at: datetime
+    proposal_reason: str
+    confirmed_by_citizen_id: int | None = None
+    confirmed_at: datetime | None = None
+    confirmation_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Election:
     id: int
     guild_id: int
@@ -61,6 +72,22 @@ class Election:
     runoff_of_id: int | None = None
     extension_hours: int = 24
     candidate_discord_user_ids: tuple[int, ...] = ()
+    retry_of_id: int | None = None
+    crisis_resolution: CrisisResolution | None = None
+
+    @property
+    def failed(self) -> bool:
+        return self.certified_at is not None and self.status in (ElectionStatus.NO_QUORUM, ElectionStatus.TIED)
+
+    @property
+    def opens_political_crisis(self) -> bool:
+        return self.failed and self.retry_of_id is not None
+
+    @property
+    def is_political_crisis_open(self) -> bool:
+        return self.opens_political_crisis and (
+            self.crisis_resolution is None or self.crisis_resolution.confirmed_at is None
+        )
 
 
 @dataclass(frozen=True, slots=True)

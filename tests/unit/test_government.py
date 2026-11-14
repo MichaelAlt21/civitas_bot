@@ -27,6 +27,7 @@ POLL = "https://poll.example/results/17"
 def repository() -> AsyncMock:
     repo = AsyncMock(spec=GovernmentRepository)
     elections: dict[int, Election] = {}
+    poll_bindings: dict[tuple[int, str], int] = {}
 
     def get_citizens(guild_id: int, user_ids: tuple[int, ...], *, lock: bool) -> tuple[Citizen, ...]:
         assert guild_id == DISCORD_GUILD
@@ -40,6 +41,9 @@ def repository() -> AsyncMock:
     def update(election: Election) -> None:
         elections[election.id] = election
 
+    def bind_poll_source(guild_id: int, election_id: int, source_url: str) -> bool:
+        return poll_bindings.setdefault((guild_id, source_url), election_id) == election_id
+
     repo.ensure_guild.return_value = GUILD
     repo.get_citizens.side_effect = get_citizens
     repo.list_verified_citizens.return_value = CITIZENS
@@ -47,6 +51,11 @@ def repository() -> AsyncMock:
     repo.get_election_by_key.side_effect = lambda guild_id, key: next(
         (election for election in elections.values() if election.request_key == key), None
     )
+    repo.has_future_office_term.return_value = False
+    repo.get_latest_election.side_effect = lambda guild_id, office: next(
+        (election for election in reversed(elections.values()) if election.office == office), None
+    )
+    repo.bind_poll_source.side_effect = bind_poll_source
     repo.create_election.side_effect = create
     repo.update_election.side_effect = update
     repo.apply_election.side_effect = update
@@ -56,7 +65,10 @@ def repository() -> AsyncMock:
     return repo
 
 
-def service(repository: AsyncMock, *, now: datetime = NOW, rules: ElectionRules = RULES) -> GovernmentService:
+def service(
+    repository: AsyncMock, *, now: datetime = NOW, rules: ElectionRules = RULES,
+    commissioners: tuple[Citizen, ...] = (FIRST, SECOND, CAROL), excluded_ids: tuple[int, ...] = (),
+) -> GovernmentService:
     @asynccontextmanager
     async def unit_of_work() -> AsyncIterator[GovernmentRepository]:
         yield repository
@@ -64,11 +76,11 @@ def service(repository: AsyncMock, *, now: datetime = NOW, rules: ElectionRules 
     citizens = CitizensService(
         lambda: pytest.fail("Authorization should not use a separate transaction"),
         guild_id=DISCORD_GUILD,
-        allowed_user_ids=[citizen.discord_user_id for citizen in CITIZENS],
+        allowed_user_ids=[citizen.discord_user_id for citizen in CITIZENS if citizen.discord_user_id not in excluded_ids],
     )
     return GovernmentService(
         unit_of_work, guild_id=DISCORD_GUILD, authorize=citizens.authorize,
-        commissioner_user_ids=[FIRST.discord_user_id, SECOND.discord_user_id, CAROL.discord_user_id],
+        commissioner_user_ids=[citizen.discord_user_id for citizen in commissioners],
         rules=rules, clock=lambda: now,
     )
 
@@ -110,6 +122,43 @@ async def test_open_requires_population_threshold_and_valid_slate(repository: As
     repository.create_election.assert_not_awaited()
 
 
+@pytest.mark.parametrize("unavailable", ["candidate", "not_admitted", "not_verified"])
+@pytest.mark.asyncio
+async def test_open_requires_two_independent_admitted_verified_commissioners(
+    repository: AsyncMock, unavailable: str,
+) -> None:
+    candidates = (ALICE.discord_user_id, SECOND.discord_user_id if unavailable == "candidate" else BOB.discord_user_id)
+    if unavailable == "not_verified":
+        repository.list_verified_citizens.return_value = tuple(citizen for citizen in CITIZENS if citizen != SECOND)
+    gov = service(
+        repository, rules=replace(RULES, min_eligible=9), commissioners=(FIRST, SECOND),
+        excluded_ids=(SECOND.discord_user_id,) if unavailable == "not_admitted" else (),
+    )
+
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INSUFFICIENT_COMMISSIONERS):
+        await gov.open_election(
+            DISCORD_GUILD, FIRST.discord_user_id, office=OfficeKind.PRESIDENT,
+            candidate_user_ids=candidates, reason="Выборы", idempotency_key="open",
+        )
+    repository.create_election.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_future_term_blocks_new_election_but_allows_replay(repository: AsyncMock) -> None:
+    gov = service(repository)
+    opened = await open_president(gov)
+    repository.has_future_office_term.return_value = True
+
+    assert await open_president(gov) == opened
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.ELECTION_IN_PROGRESS):
+        await gov.open_election(
+            DISCORD_GUILD, FIRST.discord_user_id, office=OfficeKind.PRESIDENT,
+            candidate_user_ids=opened.candidate_discord_user_ids, reason="Выборы", idempotency_key="next",
+        )
+    repository.has_future_office_term.assert_awaited_with(GUILD, OfficeKind.PRESIDENT, NOW)
+    repository.create_election.assert_awaited_once()
+
+
 @pytest.mark.parametrize("source", ["http://poll.example/result", "https://poll.example.invalid/results", "https://poll.example@other.invalid/results", "https://poll.example:8080/results"])
 @pytest.mark.asyncio
 async def test_manual_results_accept_only_configured_https_sources(repository: AsyncMock, source: str) -> None:
@@ -121,6 +170,42 @@ async def test_manual_results_accept_only_configured_https_sources(repository: A
             tallies={ALICE.discord_user_id: 4, BOB.discord_user_id: 0}, reason="Протокол",
         )
     repository.update_election.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_poll_source_can_be_replayed_for_one_election_only(repository: AsyncMock) -> None:
+    initial = service(repository)
+    president = await open_president(initial)
+    parliament = await initial.open_election(
+        DISCORD_GUILD, FIRST.discord_user_id, office=OfficeKind.PARLIAMENT,
+        candidate_user_ids=(ALICE.discord_user_id, BOB.discord_user_id, DAN.discord_user_id),
+        reason="Выборы", idempotency_key="parliament",
+    )
+    closed = service(repository, now=president.closes_at)
+    original_url = "https://POLL.EXAMPLE:443/results/17/?poll=one#results"
+    alias_url = f"{POLL}?poll=one"
+    presidential_tallies = {ALICE.discord_user_id: 3, BOB.discord_user_id: 1}
+    parliamentary_tallies = {ALICE.discord_user_id: 2, BOB.discord_user_id: 1, DAN.discord_user_id: 1}
+    recorded = await closed.record_protocol(
+        DISCORD_GUILD, FIRST.discord_user_id, president.id, source_url=original_url, participants=4,
+        tallies=presidential_tallies, reason="Протокол",
+    )
+    assert recorded.protocol.source_url == original_url
+    assert await closed.record_protocol(
+        DISCORD_GUILD, FIRST.discord_user_id, president.id, source_url=alias_url, participants=4,
+        tallies=presidential_tallies, reason="Протокол",
+    ) == recorded
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_SOURCE):
+        await closed.record_protocol(
+            DISCORD_GUILD, FIRST.discord_user_id, parliament.id, source_url=alias_url, participants=4,
+            tallies=parliamentary_tallies, reason="Протокол",
+        )
+    repository.update_election.assert_awaited_once_with(recorded)
+    distinct = await closed.record_protocol(
+        DISCORD_GUILD, FIRST.discord_user_id, parliament.id, source_url=f"{POLL}?poll=two", participants=4,
+        tallies=parliamentary_tallies, reason="Протокол",
+    )
+    assert distinct.protocol.source_url.endswith("?poll=two")
 
 
 @pytest.mark.asyncio

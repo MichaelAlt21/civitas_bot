@@ -5,10 +5,10 @@ from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError
 from civitas.app.wallet import WalletError, WalletService
-from civitas.domain.ledger import LedgerError, TransactionKind
+from civitas.domain.ledger import LedgerError
 
 from .confirmation import OperationConfirmation
-from .localization import command_description, message
+from .localization import command_description, message, transaction_label
 
 _WALLET_ERRORS = (CitizenshipAccessError, WalletError, LedgerError)
 _HISTORY_LIMIT = 10
@@ -55,12 +55,9 @@ def add_wallet_commands(
         else:
             lines = []
             for entry in entries[:_HISTORY_LIMIT]:
-                kind = entry.kind.value.lower()
-                if entry.kind == TransactionKind.TRANSFER:
-                    kind = "transfer_in" if entry.delta > 0 else "transfer_out"
-                label = message(locale, f"wallet.history.{kind}")
+                label = transaction_label(locale, entry.kind, entry.delta)
                 date = discord.utils.format_dt(entry.created_at, style="f")
-                lines.append(f"• {date} — {label}: {entry.delta:+d} {currency_symbol}")
+                lines.append(f"• #{entry.transaction_id} · {date} — {label}: {entry.delta:+d} {currency_symbol}")
             if lines:
                 reply = "\n".join([f"**{message(locale, 'wallet.history.title')}**", *lines])
             else:

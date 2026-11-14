@@ -12,6 +12,7 @@ from civitas.bot.government import _reconcile_office_roles, add_government_comma
 from civitas.bot.localization import CommandTranslator
 from civitas.domain.government import (
     CandidateTally,
+    CrisisResolution,
     Election,
     ElectionProtocol,
     ElectionStatus,
@@ -80,7 +81,31 @@ async def test_localized_government_commands_are_guild_only(commands):
     payload = await election.get_translated_payload(tree, CommandTranslator())
     assert payload["description_localizations"] == {"ru": "Выборы и подтверждённые итоги"}
     commission = next(option for option in payload["options"] if option["name"] == "commission")
-    assert {item["name"] for item in commission["options"]} == {"open", "record", "inspect", "certify"}
+    by_name = {item["name"]: item for item in commission["options"]}
+    assert by_name.keys() == {"active", "open", "record", "inspect", "certify", "resolve_crisis", "confirm_crisis"}
+    for command in ("resolve_crisis", "confirm_crisis"):
+        assert {item["name"] for item in by_name[command]["options"] if item["required"]} == {"election_id", "reason"}
+        assert "ru" in by_name[command]["description_localizations"]
+    opening = next(option for option in commission["options"] if option["name"] == "open")
+    retry = next(option for option in opening["options"] if option["name"] == "retry_of_id")
+    assert retry["description_localizations"] == {"ru": "Номер несостоявшихся выборов для повторного голосования"}
+    assert not retry["required"]
+
+
+@pytest.mark.asyncio
+async def test_active_elections_list_status_and_deadline_privately(commands):
+    service, _, _, _, commission = commands
+    service.list_unfinished_elections.return_value = (
+        replace(OPEN, status=ElectionStatus.PENDING_CERTIFICATION, protocol=PROTOCOL),
+    )
+    command = interaction(locale=discord.Locale.american_english)
+
+    await commission.get_command("active").callback(command)
+
+    service.list_unfinished_elections.assert_awaited_once_with(GUILD, COMMISSIONER)
+    content = reply(command, private=True)
+    assert f"#{OPEN.id}" in content and discord.utils.format_dt(END, style="f") in content
+    assert SOURCE not in content and OPEN.reason not in content
 
 
 @pytest.mark.asyncio
@@ -120,6 +145,128 @@ async def test_public_results_use_certified_service_and_hide_audit_metadata(comm
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("locale, retry_label, crisis_label", [
+    (discord.Locale.russian, "допускается одно повторное голосование", "игровой политический кризис"),
+    (discord.Locale.american_english, "one repeat vote allowed", "in-game political crisis"),
+])
+async def test_public_history_marks_failed_votes_and_details_explain_the_in_game_crisis(
+    commands, locale, retry_label, crisis_label,
+):
+    service, _, _, election, _ = commands
+    protocol = replace(PROTOCOL, winners=(), reason="Private evidence")
+    failure = replace(OPEN, status=ElectionStatus.NO_QUORUM, protocol=protocol, certified_at=END)
+    retry = replace(failure, id=4, retry_of_id=failure.id, status=ElectionStatus.TIED)
+    service.list_results.return_value = (retry, failure)
+    service.get_public_result.return_value = retry
+    history, detail = interaction(locale=locale), interaction(locale=locale)
+
+    await election.get_command("results").callback(history)
+    await election.get_command("results").callback(detail, retry.id)
+
+    assert retry_label in reply(history, private=False)
+    assert crisis_label in reply(history, private=False)
+    explanation = reply(detail, private=False)
+    assert ("в рамках ролевой игры" if locale == discord.Locale.russian else "for roleplay") in explanation
+    assert str(failure.id) in explanation
+    assert protocol.reason not in explanation
+
+
+@pytest.mark.asyncio
+async def test_pending_crisis_resolution_is_private_until_independently_confirmed(commands):
+    service, _, _, election, commission = commands
+    retry = replace(OPEN, id=4, retry_of_id=OPEN.id, status=ElectionStatus.TIED, certified_at=END)
+    resolution = CrisisResolution(retry.id, 7, END, "Private proposal @everyone")
+    pending = replace(retry, crisis_resolution=resolution)
+    confirmed = replace(resolution, confirmed_by_citizen_id=8, confirmed_at=END, confirmation_reason="Private check")
+    resolved = replace(retry, crisis_resolution=confirmed)
+    service.get_election.return_value = pending
+    service.get_public_result.side_effect = [pending, resolved]
+    service.list_results.return_value = (resolved,)
+    inspect, before, detail, history = [interaction() for _ in range(4)]
+
+    await commission.get_command("inspect").callback(inspect, retry.id)
+    await election.get_command("results").callback(before, retry.id)
+    await election.get_command("results").callback(detail, retry.id)
+    await election.get_command("results").callback(history)
+
+    private = reply(inspect, private=True)
+    assert "ожидает подтверждения другим членом комиссии" in private
+    assert "Основание предлагаемого решения · Private proposal @\u200beveryone" in private
+    assert "@everyone" not in private
+    unconfirmed = reply(before, private=False)
+    assert "ролевой игры" in unconfirmed and "разрешила" not in unconfirmed
+    assert "Private proposal" not in unconfirmed
+    outcome = reply(detail, private=False)
+    assert "Комиссия разрешила провести новые выборы" in outcome
+    assert resolution.proposal_reason not in outcome and confirmed.confirmation_reason not in outcome
+    assert "игровой политический кризис завершён" in reply(history, private=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command, method, confirmed, expected", [
+    ("resolve_crisis", "propose_crisis_resolution", False, "awaiting confirmation by another commissioner"),
+    ("confirm_crisis", "confirm_crisis_resolution", True, "New elections can be opened"),
+])
+async def test_crisis_commands_forward_private_resolution_reason(commands, command, method, confirmed, expected):
+    service, _, _, _, commission = commands
+    request = interaction(locale=discord.Locale.american_english)
+    action = getattr(service, method)
+    resolution = CrisisResolution(4, 7, END, "Private RP account")
+    if confirmed:
+        resolution = replace(resolution, confirmed_by_citizen_id=8, confirmed_at=END, confirmation_reason="Check")
+    action.return_value = resolution
+
+    await commission.get_command(command).callback(request, resolution.election_id, "My audit reason")
+
+    action.assert_awaited_once_with(GUILD, COMMISSIONER, resolution.election_id, reason="My audit reason")
+    content = reply(request, private=True)
+    assert expected in content and "My audit reason" not in content and resolution.proposal_reason not in content
+
+
+@pytest.mark.asyncio
+async def test_crisis_confirmation_independence_error_stays_private(commands):
+    service, _, _, _, commission = commands
+    service.confirm_crisis_resolution.side_effect = GovernmentError(GovernmentErrorReason.INDEPENDENT_CERTIFICATION_REQUIRED)
+    request = interaction()
+
+    await commission.get_command("confirm_crisis").callback(request, 4, "My audit reason")
+
+    assert reply(request, private=True) == "Результат должен подтвердить другой член комиссии."
+
+
+@pytest.mark.asyncio
+async def test_crisis_inspection_access_denial_stays_private(commands):
+    service, _, _, _, commission = commands
+    service.get_election.side_effect = GovernmentError(GovernmentErrorReason.COMMISSIONER_REQUIRED)
+    request = interaction()
+
+    await commission.get_command("inspect").callback(request, 4)
+
+    assert reply(request, private=True) == "Для этого действия нужны полномочия избирательной комиссии."
+
+
+@pytest.mark.asyncio
+async def test_commission_forwards_failed_election_id_without_publishing_unconfirmed_crisis(commands):
+    service, _, _, _, commission = commands
+    retry = replace(OPEN, id=4, retry_of_id=OPEN.id)
+    service.open_election.return_value = retry
+    service.record_protocol.return_value = replace(retry, status=ElectionStatus.NO_QUORUM, protocol=PROTOCOL)
+    opening, recording = interaction(), interaction()
+
+    await commission.get_command("open").callback(opening, "PRESIDENT", str(CANDIDATE), "Repeat", OPEN.id)
+    await commission.get_command("record").callback(recording, retry.id, SOURCE, 1, f"{CANDIDATE}=1", "Count")
+
+    service.open_election.assert_awaited_once_with(
+        GUILD, COMMISSIONER, office=OfficeKind.PRESIDENT, candidate_user_ids=(CANDIDATE,),
+        reason="Repeat", idempotency_key=str(opening.id), retry_of_id=OPEN.id,
+    )
+    assert f"Повторное голосование по выборам № {OPEN.id}" in reply(opening, private=True)
+    content = reply(recording, private=True)
+    assert "кворум не достигнут" in content
+    assert "кризис" not in content
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", [GovernmentErrorReason.RESULT_NOT_PUBLIC, GovernmentErrorReason.ELECTION_NOT_FOUND])
 async def test_public_lookup_does_not_expose_provisional_election(commands, reason):
     service, _, _, election, _ = commands
@@ -149,7 +296,7 @@ async def test_commission_commands_forward_aggregate_only_and_reply_privately(co
 
     service.open_election.assert_awaited_once_with(
         GUILD, COMMISSIONER, office=OfficeKind.PRESIDENT, candidate_user_ids=(CANDIDATE, OTHER_CANDIDATE),
-        reason="Open", idempotency_key=str(opening.id), runoff_of_id=None,
+        reason="Open", idempotency_key=str(opening.id), retry_of_id=None,
     )
     service.record_protocol.assert_awaited_once_with(
         GUILD, COMMISSIONER, OPEN.id, source_url=SOURCE, participants=2,
@@ -193,7 +340,7 @@ async def test_office_sync_adds_active_role_removes_expired_role_and_skips_unsaf
     guild = SimpleNamespace(
         unavailable=False, get_role={PRESIDENT_ROLE: president, PARLIAMENT_ROLE: parliament}.get,
         me=SimpleNamespace(guild_permissions=discord.Permissions(manage_roles=True)),
-        fetch_member=AsyncMock(side_effect=members.get),
+        fetch_member=AsyncMock(side_effect=members.get), channels=[],
     )
     service = Mock(spec=GovernmentService)
     service.office_role_assignments.return_value = (

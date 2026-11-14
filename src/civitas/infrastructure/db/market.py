@@ -7,10 +7,10 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
-from civitas.domain.market import Company, MarketOrder, Offer, OrderStatus
+from civitas.domain.market import Company, MarketOrder, Offer, OfferWithdrawal, OrderStatus
 
 from .jobs import PostgresJobsRepository
-from .market_models import OfferRow, OrderRow, OrganizationRow
+from .market_models import OfferRow, OfferWithdrawalRow, OrderRow, OrganizationRow
 from .models import CitizenRow
 
 
@@ -124,11 +124,27 @@ class PostgresMarketRepository(PostgresJobsRepository):
         )
         return _to_company(row, owner_discord_user_id) if row is not None else None
 
-    async def get_offer(self, guild_id: int, offer_id: int) -> Offer | None:
-        row = await self._session.scalar(
-            select(OfferRow).where(OfferRow.guild_id == guild_id, OfferRow.id == offer_id)
-        )
+    async def get_offer(self, guild_id: int, offer_id: int, *, lock: bool = False) -> Offer | None:
+        statement = select(OfferRow).where(OfferRow.guild_id == guild_id, OfferRow.id == offer_id)
+        if lock:
+            statement = statement.with_for_update(key_share=True)
+        row = await self._session.scalar(statement)
         return _to_offer(row) if row is not None else None
+
+    async def get_offer_withdrawal(self, guild_id: int, offer_id: int) -> OfferWithdrawal | None:
+        row = await self._session.scalar(select(OfferWithdrawalRow).where(
+            OfferWithdrawalRow.guild_id == guild_id, OfferWithdrawalRow.offer_id == offer_id,
+        ))
+        return OfferWithdrawal(
+            row.offer_id, row.withdrawn_at.astimezone(UTC), row.withdrawn_by_citizen_id, row.reason,
+        ) if row is not None else None
+
+    async def create_offer_withdrawal(self, guild_id: int, withdrawal: OfferWithdrawal) -> None:
+        await self._session.execute(insert(OfferWithdrawalRow).values(
+            guild_id=guild_id, offer_id=withdrawal.offer_id,
+            withdrawn_by_citizen_id=withdrawal.withdrawn_by_citizen_id,
+            withdrawn_at=withdrawal.withdrawn_at, reason=withdrawal.reason,
+        ))
 
     async def get_offer_by_key(self, guild_id: int, key: str) -> Offer | None:
         row = await self._session.scalar(
@@ -138,7 +154,10 @@ class PostgresMarketRepository(PostgresJobsRepository):
 
     async def list_offers(self, guild_id: int, limit: int) -> tuple[Offer, ...]:
         rows = await self._session.scalars(
-            select(OfferRow).where(OfferRow.guild_id == guild_id).order_by(OfferRow.id.desc()).limit(limit)
+            select(OfferRow).where(
+                OfferRow.guild_id == guild_id,
+                ~select(OfferWithdrawalRow.offer_id).where(OfferWithdrawalRow.offer_id == OfferRow.id).exists(),
+            ).order_by(OfferRow.id.desc()).limit(limit)
         )
         return tuple(_to_offer(row) for row in rows)
 

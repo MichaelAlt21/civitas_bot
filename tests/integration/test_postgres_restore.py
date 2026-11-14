@@ -18,7 +18,9 @@ from civitas.app.wallet import WalletFunding, WalletService
 from civitas.domain.assets import AssetKind
 from civitas.domain.jobs import BudgetCaps, JobCategory
 from civitas.infrastructure.db import create_db_engine
+from civitas.infrastructure.db.maintenance import PostgresMaintenanceUnitOfWork
 from civitas.infrastructure.db.private_jobs import PostgresPrivateJobUnitOfWork
+from civitas.infrastructure.db.receipts import PostgresReceiptUnitOfWork
 
 
 async def _run_postgres_tool(tool: Path, arguments: list[str], environment: dict[str, str]) -> None:
@@ -45,6 +47,10 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         "orders": "SELECT id, status, price, tax_bp, buyer_account_id FROM orders ORDER BY id",
         "assets": "SELECT id, status, owner_citizen_id, owner_company_id FROM assets ORDER BY id",
         "titles": "SELECT asset_id, kind, buyer_company_id, transaction_id FROM asset_transfers ORDER BY asset_id, kind",
+        "receipt_preferences": "SELECT citizen_id, locale FROM receipt_preferences ORDER BY citizen_id",
+        "receipts": "SELECT transaction_id, citizen_id, locale, sent_at FROM private_receipts ORDER BY id",
+        "maintenance": "SELECT guild_id, read_only FROM economy_maintenance ORDER BY guild_id",
+        "maintenance_audit": "SELECT actor_discord_user_id, read_only, reason FROM economy_maintenance_audit ORDER BY id",
     }
     async with engine.connect() as connection:
         return {
@@ -75,8 +81,10 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
         clock=lambda: now,
     )
     await citizens.register(101, 201)
-    await citizens.register(101, 202)
+    worker = (await citizens.register(101, 202)).citizen
     await citizens.register(101, 203)
+    async with PostgresReceiptUnitOfWork(pg_engine)() as repository:
+        await repository.set_receipt_preference(worker.guild_id, worker.id, "ru")
     task = await jobs.publish(
         101, 201, category=JobCategory.LOGISTICS, title="Test delivery",
         requirements="Deliver a fictional parcel", reward=30,
@@ -148,7 +156,14 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert await wallet.balance(101, 202) == 120
     assert await market.company_balance(101, 201, company.id) == 100
 
+    async with PostgresMaintenanceUnitOfWork(pg_engine)() as repository:
+        assert await repository.set_economy_read_only(
+            101, True, actor_discord_user_id=901, reason="Fixture pause before backup", at=now,
+        )
+
     expected = await _snapshot(pg_engine)
+    assert expected["receipts"] and all(row.locale == "ru" for row in expected["receipts"])
+    assert [row.read_only for row in expected["maintenance"]] == [True]
     assert [(row.status, row.amount) for row in expected["state_contracts"]] == [("PAID", 50), ("RESERVED", 30)]
     assert [(row.status, row.amount) for row in expected["private_jobs"]] == [("PAID", 40), ("OPEN", 20)]
     assert [(row.spent_total, row.reserved_total) for row in expected["budget"]] == [(80, 30)]
@@ -183,6 +198,11 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             restored = create_db_engine(url.set(database=database))
             try:
                 assert await _snapshot(restored) == expected
+                async with PostgresMaintenanceUnitOfWork(restored)() as repository:
+                    assert await repository.get_economy_read_only(101)
+                    assert await repository.set_economy_read_only(
+                        101, False, actor_discord_user_id=901, reason="Recovered fixture", at=now + timedelta(days=7),
+                    )
                 restored_assets = AssetService(
                     PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     staff_user_ids={202}, funding=funding,

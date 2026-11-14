@@ -74,6 +74,7 @@ class Settings:
     guild_id: int
     allowed_user_ids: frozenset[int]
     citizen_role_id: int | None = None
+    track_membership: bool = False
     wallet: WalletSettings | None = None
     jobs: JobsSettings | None = None
     market: MarketSettings | None = None
@@ -82,6 +83,7 @@ class Settings:
     treasury_report_channel_id: int | None = None
     report_timezone: tzinfo = UTC
     government: GovernmentSettings | None = None
+    technical_operator_ids: frozenset[int] = frozenset()
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -124,6 +126,7 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         guild_id=guild_id,
         allowed_user_ids=_discord_ids(env, "CIVITAS_ALLOWED_USER_IDS"),
         citizen_role_id=role_id,
+        track_membership=_enabled(env, "CIVITAS_TRACK_MEMBERSHIP"),
         wallet=wallet,
         jobs=_load_jobs_settings(env, wallet),
         market=_load_market_settings(env, wallet),
@@ -132,6 +135,7 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         treasury_report_channel_id=report_channel_id,
         report_timezone=_budget_timezone(env) if wallet is not None or report_channel_id is not None else UTC,
         government=government,
+        technical_operator_ids=_discord_ids(env, "CIVITAS_TECHNICAL_OPERATOR_IDS"),
     )
 
 

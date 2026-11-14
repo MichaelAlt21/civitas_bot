@@ -82,7 +82,10 @@ async def test_market_metadata_is_guild_only_and_localized(market_commands):
     payload = await market.get_translated_payload(tree, CommandTranslator())
     assert payload["description_localizations"] == {"ru": "Рынок и заказы"}
     commands = {command["name"]: command for command in payload["options"]}
-    assert set(commands) == {"list", "offer", "buy", "order"}
+    assert set(commands) == {"list", "offer", "withdraw", "buy", "order"}
+    withdrawal = commands["withdraw"]
+    assert withdrawal["description_localizations"] == {"ru": "Снять предложение компании с рынка"}
+    assert {option["name"] for option in withdrawal["options"] if option["required"]} == {"offer_id", "reason"}
     action_option = next(option for option in commands["order"]["options"] if option["name"] == "action")
     choices = {choice["value"]: choice["name_localizations"] for choice in action_option["choices"]}
     assert choices["resolve_refund"] == {"ru": "Разрешить спор возвратом"}
@@ -158,6 +161,35 @@ async def test_offer_publish_uses_discord_request_key_and_lists_offer(market_com
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("locale, expected", [
+    (discord.Locale.russian, "Предложение № 2 снято с рынка. Текущие заказы можно завершить."),
+    (discord.Locale.american_english, "Offer #2 was withdrawn. Existing orders can still be completed."),
+])
+async def test_offer_withdrawal_is_private_and_does_not_echo_reason(market_commands, locale, expected):
+    service, _, _, market = market_commands
+    service.withdraw_offer.return_value = SimpleNamespace(offer_id=OFFER.id)
+    request = interaction(actor=SELLER_ID, locale=locale)
+    reason = "Internal reason @everyone"
+
+    await market.get_command("withdraw").callback(request, OFFER.id, reason)
+
+    service.withdraw_offer.assert_awaited_once_with(GUILD_ID, SELLER_ID, OFFER.id, reason=reason)
+    assert private_reply(request) == expected
+
+
+@pytest.mark.asyncio
+async def test_offer_withdrawal_denial_stays_private(market_commands):
+    service, _, _, market = market_commands
+    service.withdraw_offer.side_effect = MarketError(MarketErrorReason.COMPANY_NOT_OWNED)
+    request = interaction(actor=BUYER_ID)
+
+    await market.get_command("withdraw").callback(request, OFFER.id, "test reason")
+
+    service.withdraw_offer.assert_awaited_once_with(GUILD_ID, BUYER_ID, OFFER.id, reason="test reason")
+    assert private_reply(request) == "Это действие доступно владельцу компании."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("buyer_company_id", [None, 9])
 async def test_buy_previews_and_confirms_exact_quote(market_commands, buyer_company_id):
     service, _, _, market = market_commands
@@ -201,6 +233,21 @@ async def test_changed_quote_requires_new_confirmation(market_commands):
     await view.confirm.callback(click)
 
     assert "Условия в подтверждении устарели" in click.edit_original_response.await_args.kwargs["content"]
+    assert view.is_finished()
+
+
+@pytest.mark.asyncio
+async def test_existing_purchase_confirmation_reports_offer_withdrawal(market_commands):
+    service, _, _, market = market_commands
+    service.quote_order.return_value = QUOTE
+    service.fund_order.side_effect = MarketError(MarketErrorReason.OFFER_WITHDRAWN)
+    opening, click = interaction(), interaction()
+
+    await market.get_command("buy").callback(opening, OFFER.id)
+    view = opening.edit_original_response.await_args.kwargs["view"]
+    await view.confirm.callback(click)
+
+    assert click.edit_original_response.await_args.kwargs["content"] == "Это предложение снято с рынка."
     assert view.is_finished()
 
 

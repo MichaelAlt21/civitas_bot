@@ -3,6 +3,8 @@
 import discord
 from discord import app_commands
 
+from civitas.domain.ledger import TransactionKind
+
 _MESSAGES = {
     "command.start.description": {
         "en": "Get started in Civitas",
@@ -26,6 +28,10 @@ _MESSAGES = {
         "en": "View your recent transactions",
         "ru": "Посмотреть свои последние операции",
     },
+    "command.wallet.receipts.description": {"en": "Manage transaction receipts in direct messages", "ru": "Настроить квитанции об операциях в личных сообщениях"},
+    "command.wallet.receipts.enabled.description": {"en": "Enable or disable direct-message receipts", "ru": "Включить или выключить квитанции в личных сообщениях"},
+    "command.wallet.receipt.description": {"en": "View details of a wallet transaction by ID", "ru": "Посмотреть детали операции по номеру"},
+    "command.wallet.receipt.transaction_id.description": {"en": "Transaction ID from a receipt or your wallet history", "ru": "Номер операции из квитанции или истории кошелька"},
     "command.wallet.transfer.description": {
         "en": "Transfer money to a citizen",
         "ru": "Перевести деньги гражданину",
@@ -60,6 +66,8 @@ _MESSAGES = {
     "command.market.description": {"en": "Market and orders", "ru": "Рынок и заказы"},
     "command.market.list.description": {"en": "Browse current offers", "ru": "Посмотреть актуальные предложения"},
     "command.market.offer.description": {"en": "Publish an offer for your company", "ru": "Разместить предложение от своей компании"},
+    "command.market.withdraw.description": {"en": "Withdraw a company offer from the market", "ru": "Снять предложение компании с рынка"},
+    "command.market.withdraw.reason.description": {"en": "Reason for withdrawing this offer", "ru": "Причина снятия предложения с рынка"},
     "command.market.buy.description": {"en": "Review and fund an order", "ru": "Проверить условия и оплатить заказ"},
     "command.market.order.description": {"en": "View your orders or act on an order", "ru": "Посмотреть свои заказы или выполнить действие по заказу"},
     "command.market.offer_id.description": {"en": "Offer ID from `/market list`", "ru": "Номер предложения из `/market list`"},
@@ -111,19 +119,28 @@ _MESSAGES = {
     "command.government.offices.description": {"en": "View office holders and their terms", "ru": "Посмотреть должностных лиц и их сроки"},
     "command.election.description": {"en": "Elections and certified results", "ru": "Выборы и подтверждённые итоги"},
     "command.election.results.description": {"en": "View certified election results", "ru": "Посмотреть подтверждённые итоги выборов"},
-    "command.election.commission.description": {"en": "Record and certify external election results", "ru": "Регистрация и подтверждение результатов внешних выборов"},
+    "command.election.commission.description": {"en": "Manage election records and crisis resolutions", "ru": "Ведение протоколов выборов и решений по кризисам"},
     "command.election.commission.open.description": {"en": "Open an election record and snapshot eligible citizens", "ru": "Открыть выборы и зафиксировать список избирателей"},
+    "command.election.commission.active.description": {"en": "Privately list elections awaiting completion", "ru": "Приватно посмотреть незавершённые выборы"},
     "command.election.commission.record.description": {"en": "Record manual aggregate results from an external poll", "ru": "Внести суммарные результаты внешнего голосования вручную"},
     "command.election.commission.certify.description": {"en": "Independently certify recorded results", "ru": "Подтвердить результаты независимым решением"},
+    "command.election.commission.resolve_crisis.description": {"en": "Record the end of an in-game political crisis", "ru": "Внести решение о завершении игрового политического кризиса"},
+    "command.election.commission.confirm_crisis.description": {"en": "Independently authorize new elections after a crisis", "ru": "Независимо подтвердить разрешение на новые выборы после кризиса"},
     "command.election.commission.inspect.description": {"en": "Privately inspect an election record", "ru": "Приватно посмотреть протокол выборов"},
     "command.election.id.description": {"en": "Election record ID", "ru": "Номер выборов"},
     "command.election.office.description": {"en": "Office being elected", "ru": "На какую должность проводятся выборы"},
     "command.election.candidates.description": {"en": "Candidate Discord IDs, separated by commas", "ru": "Discord ID кандидатов через запятую"},
-    "command.election.runoff_of_id.description": {"en": "ID of the tied election, for a repeat election", "ru": "Номер выборов с ничьей для повторного голосования"},
+    "command.election.retry_of_id.description": {"en": "ID of the failed election, for a repeat vote", "ru": "Номер несостоявшихся выборов для повторного голосования"},
     "command.election.source_url.description": {"en": "HTTPS link to the external poll or tally protocol", "ru": "HTTPS-ссылка на внешний опрос или протокол подсчёта"},
     "command.election.participants.description": {"en": "Number of eligible voters who participated", "ru": "Число допущенных избирателей, участвовавших в голосовании"},
     "command.election.tally.description": {"en": "Aggregate vote counts in the form ID=votes, ID=votes", "ru": "Итоги по кандидатам в формате ID=голоса, ID=голоса"},
     "command.election.reason.description": {"en": "Reason to record in the audit log", "ru": "Основание для журнала аудита"},
+    "command.admin.description": {"en": "Civitas operator tools", "ru": "Команды технического оператора Civitas"},
+    "command.admin.maintenance.description": {"en": "View or change economy read-only mode", "ru": "Посмотреть или изменить режим паузы экономики"},
+    "command.admin.maintenance.enabled.description": {"en": "Pause financial changes when enabled", "ru": "При включении приостановить финансовые изменения"},
+    "command.admin.maintenance.reason.description": {"en": "Reason to audit when changing the mode", "ru": "Основание для журнала при смене режима"},
+    "command.admin.audit.description": {"en": "Privately review recent audit events", "ru": "Приватно посмотреть недавние события аудита"},
+    "command.admin.audit.page.description": {"en": "Page number (starts at 1)", "ru": "Номер страницы (начиная с 1)"},
     "access.wrong_guild": {
         "en": "Civitas commands are available on the game server.",
         "ru": "Команды Civitas доступны на игровом сервере.",
@@ -172,6 +189,10 @@ _MESSAGES = {
         "en": "This command is temporarily unavailable. Please try again later.",
         "ru": "Команда временно недоступна. Попробуйте ещё раз позже.",
     },
+    "wallet.error.economy_read_only": {
+        "en": "The economy is temporarily read-only. You can still view existing records.",
+        "ru": "Экономика временно работает в режиме просмотра. Существующие записи доступны.",
+    },
     "wallet.balance": {"en": "Your balance: {amount}.", "ru": "Ваш баланс: {amount}."},
     "wallet.history.empty": {"en": "Your wallet has no transactions yet.", "ru": "В вашем кошельке пока нет операций."},
     "wallet.history.title": {"en": "Your recent transactions", "ru": "Ваши последние операции"},
@@ -189,6 +210,15 @@ _MESSAGES = {
     "wallet.history.private_job_refund": {"en": "Company job refund", "ru": "Возврат резерва задания компании"},
     "wallet.history.transfer_in": {"en": "Transfer received", "ru": "Входящий перевод"},
     "wallet.history.transfer_out": {"en": "Transfer sent", "ru": "Исходящий перевод"},
+    "wallet.receipts.enabled": {
+        "en": "Civitas will send receipts for new wallet transactions in direct messages when delivery is available.",
+        "ru": "Civitas будет отправлять квитанции о новых операциях в личные сообщения, когда доступна доставка.",
+    },
+    "wallet.receipts.disabled": {"en": "Direct-message receipts are off.", "ru": "Квитанции в личных сообщениях отключены."},
+    "wallet.receipts.title": {"en": "Civitas transaction receipt", "ru": "Квитанция Civitas"},
+    "wallet.receipts.reference": {"en": "Transaction #{transaction_id} · {date}", "ru": "Операция № {transaction_id} · {date}"},
+    "wallet.receipts.details_hint": {"en": "On the Civitas server, use `/wallet receipt transaction_id:{transaction_id}` for details.", "ru": "Подробности на сервере Civitas: `/wallet receipt transaction_id:{transaction_id}`."},
+    "wallet.receipts.not_found": {"en": "No transaction with that ID was found in your wallet.", "ru": "В вашем кошельке нет операции с таким номером."},
     "wallet.transfer.preview": {
         "en": "Send {amount} to {recipient}?",
         "ru": "Перевести {amount} получателю {recipient}?",
@@ -299,6 +329,10 @@ _MESSAGES = {
     "market.list.empty": {"en": "There are no offers right now.", "ru": "Сейчас нет предложений."},
     "market.list.row": {"en": "#{id} · {title} · {price} · Company #{seller}", "ru": "№ {id} · {title} · {price} · Компания № {seller}"},
     "market.offer.published": {"en": "Offer #{id} published: {title}.", "ru": "Предложение № {id} опубликовано: {title}."},
+    "market.offer.withdrawn": {
+        "en": "Offer #{id} was withdrawn. Existing orders can still be completed.",
+        "ru": "Предложение № {id} снято с рынка. Текущие заказы можно завершить.",
+    },
     "market.buy.preview": {
         "en": "**{title}** from {seller}\nPrice held in escrow: {price}\nTax included: {tax} ({rate}%)\nDelivery deadline: {deadline}\n\n{terms}",
         "ru": "**{title}** от {seller}\nСумма в эскроу: {price}\nНалог в составе цены: {tax} ({rate}%)\nСрок выполнения: {deadline}\n\n{terms}",
@@ -334,6 +368,7 @@ _MESSAGES = {
     "market.error.name_taken": {"en": "This company name is already taken.", "ru": "Это название компании уже занято."},
     "market.error.company_limit": {"en": "You have reached the company limit.", "ru": "Вы достигли лимита компаний."},
     "market.error.offer_not_found": {"en": "Offer not found.", "ru": "Предложение не найдено."},
+    "market.error.offer_withdrawn": {"en": "This offer was withdrawn from the market.", "ru": "Это предложение снято с рынка."},
     "market.error.order_not_found": {"en": "Order not found.", "ru": "Заказ не найден."},
     "market.error.not_order_party": {"en": "You do not have access to this order action.", "ru": "У вас нет доступа к этому действию по заказу."},
     "market.error.arbiter_required": {"en": "This action requires market arbiter access.", "ru": "Для этого действия нужны полномочия арбитра рынка."},
@@ -552,7 +587,31 @@ _MESSAGES = {
     "election.detail.winners": {"en": "Elected", "ru": "Избраны"},
     "election.detail.source": {"en": "External source: <{url}>", "ru": "Внешний источник: <{url}>"},
     "election.detail.certified": {"en": "Certified: {date}", "ru": "Подтверждено: {date}"},
-    "election.detail.runoff": {"en": "Repeat vote for election #{id}", "ru": "Повторное голосование по выборам № {id}"},
+    "election.detail.retry": {"en": "Repeat vote for election #{id}", "ru": "Повторное голосование по выборам № {id}"},
+    "election.outcome.retry.short": {"en": "one repeat vote allowed", "ru": "допускается одно повторное голосование"},
+    "election.outcome.retry.detail": {
+        "en": "The commission may hold one repeat vote linked to this result.",
+        "ru": "Комиссия может провести одно повторное голосование со ссылкой на этот результат.",
+    },
+    "election.outcome.crisis.short": {"en": "in-game political crisis", "ru": "игровой политический кризис"},
+    "election.outcome.crisis.detail": {
+        "en": "The repeat vote failed and triggered an in-game political crisis for roleplay.",
+        "ru": "Повторное голосование не состоялось и привело к политическому кризису в рамках ролевой игры.",
+    },
+    "election.outcome.crisis_resolved.short": {"en": "in-game political crisis resolved", "ru": "игровой политический кризис завершён"},
+    "election.outcome.crisis_resolved.detail": {
+        "en": "The in-game political crisis ended. The commission authorized new elections.",
+        "ru": "Игровой политический кризис завершён. Комиссия разрешила провести новые выборы.",
+    },
+    "election.crisis.resolution_pending": {
+        "en": "The resolution for election #{id} is awaiting confirmation by another commissioner.",
+        "ru": "Решение по выборам № {id} ожидает подтверждения другим членом комиссии.",
+    },
+    "election.crisis.resolution_confirmed": {
+        "en": "The resolution for election #{id} has been confirmed. New elections can be opened.",
+        "ru": "Решение по выборам № {id} подтверждено. Можно открыть новые выборы.",
+    },
+    "election.crisis.proposal_reason": {"en": "Proposed resolution reason · {reason}", "ru": "Основание предлагаемого решения · {reason}"},
     "election.status.open": {"en": "open", "ru": "открыто голосование"},
     "election.status.extended": {"en": "voting extended", "ru": "голосование продлено"},
     "election.status.no_quorum": {"en": "no quorum", "ru": "кворум не достигнут"},
@@ -560,10 +619,15 @@ _MESSAGES = {
     "election.status.pending_certification": {"en": "awaiting independent certification", "ru": "ожидает независимого подтверждения"},
     "election.status.applied": {"en": "result applied", "ru": "результат применён"},
     "election.error.citizen_not_verified": {"en": "This action requires verified citizenship.", "ru": "Для этого действия нужно подтверждённое гражданство."},
+    "election.active.title": {"en": "Recent elections awaiting completion", "ru": "Недавние незавершённые выборы"},
+    "election.active.empty": {"en": "No elections are awaiting completion.", "ru": "Нет незавершённых выборов."},
+    "election.active.row": {"en": "{election} · Voting closes {end}", "ru": "{election} · Закрытие голосования {end}"},
+    "election.active.inspect_hint": {"en": "Open a record with `/election commission inspect`.", "ru": "Откройте протокол через `/election commission inspect`."},
     "election.error.commissioner_required": {"en": "This action requires election commission access.", "ru": "Для этого действия нужны полномочия избирательной комиссии."},
     "election.error.invalid_office": {"en": "Select a valid elected office.", "ru": "Выберите допустимую выборную должность."},
     "election.error.invalid_candidates": {"en": "Enter the candidates' distinct Discord IDs, separated by commas.", "ru": "Укажите разные Discord ID кандидатов через запятую."},
     "election.error.insufficient_eligible": {"en": "There are too few eligible voters to open this election.", "ru": "Недостаточно допущенных избирателей, чтобы открыть эти выборы."},
+    "election.error.insufficient_commissioners": {"en": "These elections require at least two eligible commissioners who are not candidates.", "ru": "Для этих выборов нужны как минимум два допущенных члена комиссии, которые не участвуют как кандидаты."},
     "election.error.invalid_text": {"en": "Enter a short reason for the audit log.", "ru": "Укажите краткое основание для журнала аудита."},
     "election.error.invalid_request_key": {"en": "This election request is invalid. Run the command again.", "ru": "Запрос на открытие выборов недействителен. Вызовите команду заново."},
     "election.error.election_in_progress": {"en": "An election for this office is already in progress.", "ru": "Выборы на эту должность уже проводятся."},
@@ -576,12 +640,95 @@ _MESSAGES = {
     "election.error.candidate_conflict": {"en": "A commissioner who is not a candidate must handle this election.", "ru": "Эти выборы должен обработать член комиссии, который не участвует в них как кандидат."},
     "election.error.independent_certification_required": {"en": "A different commissioner must certify this result.", "ru": "Результат должен подтвердить другой член комиссии."},
     "election.error.invalid_runoff": {"en": "The selected election or candidates do not qualify for a repeat vote.", "ru": "Указанные выборы или кандидаты не подходят для повторного голосования."},
+    "election.error.retry_required": {
+        "en": "Enter the failed election ID in `retry_of_id` to open its repeat vote.",
+        "ru": "Укажите номер несостоявшихся выборов в `retry_of_id`, чтобы открыть повторное голосование.",
+    },
+    "election.error.invalid_retry": {
+        "en": "That election cannot be used to open a repeat vote.",
+        "ru": "Для этих выборов нельзя открыть повторное голосование.",
+    },
+    "election.error.political_crisis": {
+        "en": "New elections for this office require commission confirmation after the in-game political crisis.",
+        "ru": "Чтобы провести новые выборы на эту должность, комиссия должна подтвердить завершение игрового кризиса.",
+    },
+    "election.error.crisis_not_active": {
+        "en": "This election has no active political crisis to resolve.",
+        "ru": "По этим выборам нет активного политического кризиса, который нужно завершить.",
+    },
+    "election.error.crisis_resolution_not_proposed": {
+        "en": "Record a resolution with `/election commission resolve_crisis` before confirming it.",
+        "ru": "Сначала внесите решение через `/election commission resolve_crisis`, затем подтвердите его.",
+    },
+    "admin.maintenance.enabled": {"en": "Economy read-only mode is on. Existing records are available to view.", "ru": "Пауза экономики включена. Существующие записи доступны для просмотра."},
+    "admin.maintenance.disabled": {"en": "Economy read-only mode is off.", "ru": "Пауза экономики выключена."},
+    "admin.maintenance.changed": {"en": "Economy mode updated.", "ru": "Режим экономики изменён."},
+    "admin.maintenance.unchanged": {"en": "The economy was already in this mode.", "ru": "Экономика уже в этом режиме."},
+    "admin.error.operator_required": {"en": "This command requires technical operator access.", "ru": "Для этой команды нужны полномочия технического оператора."},
+    "admin.error.invalid_reason": {"en": "Enter a reason of up to {limit} characters to change the mode.", "ru": "Для смены режима укажите основание длиной до {limit} символов."},
+    "admin.error.invalid_page": {"en": "Enter a valid positive page number.", "ru": "Укажите допустимый положительный номер страницы."},
+    "admin.audit.title": {"en": "Recent audit events · Page {page}", "ru": "Недавние события аудита · Страница {page}"},
+    "admin.audit.empty": {"en": "No audit events on page {page}.", "ru": "На странице {page} нет событий аудита."},
+    "admin.audit.next": {"en": "Next page: `/admin audit page:{page}`", "ru": "Следующая страница: `/admin audit page:{page}`"},
+    "admin.audit.row": {"en": "{date} · {action} · Actor {actor} · {subject} · {result}", "ru": "{date} · {action} · Инициатор {actor} · {subject} · {result}"},
+    "admin.audit.reason": {"en": "Reason code: {code}", "ru": "Код основания: {code}"},
+    "admin.audit.action.citizen.registered": {"en": "Citizenship granted", "ru": "Гражданство оформлено"},
+    "admin.audit.action.citizen.restored": {"en": "Citizenship restored", "ru": "Гражданство восстановлено"},
+    "admin.audit.action.citizen.left": {"en": "Citizen left the server", "ru": "Гражданин вышел с сервера"},
+    "admin.audit.action.budget.activate": {"en": "Approve budget", "ru": "Утверждение бюджета"},
+    "admin.audit.action.contract.propose": {"en": "Propose state contract", "ru": "Создание госконтракта"},
+    "admin.audit.action.contract.reserve": {"en": "Reserve state contract funds", "ru": "Резервирование по госконтракту"},
+    "admin.audit.action.contract.submit": {"en": "Submit state contract work", "ru": "Сдача работы по госконтракту"},
+    "admin.audit.action.contract.pay": {"en": "Pay state contract", "ru": "Оплата госконтракта"},
+    "admin.audit.action.contract.cancel": {"en": "Cancel state contract", "ru": "Отмена госконтракта"},
+    "admin.audit.action.election.open": {"en": "Open election", "ru": "Открытие выборов"},
+    "admin.audit.action.election.record": {"en": "Record election result", "ru": "Внесение итога выборов"},
+    "admin.audit.action.election.certify": {"en": "Certify election result", "ru": "Подтверждение итога выборов"},
+    "admin.audit.action.election.crisis.propose": {"en": "Propose an end to the political crisis", "ru": "Предложение завершить политический кризис"},
+    "admin.audit.action.election.crisis.confirm": {"en": "Confirm the end of the political crisis", "ru": "Подтверждение завершения политического кризиса"},
+    "admin.audit.action.asset.issue": {"en": "List state asset", "ru": "Выставление госимущества"},
+    "admin.audit.action.npc.review": {"en": "Review NPC work", "ru": "Проверка задания NPC"},
+    "admin.audit.action.market.arbitrate": {"en": "Resolve market dispute", "ru": "Разрешение спора на рынке"},
+    "admin.audit.action.work.arbitrate": {"en": "Resolve company job dispute", "ru": "Разрешение спора по заданию компании"},
+    "admin.audit.action.economy.maintenance.paused": {"en": "Pause the economy", "ru": "Включение паузы экономики"},
+    "admin.audit.action.economy.maintenance.resumed": {"en": "Resume the economy", "ru": "Выключение паузы экономики"},
+    "admin.audit.result.success": {"en": "succeeded", "ru": "выполнено"},
+    "admin.audit.result.denied": {"en": "denied", "ru": "отказано"},
+    "admin.audit.result.paid": {"en": "paid", "ru": "оплачено"},
+    "admin.audit.result.cancelled": {"en": "cancelled", "ru": "отменено"},
+    "admin.audit.result.completed": {"en": "completed", "ru": "завершено"},
+    "admin.audit.result.refunded": {"en": "refunded", "ru": "оплата возвращена"},
+    "admin.audit.result.rejected": {"en": "rejected", "ru": "отклонено"},
+    "admin.audit.result.applied": {"en": "applied", "ru": "применено"},
+    "admin.audit.result.no_quorum": {"en": "no quorum", "ru": "кворум не достигнут"},
+    "admin.audit.result.tied": {"en": "tied", "ru": "ничья"},
+    "admin.audit.subject.citizen": {"en": "Citizen", "ru": "Гражданин"},
+    "admin.audit.subject.budget_period": {"en": "Budget period", "ru": "Бюджетный период"},
+    "admin.audit.subject.contract": {"en": "Contract", "ru": "Контракт"},
+    "admin.audit.subject.election": {"en": "Election", "ru": "Выборы"},
+    "admin.audit.subject.asset": {"en": "Asset", "ru": "Имущество"},
+    "admin.audit.subject.npc_task": {"en": "NPC task", "ru": "Задание NPC"},
+    "admin.audit.subject.market_order": {"en": "Market order", "ru": "Заказ на рынке"},
+    "admin.audit.subject.market_offer": {"en": "Market offer", "ru": "Предложение на рынке"},
+    "admin.audit.subject.private_job": {"en": "Company job", "ru": "Задание компании"},
+    "admin.audit.subject.economy": {"en": "Economy", "ru": "Экономика"},
 }
 
 
+def language_for_locale(locale: discord.Locale | str | None) -> str:
+    return "ru" if locale in (discord.Locale.russian, "ru") else "en"
+
+
 def message(locale: discord.Locale | str | None, key: str, **fields: str) -> str:
-    language = "ru" if locale in (discord.Locale.russian, "ru") else "en"
-    return _MESSAGES[key][language].format(**fields)
+    return _MESSAGES[key][language_for_locale(locale)].format(**fields)
+
+
+def transaction_label(locale: discord.Locale | str, kind: TransactionKind, delta: int) -> str:
+    if kind == TransactionKind.TRANSFER:
+        key = "transfer_in" if delta > 0 else "transfer_out"
+    else:
+        key = kind.value.lower()
+    return message(locale, f"wallet.history.{key}")
 
 
 def command_description(command: str) -> app_commands.locale_str:

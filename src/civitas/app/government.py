@@ -6,13 +6,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
 from civitas.app.wallet import WalletRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.government import (
     CandidateTally,
+    CrisisResolution,
     Election,
     ElectionProtocol,
     ElectionStatus,
@@ -34,6 +35,7 @@ class GovernmentErrorReason(StrEnum):
     INVALID_OFFICE = "invalid_office"
     INVALID_CANDIDATES = "invalid_candidates"
     INSUFFICIENT_ELIGIBLE = "insufficient_eligible"
+    INSUFFICIENT_COMMISSIONERS = "insufficient_commissioners"
     INVALID_TEXT = "invalid_text"
     INVALID_REQUEST_KEY = "invalid_request_key"
     ELECTION_IN_PROGRESS = "election_in_progress"
@@ -46,6 +48,11 @@ class GovernmentErrorReason(StrEnum):
     CANDIDATE_CONFLICT = "candidate_conflict"
     INDEPENDENT_CERTIFICATION_REQUIRED = "independent_certification_required"
     INVALID_RUNOFF = "invalid_runoff"
+    INVALID_RETRY = "invalid_retry"
+    RETRY_REQUIRED = "retry_required"
+    POLITICAL_CRISIS = "political_crisis"
+    CRISIS_NOT_ACTIVE = "crisis_not_active"
+    CRISIS_RESOLUTION_NOT_PROPOSED = "crisis_resolution_not_proposed"
 
 
 class GovernmentError(Exception):
@@ -87,6 +94,26 @@ class GovernmentRepository(WalletRepository, Protocol):
 
     async def get_election_by_key(self, guild_id: int, key: str) -> Election | None: ...
 
+    async def has_future_office_term(self, guild_id: int, office: OfficeKind, after: datetime) -> bool: ...
+
+    async def get_latest_election(self, guild_id: int, office: OfficeKind) -> Election | None: ...
+
+    async def lock_election_cycle(self, guild_id: int) -> None: ...
+
+    async def get_crisis_resolution(self, guild_id: int, election_id: int) -> CrisisResolution | None: ...
+
+    async def propose_crisis_resolution(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> CrisisResolution: ...
+
+    async def confirm_crisis_resolution(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> CrisisResolution: ...
+
+    async def bind_poll_source(self, guild_id: int, election_id: int, source_url: str) -> bool:
+        """Bind a canonical source to this election or reject its use by another election."""
+        ...
+
     async def create_election(self, election: Election) -> Election | None: ...
 
     async def update_election(self, election: Election) -> None: ...
@@ -96,6 +123,8 @@ class GovernmentRepository(WalletRepository, Protocol):
     async def list_offices(self, guild_id: int, at: datetime) -> tuple[OfficeTerm, ...]: ...
 
     async def list_results(self, guild_id: int, limit: int) -> tuple[Election, ...]: ...
+
+    async def list_unfinished_elections(self, guild_id: int) -> tuple[Election, ...]: ...
 
     async def list_office_role_assignments(
         self, discord_guild_id: int, at: datetime
@@ -123,6 +152,10 @@ def _validate_key(key: str) -> None:
         or "\0" in key
     ):
         raise GovernmentError(GovernmentErrorReason.INVALID_REQUEST_KEY)
+
+
+def _poll_source_key(parts: SplitResult) -> str:
+    return urlunsplit((parts.scheme, parts.hostname or "", parts.path.rstrip("/"), parts.query, ""))
 
 
 class GovernmentService:
@@ -157,6 +190,7 @@ class GovernmentService:
         reason: str,
         idempotency_key: str,
         runoff_of_id: int | None = None,
+        retry_of_id: int | None = None,
     ) -> Election:
         self._commissioner(guild_id, user_id)
         _validate_key(idempotency_key)
@@ -170,12 +204,15 @@ class GovernmentService:
             raise GovernmentError(GovernmentErrorReason.INVALID_CANDIDATES)
         if user_id in candidates:
             raise GovernmentError(GovernmentErrorReason.CANDIDATE_CONFLICT)
+        if runoff_of_id is not None and retry_of_id is not None and runoff_of_id != retry_of_id:
+            raise GovernmentError(GovernmentErrorReason.INVALID_RETRY)
+        parent_id = retry_of_id if retry_of_id is not None else runoff_of_id
 
         async with self._unit_of_work() as repository:
             commissioner = await self._verified(repository, user_id, lock=True)
             existing = await repository.get_election_by_key(commissioner.guild_id, idempotency_key)
             if existing is not None:
-                return self._replay_open(existing, commissioner.id, office, candidates, reason, runoff_of_id)
+                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id)
             eligible = await repository.list_verified_citizens(commissioner.guild_id)
             by_discord_id = {citizen.discord_user_id: citizen for citizen in eligible}
             if len(eligible) < self._rules.min_eligible:
@@ -184,17 +221,34 @@ class GovernmentService:
                 raise GovernmentError(GovernmentErrorReason.INVALID_CANDIDATES)
             seats = 1 if office == OfficeKind.PRESIDENT else self._rules.parliament_seats
             term_days = self._rules.term_days
-            if runoff_of_id is not None:
-                parent = await self._election(repository, commissioner.guild_id, runoff_of_id)
+            now = self._clock()
+            if await repository.has_future_office_term(commissioner.guild_id, office, now):
+                raise GovernmentError(GovernmentErrorReason.ELECTION_IN_PROGRESS)
+            # has_future_office_term locks the guild before reading the latest election.
+            latest = await repository.get_latest_election(commissioner.guild_id, office)
+            if latest is not None and latest.is_political_crisis_open:
+                raise GovernmentError(GovernmentErrorReason.POLITICAL_CRISIS)
+            if parent_id is None and latest is not None and latest.failed and not latest.opens_political_crisis:
+                raise GovernmentError(GovernmentErrorReason.RETRY_REQUIRED)
+            if parent_id is None and latest is not None and latest.certified_at is None:
+                raise GovernmentError(GovernmentErrorReason.ELECTION_IN_PROGRESS)
+            tie_parent_id = None
+            if parent_id is not None:
+                invalid = GovernmentErrorReason.INVALID_RUNOFF if runoff_of_id is not None else GovernmentErrorReason.INVALID_RETRY
                 if (
-                    parent.office != office or parent.status != ElectionStatus.TIED
-                    or parent.certified_at is None or parent.protocol is None
-                    or candidates != self._runoff_candidates(parent)
+                    type(parent_id) is not int or latest is None or parent_id != latest.id
+                    or not latest.failed or latest.opens_political_crisis
                 ):
-                    raise GovernmentError(GovernmentErrorReason.INVALID_RUNOFF)
-                seats, term_days = parent.seats, parent.term_days
+                    raise GovernmentError(invalid)
+                if latest.status == ElectionStatus.TIED:
+                    if latest.protocol is None or candidates != self._runoff_candidates(latest):
+                        raise GovernmentError(GovernmentErrorReason.INVALID_RUNOFF)
+                    tie_parent_id = latest.id
+                seats, term_days = latest.seats, latest.term_days
             if len(candidates) < seats:
                 raise GovernmentError(GovernmentErrorReason.INVALID_CANDIDATES)
+            if not self._has_independent_commission(by_discord_id.keys() - candidates):
+                raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_COMMISSIONERS)
             quorum = max(
                 self._rules.quorum_min,
                 (len(eligible) * self._rules.quorum_bp + _BASIS_POINTS - 1) // _BASIS_POINTS,
@@ -202,7 +256,6 @@ class GovernmentService:
             if quorum > len(eligible):
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
             ordered_candidates = sorted((by_discord_id[user] for user in candidates), key=lambda citizen: citizen.id)
-            now = self._clock()
             election = Election(
                 id=0,
                 guild_id=commissioner.guild_id,
@@ -218,7 +271,8 @@ class GovernmentService:
                 eligible_citizen_ids=tuple(sorted(citizen.id for citizen in eligible)),
                 candidate_citizen_ids=tuple(citizen.id for citizen in ordered_candidates),
                 candidate_discord_user_ids=tuple(citizen.discord_user_id for citizen in ordered_candidates),
-                runoff_of_id=runoff_of_id,
+                runoff_of_id=tie_parent_id,
+                retry_of_id=parent_id,
                 extension_hours=self._rules.extension_hours,
             )
             created = await repository.create_election(election)
@@ -226,7 +280,7 @@ class GovernmentService:
                 return created
             existing = await repository.get_election_by_key(commissioner.guild_id, idempotency_key)
             if existing is not None:
-                return self._replay_open(existing, commissioner.id, office, candidates, reason, runoff_of_id)
+                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id)
             raise GovernmentError(GovernmentErrorReason.ELECTION_IN_PROGRESS)
 
     async def record_protocol(
@@ -241,7 +295,7 @@ class GovernmentService:
         reason: str,
     ) -> Election:
         async with self._commission_action(guild_id, user_id, election_id) as (repository, actor, election):
-            source_url = self._validate_source(source_url)
+            source_key = self._validate_source(source_url)
             reason = _reason(reason)
             candidate_tallies = self._validate_tallies(election, participants, tallies)
             previous = election.protocol
@@ -252,13 +306,16 @@ class GovernmentService:
                 and now >= election.extended_until
             )
             if not extension_closed and previous is not None and (
-                previous.source_url, previous.participants, previous.tallies, previous.recorded_by_citizen_id, previous.reason
-            ) == (source_url, participants, candidate_tallies, actor.id, reason):
+                _poll_source_key(urlsplit(previous.source_url)), previous.participants, previous.tallies,
+                previous.recorded_by_citizen_id, previous.reason,
+            ) == (source_key, participants, candidate_tallies, actor.id, reason):
                 return election
             if election.status not in _VOTING:
                 raise GovernmentError(GovernmentErrorReason.INVALID_STATUS)
             if now < (election.extended_until or election.closes_at):
                 raise GovernmentError(GovernmentErrorReason.VOTING_NOT_CLOSED)
+            if not await repository.bind_poll_source(election.guild_id, election.id, source_key):
+                raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
 
             winners = ()
             extended_until = election.extended_until
@@ -309,6 +366,56 @@ class GovernmentService:
                 await repository.update_election(certified)
             return certified
 
+    async def propose_crisis_resolution(
+        self, guild_id: int | None, user_id: int, election_id: int, *, reason: str,
+    ) -> CrisisResolution:
+        async with self._crisis_action(guild_id, user_id, election_id) as (repository, actor, election):
+            reason = _reason(reason)
+            if election.crisis_resolution is not None:
+                return election.crisis_resolution
+            await self._require_latest_crisis(repository, election)
+            return await repository.propose_crisis_resolution(
+                election.guild_id, election.id, actor.id, reason, self._clock(),
+            )
+
+    async def confirm_crisis_resolution(
+        self, guild_id: int | None, user_id: int, election_id: int, *, reason: str,
+    ) -> CrisisResolution:
+        async with self._crisis_action(guild_id, user_id, election_id) as (repository, actor, election):
+            reason = _reason(reason)
+            resolution = election.crisis_resolution
+            if resolution is None:
+                raise GovernmentError(GovernmentErrorReason.CRISIS_RESOLUTION_NOT_PROPOSED)
+            if resolution.proposed_by_citizen_id == actor.id:
+                raise GovernmentError(GovernmentErrorReason.INDEPENDENT_CERTIFICATION_REQUIRED)
+            if resolution.confirmed_at is not None:
+                return resolution
+            await self._require_latest_crisis(repository, election)
+            return await repository.confirm_crisis_resolution(
+                election.guild_id, election.id, actor.id, reason, self._clock(),
+            )
+
+    @asynccontextmanager
+    async def _crisis_action(
+        self, guild_id: int | None, user_id: int, election_id: int,
+    ) -> AsyncIterator[tuple[GovernmentRepository, Citizen, Election]]:
+        self._commissioner(guild_id, user_id)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id, lock=True)
+            await repository.lock_election_cycle(actor.guild_id)
+            election = await self._election(repository, actor.guild_id, election_id)
+            if not election.opens_political_crisis:
+                raise GovernmentError(GovernmentErrorReason.CRISIS_NOT_ACTIVE)
+            if actor.id in election.candidate_citizen_ids:
+                raise GovernmentError(GovernmentErrorReason.CANDIDATE_CONFLICT)
+            yield repository, actor, election
+
+    @staticmethod
+    async def _require_latest_crisis(repository: GovernmentRepository, election: Election) -> None:
+        latest = await repository.get_latest_election(election.guild_id, election.office)
+        if latest is None or latest.id != election.id or not latest.is_political_crisis_open:
+            raise GovernmentError(GovernmentErrorReason.CRISIS_NOT_ACTIVE)
+
     async def list_offices(self, guild_id: int | None, user_id: int) -> tuple[OfficeTerm, ...]:
         self._public_access(guild_id, user_id)
         async with self._unit_of_work() as repository:
@@ -321,6 +428,12 @@ class GovernmentService:
             internal_guild_id = await repository.ensure_guild(self._guild_id)
             return await repository.list_results(internal_guild_id, 10)
 
+    async def list_unfinished_elections(self, guild_id: int | None, user_id: int) -> tuple[Election, ...]:
+        self._commissioner(guild_id, user_id)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id)
+            return await repository.list_unfinished_elections(actor.guild_id)
+
     async def get_public_result(self, guild_id: int | None, user_id: int, election_id: int) -> Election:
         self._public_access(guild_id, user_id)
         async with self._unit_of_work() as repository:
@@ -331,8 +444,6 @@ class GovernmentService:
             return election
 
     async def get_election(self, guild_id: int | None, user_id: int, election_id: int) -> Election:
-        if user_id not in self._commissioners:
-            return await self.get_public_result(guild_id, user_id, election_id)
         self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
@@ -366,6 +477,18 @@ class GovernmentService:
         if user_id not in self._commissioners:
             raise GovernmentError(GovernmentErrorReason.COMMISSIONER_REQUIRED)
 
+    def _has_independent_commission(self, eligible: set[int]) -> bool:
+        admitted_count = 0
+        for user_id in self._commissioners & eligible:
+            try:
+                self._authorize(self._guild_id, user_id)
+            except CitizenshipAccessError:
+                continue
+            admitted_count += 1
+            if admitted_count == 2:
+                return True
+        return False
+
     async def _verified(self, repository: GovernmentRepository, user_id: int, *, lock: bool = False) -> Citizen:
         citizens = await repository.get_citizens(self._guild_id, (user_id,), lock=lock)
         if not citizens or citizens[0].status != CitizenStatus.VERIFIED:
@@ -398,7 +521,7 @@ class GovernmentService:
             allowed = False
         if not allowed:
             raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
-        return source_url
+        return _poll_source_key(parts)
 
     @staticmethod
     def _validate_tallies(
@@ -435,10 +558,10 @@ class GovernmentService:
 
     @staticmethod
     def _replay_open(
-        election: Election, actor_id: int, office: OfficeKind, candidates: set[int], reason: str, runoff_of_id: int | None
+        election: Election, actor_id: int, office: OfficeKind, candidates: set[int], reason: str, retry_of_id: int | None
     ) -> Election:
-        if (election.opened_by_citizen_id, election.office, election.reason, election.runoff_of_id) != (
-            actor_id, office, reason, runoff_of_id
+        if (election.opened_by_citizen_id, election.office, election.reason, election.retry_of_id) != (
+            actor_id, office, reason, retry_of_id
         ) or set(election.candidate_discord_user_ids) != candidates:
             raise GovernmentError(GovernmentErrorReason.INVALID_REQUEST_KEY)
         return election

@@ -28,7 +28,7 @@ def discord_server():
         is_assignable=Mock(return_value=True),
     )
     guild = SimpleNamespace(
-        unavailable=False, get_role=Mock(return_value=role), fetch_member=AsyncMock(),
+        unavailable=False, get_role=Mock(return_value=role), fetch_member=AsyncMock(), channels=[],
         me=SimpleNamespace(guild_permissions=discord.Permissions(manage_roles=True)),
     )
     client = SimpleNamespace(
@@ -74,7 +74,11 @@ async def test_gateway_skips_departed_discord_member(discord_server):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("permission", ["administrator", "manage_guild", "manage_roles"])
+@pytest.mark.parametrize("permission", [
+    "administrator", "manage_guild", "manage_roles", "manage_channels", "kick_members", "ban_members",
+    "manage_messages", "manage_webhooks", "moderate_members", "move_members", "view_audit_log", "manage_events",
+    "pin_messages", "bypass_slowmode",
+])
 async def test_worker_refuses_privileged_role(discord_server, permission):
     client, guild, role = discord_server
     setattr(role.permissions, permission, True)
@@ -85,6 +89,33 @@ async def test_worker_refuses_privileged_role(discord_server, permission):
     guild.get_role.assert_called_once_with(ROLE_ID)
     guild.fetch_member.assert_not_awaited()
     unit_of_work.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_refuses_to_sync_as_discord_administrator(discord_server):
+    client, guild, _ = discord_server
+    guild.me.guild_permissions = discord.Permissions.all()
+    unit_of_work = Mock()
+
+    await roles._reconcile_once(client, unit_of_work, GUILD_ID, ROLE_ID)
+
+    unit_of_work.assert_not_called()
+    guild.fetch_member.assert_not_awaited()
+
+
+@pytest.mark.parametrize("overwrite, assignable", [
+    (discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_messages=False), True),
+    (discord.PermissionOverwrite(view_channel=True, manage_messages=True), False),
+    (discord.PermissionOverwrite(connect=True, mute_members=True), False),
+])
+def test_channel_or_category_permission_overwrite_is_checked(discord_server, overwrite, assignable):
+    _, guild, role = discord_server
+    role.permissions = discord.Permissions(view_channel=True, send_messages=True)
+    channel = SimpleNamespace(overwrites_for=Mock(return_value=overwrite))
+    guild.channels.append(channel)
+
+    assert roles.safe_assignable_role(guild, ROLE_ID) is (role if assignable else None)
+    channel.overwrites_for.assert_called_once_with(role)
 
 
 @pytest.mark.asyncio

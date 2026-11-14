@@ -6,34 +6,44 @@ import os
 import sys
 
 from civitas.app.assets import AssetService
+from civitas.app.admin_audit import AdminAuditService
+from civitas.app.admin_operators import AdminOperatorPolicy
 from civitas.app.citizens import CitizensService
 from civitas.app.government import ElectionRules, GovernmentService
 from civitas.app.jobs import JobService, JobsRules
+from civitas.app.maintenance import MaintenanceService
 from civitas.app.market import MarketRules, MarketService
 from civitas.app.private_jobs import PrivateJobService
 from civitas.app.profile import ProfileService
+from civitas.app.receipts import ReceiptService
 from civitas.app.reports import ReportService
 from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.bot import create_bot
+from civitas.bot.admin import add_admin_commands
 from civitas.bot.assets import add_asset_commands
 from civitas.bot.government import add_government_commands, run_office_role_sync
 from civitas.bot.jobs import add_job_commands
 from civitas.bot.market import add_market_commands
+from civitas.bot.membership import run_membership_sync
 from civitas.bot.private_jobs import add_private_job_commands
+from civitas.bot.receipts import add_receipt_commands, run_receipt_publisher
 from civitas.bot.reports import add_report_commands, run_report_publisher
 from civitas.bot.roles import run_role_sync
 from civitas.bot.treasury import add_treasury_commands
 from civitas.config import ConfigurationError, Settings, load_settings
 from civitas.domain.jobs import BudgetCaps
+from civitas.domain.ledger import LedgerError, LedgerErrorReason
 from civitas.infrastructure.db import create_db_engine
-from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
+from civitas.infrastructure.db.admin_audit import PostgresAdminAuditUnitOfWork
+from civitas.infrastructure.db.maintenance import PostgresMaintenanceUnitOfWork
+from civitas.infrastructure.db.receipts import PostgresReceiptUnitOfWork
 
 
 async def run_bot(settings: Settings) -> None:
     engine = create_db_engine(settings.database_url)
     try:
-        unit_of_work = PostgresGovernmentUnitOfWork(engine)
+        unit_of_work = PostgresReceiptUnitOfWork(engine)
         wallet_settings = settings.wallet
         currency_symbol = wallet_settings.currency_symbol if wallet_settings else "₵"
         funding = None
@@ -56,7 +66,11 @@ async def run_bot(settings: Settings) -> None:
                 authorize=service.authorize,
                 funding=funding,
             )
-            await wallet.initialize_guild()
+            try:
+                await wallet.initialize_guild()
+            except LedgerError as error:
+                if error.reason != LedgerErrorReason.ECONOMY_READ_ONLY:
+                    raise
         government_settings = settings.government
         president_role = government_settings.president_role_id if government_settings else None
         parliament_role = government_settings.parliament_role_id if government_settings else None
@@ -67,7 +81,23 @@ async def run_bot(settings: Settings) -> None:
             wallet_service=wallet,
             currency_symbol=currency_symbol,
             profile_service=ProfileService(unit_of_work, authorize=service.authorize),
+            track_membership=settings.track_membership,
         )
+        if settings.technical_operator_ids:
+            operator_policy = AdminOperatorPolicy(
+                discord_guild_id=settings.guild_id, operator_user_ids=settings.technical_operator_ids,
+            )
+            add_admin_commands(
+                bot.tree, guild_scope=bot.guild_scope,
+                maintenance_service=MaintenanceService(
+                    PostgresMaintenanceUnitOfWork(engine), operator_policy=operator_policy, guild_id=settings.guild_id,
+                ),
+                audit_service=AdminAuditService(PostgresAdminAuditUnitOfWork(engine), operator_policy=operator_policy),
+            )
+        receipts = None
+        if wallet is not None:
+            receipts = ReceiptService(unit_of_work, guild_id=settings.guild_id, authorize=service.authorize)
+            add_receipt_commands(bot.tree, guild_scope=bot.guild_scope, service=receipts, currency_symbol=currency_symbol)
         job_settings = settings.jobs
         if job_settings is not None:
             jobs = JobService(
@@ -182,6 +212,8 @@ async def run_bot(settings: Settings) -> None:
         async with (
             bot,
             run_role_sync(bot, unit_of_work, guild_id=settings.guild_id, role_id=settings.citizen_role_id),
+            run_membership_sync(bot, unit_of_work, service, guild_id=settings.guild_id, enabled=settings.track_membership),
+            run_receipt_publisher(bot, receipts),
             run_report_publisher(
                 bot, reports if publication_channel is not None else None,
                 guild_id=settings.guild_id, currency_symbol=currency_symbol,

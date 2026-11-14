@@ -1,14 +1,13 @@
 import asyncio
 
 import pytest
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text
 
 from civitas.app.citizens import CitizensService, RegistrationOutcome
 from civitas.app.wallet import WalletFunding, WalletService
-from civitas.domain.citizens import CitizenStatus
 from civitas.domain.ledger import AccountKind, LedgerError, LedgerErrorReason, TransactionKind
 from civitas.infrastructure.db.ledger import PostgresLedgerUnitOfWork
-from civitas.infrastructure.db.models import AuditEventRow, CitizenRow
+from civitas.infrastructure.db.models import AuditEventRow
 
 GUILD_ID = 101
 SENDER = 201
@@ -47,10 +46,7 @@ async def test_registration_funds_before_first_wallet_read_and_rejoin_does_not_m
     assert repeated.transaction_id == receipt.transaction_id
     assert not repeated.created
 
-    async with pg_engine.begin() as connection:
-        await connection.execute(
-            update(CitizenRow).where(CitizenRow.id == citizen.id).values(status=CitizenStatus.LEFT)
-        )
+    assert await citizens.mark_departed(GUILD_ID, SENDER)
     restored = await citizens.register(GUILD_ID, SENDER)
     assert restored.outcome is RegistrationOutcome.RESTORED
     assert restored.citizen.id == citizen.id

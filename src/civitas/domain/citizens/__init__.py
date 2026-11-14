@@ -25,6 +25,7 @@ class Citizen:
 class CitizenAuditAction(StrEnum):
     REGISTERED = "citizen.registered"
     RESTORED = "citizen.restored"
+    LEFT = "citizen.left"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,3 +34,4 @@ class CitizenAuditEvent:
     action: CitizenAuditAction
     occurred_at: datetime
     reason: str
+    actor_discord_user_id: int | None = None

@@ -18,6 +18,7 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         discord_token="test-token",
         guild_id=101,
         allowed_user_ids=frozenset({201, 202}),
+        technical_operator_ids=frozenset({901}),
         wallet=WalletSettings(starter_grant=250, treasury_genesis=8000, currency_symbol="₵"),
         jobs=JobsSettings(
             reviewer_ids=frozenset({201}),
@@ -56,6 +57,10 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         command_names.update(command.name for command in bot.tree.get_commands(guild=bot.guild_scope))
         treasury = bot.tree.get_command("treasury", guild=bot.guild_scope)
         assert {command.name for command in treasury.commands} == {"budget", "approve_budget", "report"}
+        wallet = bot.tree.get_command("wallet", guild=bot.guild_scope)
+        assert {command.name for command in wallet.commands} == {"balance", "history", "transfer", "receipt", "receipts"}
+        admin = bot.tree.get_command("admin", guild=bot.guild_scope)
+        assert {command.name for command in admin.commands} == {"audit", "maintenance"}
         assert not bot.tree.get_commands()
 
     monkeypatch.setattr(entrypoint, "create_db_engine", lambda _url: pg_engine)
@@ -64,7 +69,7 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
 
     assert command_names == {
         "start", "citizen", "profile", "wallet", "jobs", "company", "market", "work", "assets", "treasury", "contracts",
-        "government", "election", "help",
+        "government", "election", "help", "admin",
     }
     assert sync.await_count == 1
     async with pg_engine.connect() as connection:

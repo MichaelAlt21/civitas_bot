@@ -12,6 +12,20 @@ from civitas.app.citizen_roles import CitizenRoleReconciler, CitizenRoleReposito
 logger = logging.getLogger(__name__)
 _SYNC_INTERVAL_SECONDS = 60
 _UNKNOWN_MEMBER = 10007
+_PRIVILEGED_ROLE_PERMISSIONS = (
+    discord.Permissions.elevated()
+    | discord.Permissions.stage_moderator()
+    | discord.Permissions(
+        view_audit_log=True,
+        view_guild_insights=True,
+        view_creator_monetization_analytics=True,
+        manage_nicknames=True,
+        manage_events=True,
+        deafen_members=True,
+        pin_messages=True,
+        bypass_slowmode=True,
+    )
+)
 
 
 class DiscordCitizenRoleGateway:
@@ -28,17 +42,19 @@ class DiscordCitizenRoleGateway:
 def safe_assignable_role(guild: discord.Guild, role_id: int) -> discord.Role | None:
     role = guild.get_role(role_id)
     bot_member = guild.me
-    if (
-        role is None
-        or bot_member is None
-        or not bot_member.guild_permissions.manage_roles
-        or not role.is_assignable()
-    ):
+    if role is None or bot_member is None:
         return None
 
-    permissions = role.permissions
-    if permissions.administrator or permissions.manage_guild or permissions.manage_roles:
+    bot_permissions = bot_member.guild_permissions
+    if bot_permissions.administrator or not bot_permissions.manage_roles or not role.is_assignable():
         return None
+
+    if role.permissions & _PRIVILEGED_ROLE_PERMISSIONS:
+        return None
+    for channel in guild.channels:
+        allowed, _ = channel.overwrites_for(role).pair()
+        if allowed & _PRIVILEGED_ROLE_PERMISSIONS:
+            return None
     return role
 
 
@@ -72,7 +88,7 @@ async def _reconcile_once(
 
     role = safe_assignable_role(guild, role_id)
     if role is None:
-        logger.warning("Проверьте ID роли гражданина, иерархию ролей и право Manage Roles у бота")
+        logger.warning("Проверьте ID роли гражданина, иерархию и права роли, каналов и бота")
         return
 
     gateway = DiscordCitizenRoleGateway(guild, role)

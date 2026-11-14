@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -27,7 +27,7 @@ class InMemoryCitizensRepository:
         self.scopes_opened += 1
         yield self
 
-    async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None:
+    async def get_profile(self, guild_id: int, user_id: int, *, lock: bool = False) -> Citizen | None:
         assert guild_id == DISCORD_GUILD_ID
         return self.citizens.get(user_id)
 
@@ -41,7 +41,7 @@ class InMemoryCitizensRepository:
         self.citizens[user_id] = citizen
         return citizen, True
 
-    async def restore(self, citizen: Citizen) -> None:
+    async def update_citizen_status(self, citizen: Citizen) -> None:
         self.citizens[citizen.discord_user_id] = citizen
 
     async def append_audit(self, event: CitizenAuditEvent) -> None:
@@ -133,6 +133,53 @@ async def test_restores_the_same_citizen_on_readmission(
     event, = repository.audit_events
     assert event.action == CitizenAuditAction.RESTORED
     assert event.citizen == restored.citizen
+
+
+@pytest.mark.parametrize("status", [CitizenStatus.VERIFIED, CitizenStatus.PENDING, CitizenStatus.SUSPENDED])
+@pytest.mark.asyncio
+async def test_trusted_departure_is_idempotent_and_preserves_suspension(
+    repository: InMemoryCitizensRepository, status: CitizenStatus,
+) -> None:
+    service = CitizensService(repository.unit_of_work, guild_id=DISCORD_GUILD_ID, allowed_user_ids=())
+    joined = datetime(2020, 1, 1, tzinfo=UTC)
+    verified = joined if status is CitizenStatus.VERIFIED else None
+    repository.citizens[DISCORD_USER_ID] = Citizen(42, 1, DISCORD_USER_ID, status, joined, verified)
+    actor = 300
+    observed = joined + timedelta(days=1)
+
+    changed = await service.mark_departed(
+        DISCORD_GUILD_ID, DISCORD_USER_ID, observed_at=observed, actor_discord_user_id=actor,
+    )
+    assert not await service.mark_departed(DISCORD_GUILD_ID, DISCORD_USER_ID, observed_at=observed)
+    citizen = repository.citizens[DISCORD_USER_ID]
+    assert citizen.verified_at == verified
+    if status is CitizenStatus.SUSPENDED:
+        assert not changed and citizen.status is status
+        assert repository.audit_events == []
+    else:
+        assert changed and citizen.status is CitizenStatus.LEFT
+        assert repository.audit_events == [CitizenAuditEvent(
+            citizen, CitizenAuditAction.LEFT, observed, "discord_membership", actor,
+        )]
+
+
+@pytest.mark.asyncio
+async def test_trusted_departure_ignores_other_guilds_unknown_users_and_stale_observations(
+    service: CitizensService, repository: InMemoryCitizensRepository,
+) -> None:
+    assert not await service.mark_departed(DISCORD_GUILD_ID + 1, DISCORD_USER_ID)
+    assert not await service.mark_departed(DISCORD_GUILD_ID, 0)
+    assert repository.scopes_opened == 0
+    assert not await service.mark_departed(DISCORD_GUILD_ID, DISCORD_USER_ID + 1)
+
+    joined = datetime(2020, 1, 1, tzinfo=UTC)
+    verified = joined + timedelta(days=3)
+    citizen = Citizen(42, 1, DISCORD_USER_ID, CitizenStatus.VERIFIED, joined, verified)
+    repository.citizens[DISCORD_USER_ID] = citizen
+    assert not await service.mark_departed(DISCORD_GUILD_ID, DISCORD_USER_ID, observed_at=joined)
+    assert not await service.mark_departed(DISCORD_GUILD_ID, DISCORD_USER_ID, observed_at=verified)
+    assert repository.citizens[DISCORD_USER_ID] == citizen
+    assert repository.audit_events == []
 
 
 @pytest.mark.parametrize("status", [CitizenStatus.PENDING, CitizenStatus.SUSPENDED])

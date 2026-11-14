@@ -1,8 +1,9 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import func, insert, literal, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -13,7 +14,7 @@ from civitas.domain.ledger import MAX_AMOUNT, AccountKind, TransactionKind
 from civitas.domain.market import Company, MarketOrder, Offer, OrderStatus
 from civitas.infrastructure.db.ledger_models import FinancialAccountRow, FinancialTransactionRow
 from civitas.infrastructure.db.market import PostgresMarketUnitOfWork
-from civitas.infrastructure.db.market_models import OrderRow, OrganizationRow
+from civitas.infrastructure.db.market_models import OfferWithdrawalRow, OrderRow, OrganizationRow
 
 pytestmark = pytest.mark.asyncio
 
@@ -168,6 +169,94 @@ async def test_unperformed_order_returns_exact_price_once(pg_engine: AsyncEngine
     )
     assert first == repeated and first.status is OrderStatus.REFUNDED
     assert await _balances(unit_of_work, order) == (1000, 0, 8150, 0)
+
+
+async def test_withdrawn_offer_blocks_new_orders_but_preserves_funded_order(pg_engine: AsyncEngine) -> None:
+    unit_of_work, citizens, service = await _setup(pg_engine)
+    seller = await _company(service)
+    offer = await _offer(service, seller)
+    quote = await service.quote_order(GUILD, BUYER, offer.id)
+    order = await service.fund_order(GUILD, BUYER, quote, idempotency_key="before-withdrawal")
+    buyer = await citizens.get_profile(GUILD, BUYER)
+    assert buyer is not None
+
+    with pytest.raises(MarketError, match=MarketErrorReason.COMPANY_NOT_OWNED):
+        await service.withdraw_offer(GUILD, BUYER, offer.id, reason="Someone else's offer")
+    with pytest.raises(IntegrityError, match="Only the offer owner"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(insert(OfferWithdrawalRow).values(
+                guild_id=offer.guild_id, offer_id=offer.id, withdrawn_by_citizen_id=buyer.id,
+                withdrawn_at=NOW, reason="Invalid actor",
+            ))
+    assert await service.list_offers(GUILD, BUYER) == (offer,)
+
+    withdrawal = await service.withdraw_offer(GUILD, SELLER, offer.id, reason="  No capacity  ")
+    assert (withdrawal.offer_id, withdrawal.withdrawn_by_citizen_id, withdrawal.withdrawn_at, withdrawal.reason) == (
+        offer.id, seller.owner_citizen_id, NOW, "No capacity",
+    )
+    restarted = _market(PostgresMarketUnitOfWork(pg_engine), citizens)
+    assert await restarted.withdraw_offer(GUILD, SELLER, offer.id, reason="Repeated") == withdrawal
+    assert not await restarted.list_offers(GUILD, BUYER)
+    with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
+        await restarted.quote_order(GUILD, BUYER, offer.id)
+    with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
+        await restarted.fund_order(GUILD, BUYER, quote, idempotency_key="after-withdrawal")
+
+    # A direct INSERT with otherwise valid order terms must fail before funding.
+    table = OrderRow.__table__
+    columns = [column for column in table.c if column is not table.c.id]
+    cloned_order = select(*(
+        literal("direct-insert-after-withdrawal") if column is table.c.request_key else column
+        for column in columns
+    )).where(table.c.id == order.id)
+    with pytest.raises(IntegrityError, match="Cannot fund a withdrawn offer"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(insert(table).from_select(columns, cloned_order))
+
+    assert await restarted.fund_order(GUILD, BUYER, quote, idempotency_key="before-withdrawal") == order
+    await restarted.deliver_order(GUILD, SELLER, order.id)
+    assert (await restarted.accept_order(GUILD, BUYER, order.id)).status is OrderStatus.COMPLETED
+    assert await _balances(unit_of_work, order) == (800, 180, 8170, 0)
+
+
+async def test_funding_waits_for_in_flight_withdrawal(pg_engine: AsyncEngine) -> None:
+    unit_of_work, citizens, service = await _setup(pg_engine)
+    offer = await _offer(service, await _company(service))
+    quote = await service.quote_order(GUILD, BUYER, offer.id)
+    withdrawal_written = asyncio.Event()
+    allow_withdrawal_commit = asyncio.Event()
+
+    @asynccontextmanager
+    async def delayed_commit():
+        async with unit_of_work() as repository:
+            yield repository
+            withdrawal_written.set()
+            await allow_withdrawal_commit.wait()
+
+    withdrawing_service = _market(delayed_commit, citizens)
+    withdrawal = asyncio.create_task(withdrawing_service.withdraw_offer(GUILD, SELLER, offer.id, reason="Closed"))
+    try:
+        await asyncio.wait_for(withdrawal_written.wait(), timeout=10)
+        funding = asyncio.create_task(service.fund_order(GUILD, BUYER, quote, idempotency_key="raced"))
+        # Wait for PostgreSQL to report the funding transaction waiting on the
+        # offer lock. A timing-only test could pass without exercising the race.
+        async with asyncio.timeout(10):
+            while True:
+                async with pg_engine.connect() as connection:
+                    waiting = await connection.scalar(select(func.count()).select_from(
+                        text("pg_stat_activity")
+                    ).where(text("wait_event_type = 'Lock' AND query LIKE '%FROM offers%FOR NO KEY UPDATE%'")))
+                if waiting:
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        allow_withdrawal_commit.set()
+        await asyncio.wait_for(withdrawal, timeout=10)
+    with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
+        await asyncio.wait_for(funding, timeout=10)
+    async with pg_engine.connect() as connection:
+        assert await connection.scalar(select(func.count()).select_from(OrderRow)) == 0
+        assert await connection.scalar(select(func.count()).select_from(OfferWithdrawalRow)) == 1
 
 
 async def test_conflicting_arbiters_can_close_escrow_only_once(pg_engine: AsyncEngine) -> None:

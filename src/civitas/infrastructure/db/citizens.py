@@ -27,8 +27,8 @@ class PostgresCitizensRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None:
-        row = await self._session.scalar(
+    async def get_profile(self, guild_id: int, user_id: int, *, lock: bool = False) -> Citizen | None:
+        statement = (
             select(CitizenRow)
             .join(GuildRow, GuildRow.id == CitizenRow.guild_id)
             .where(
@@ -36,6 +36,9 @@ class PostgresCitizensRepository:
                 CitizenRow.discord_user_id == Decimal(user_id),
             )
         )
+        if lock:
+            statement = statement.with_for_update(of=CitizenRow, key_share=True)
+        row = await self._session.scalar(statement)
         return _to_citizen(row) if row is not None else None
 
     async def list_role_members(self, guild_id: int) -> tuple[Citizen, ...]:
@@ -97,7 +100,7 @@ class PostgresCitizensRepository:
         ).one()
         return _to_citizen(existing), False
 
-    async def restore(self, citizen: Citizen) -> None:
+    async def update_citizen_status(self, citizen: Citizen) -> None:
         await self._session.execute(
             update(CitizenRow)
             .where(CitizenRow.id == citizen.id, CitizenRow.guild_id == citizen.guild_id)
@@ -108,7 +111,7 @@ class PostgresCitizensRepository:
         self._session.add(
             AuditEventRow(
                 guild_id=event.citizen.guild_id,
-                actor_discord_user_id=Decimal(event.citizen.discord_user_id),
+                actor_discord_user_id=Decimal(event.actor_discord_user_id or event.citizen.discord_user_id),
                 action=event.action.value,
                 citizen_id=event.citizen.id,
                 reason=event.reason,

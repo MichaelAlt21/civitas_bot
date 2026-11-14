@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import func, insert, inspect, select, text, update
+from sqlalchemy import delete, func, insert, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -80,6 +80,29 @@ async def test_ten_retries_keep_one_registration_and_audit(pg_engine: AsyncEngin
     assert await _table_counts(pg_engine) == (1, 1, 1)
 
 
+async def test_citizen_audit_is_append_only(pg_engine: AsyncEngine) -> None:
+    service = _service(pg_engine)
+    citizen = (await service.register(GUILD_ID, USER_ID)).citizen
+    for edit in (
+        update(AuditEventRow).where(AuditEventRow.citizen_id == citizen.id).values(reason="changed"),
+        delete(AuditEventRow).where(AuditEventRow.citizen_id == citizen.id),
+        text("TRUNCATE audit_events"),
+    ):
+        with pytest.raises(IntegrityError, match="append-only"):
+            async with pg_engine.begin() as connection:
+                await connection.execute(edit)
+
+    assert await service.mark_departed(GUILD_ID, USER_ID)
+    async with pg_engine.connect() as connection:
+        records = (await connection.execute(
+            select(AuditEventRow.action, AuditEventRow.reason).order_by(AuditEventRow.id)
+        )).all()
+    assert records == [
+        (CitizenAuditAction.REGISTERED, "discord_allowlist"),
+        (CitizenAuditAction.LEFT, "discord_membership"),
+    ]
+
+
 async def _register_concurrently(
     engine: AsyncEngine,
 ) -> tuple[RegistrationResult, RegistrationResult]:
@@ -134,12 +157,14 @@ async def test_audit_error_rolls_back_first_registration(pg_engine: AsyncEngine)
 async def test_readmission_preserves_existing_citizen(pg_engine: AsyncEngine) -> None:
     service = _service(pg_engine)
     created = await service.register(GUILD_ID, USER_ID)
-    async with pg_engine.begin() as connection:
-        await connection.execute(
-            update(CitizenRow)
-            .where(CitizenRow.id == created.citizen.id)
-            .values(status=CitizenStatus.LEFT)
-        )
+    observed_at = datetime.now(UTC)
+    actor_id = USER_ID - 1
+    departures = await asyncio.wait_for(asyncio.gather(*(
+        service.mark_departed(GUILD_ID, USER_ID, observed_at=observed_at, actor_discord_user_id=actor_id)
+        for _ in range(2)
+    )), timeout=10)
+    assert sorted(departures) == [False, True]
+    assert (await service.get_profile(GUILD_ID, USER_ID)).status is CitizenStatus.LEFT
 
     first, second = await _register_concurrently(pg_engine)
     assert {first.outcome, second.outcome} == {
@@ -151,13 +176,32 @@ async def test_readmission_preserves_existing_citizen(pg_engine: AsyncEngine) ->
     assert restored.citizen.id == created.citizen.id
     assert restored.citizen.joined_at == created.citizen.joined_at
     assert restored.citizen.status is CitizenStatus.VERIFIED
+    assert not await service.mark_departed(GUILD_ID, USER_ID, observed_at=observed_at)
     assert (await service.register(GUILD_ID, USER_ID)).outcome is RegistrationOutcome.EXISTING
     async with pg_engine.connect() as connection:
-        actions = (await connection.scalars(
-            select(AuditEventRow.action).order_by(AuditEventRow.id)
-        )).all()
-    assert actions == [CitizenAuditAction.REGISTERED, CitizenAuditAction.RESTORED]
-    assert await _table_counts(pg_engine) == (1, 1, 2)
+        audits = (await connection.execute(
+            select(AuditEventRow.__table__).order_by(AuditEventRow.id)
+        )).mappings().all()
+    assert [event["action"] for event in audits] == [
+        CitizenAuditAction.REGISTERED, CitizenAuditAction.LEFT, CitizenAuditAction.RESTORED,
+    ]
+    departure = audits[1]
+    assert (departure["actor_discord_user_id"], departure["citizen_id"]) == (actor_id, created.citizen.id)
+    assert (departure["occurred_at"], departure["reason"]) == (observed_at, "discord_membership")
+    assert await _table_counts(pg_engine) == (1, 1, 3)
+
+
+async def test_departure_rolls_back_if_audit_fails(pg_engine: AsyncEngine) -> None:
+    service = _service(pg_engine)
+    created = await service.register(GUILD_ID, USER_ID)
+    async with pg_engine.begin() as connection:
+        await connection.execute(text(
+            "ALTER TABLE audit_events ADD CONSTRAINT test_reject_departure CHECK (action <> 'citizen.left')"
+        ))
+    with pytest.raises(IntegrityError):
+        await service.mark_departed(GUILD_ID, USER_ID)
+    assert await service.get_profile(GUILD_ID, USER_ID) == created.citizen
+    assert await _table_counts(pg_engine) == (1, 1, 1)
 
 
 async def test_denied_registrations_do_not_write(pg_engine: AsyncEngine) -> None:

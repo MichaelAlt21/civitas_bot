@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import discord
 from discord import app_commands
 
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
+from civitas.domain.ledger import LedgerError, LedgerErrorReason
 
 from .localization import CommandTranslator, command_description, message
 from .wallet import add_wallet_commands
@@ -28,14 +30,17 @@ class CivitasBot(discord.Client):
         wallet_service: WalletService | None = None,
         currency_symbol: str = "₵",
         profile_service: ProfileService | None = None,
+        track_membership: bool = False,
     ) -> None:
         intents = discord.Intents.none()
-        intents.guilds = sync_roles
+        intents.guilds = sync_roles or track_membership
+        intents.members = track_membership
         super().__init__(
             intents=intents,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.guild_scope = discord.Object(id=guild_id)
+        self._citizens_service = citizens_service
         self.tree = app_commands.CommandTree(self)
         self._add_citizen_commands(citizens_service, profile_service)
         if wallet_service is not None:
@@ -49,6 +54,14 @@ class CivitasBot(discord.Client):
     async def setup_hook(self) -> None:
         await self.tree.set_translator(CommandTranslator())
         await self.tree.sync(guild=self.guild_scope)
+
+    async def on_raw_member_remove(self, payload: discord.RawMemberRemoveEvent) -> None:
+        if not self.intents.members or payload.guild_id != self.guild_scope.id:
+            return
+        await self._citizens_service.mark_departed(
+            payload.guild_id, payload.user.id, observed_at=datetime.now(UTC),
+            actor_discord_user_id=self.user.id if self.user is not None else None,
+        )
 
     def _add_citizen_commands(self, service: CitizensService, profile_service: ProfileService | None) -> None:
         citizen = app_commands.Group(name="citizen", description=command_description("citizen"))
@@ -134,7 +147,7 @@ class CivitasBot(discord.Client):
             visible = []
             for command in self.tree.walk_commands(guild=self.guild_scope):
                 if isinstance(command, app_commands.Command) and command.name != "help":
-                    if not ({"staff", "commission"} & set(command.qualified_name.split())):
+                    if not ({"admin", "staff", "commission"} & set(command.qualified_name.split())):
                         visible.append(f"`/{command.qualified_name}`")
             await interaction.response.send_message(
                 message(interaction.locale, "help.commands", commands=", ".join(visible)), ephemeral=True,
@@ -145,8 +158,11 @@ class CivitasBot(discord.Client):
             interaction: discord.Interaction, error: app_commands.AppCommandError
         ) -> None:
             original = getattr(error, "original", error)
-            logger.error("Ошибка выполнения команды Civitas (%s)", type(original).__name__)
-            reply = message(interaction.locale, "error.temporary")
+            if isinstance(original, LedgerError) and original.reason == LedgerErrorReason.ECONOMY_READ_ONLY:
+                reply = message(interaction.locale, "wallet.error.economy_read_only")
+            else:
+                logger.error("Ошибка выполнения команды Civitas (%s)", type(original).__name__)
+                reply = message(interaction.locale, "error.temporary")
             try:
                 if interaction.response.is_done():
                     await interaction.followup.send(reply, ephemeral=True)
@@ -164,6 +180,7 @@ def create_bot(
     wallet_service: WalletService | None = None,
     currency_symbol: str = "₵",
     profile_service: ProfileService | None = None,
+    track_membership: bool = False,
 ) -> CivitasBot:
     return CivitasBot(
         citizens_service=citizens_service,
@@ -172,4 +189,5 @@ def create_bot(
         wallet_service=wallet_service,
         currency_symbol=currency_symbol,
         profile_service=profile_service,
+        track_membership=track_membership,
     )

@@ -30,6 +30,15 @@ def test_omitted_allowlist_admits_nobody(env: dict[str, str]) -> None:
     assert not load_settings(env).allowed_user_ids
 
 
+def test_technical_operators_use_a_separate_explicit_allowlist(env: dict[str, str]) -> None:
+    assert not load_settings(env).technical_operator_ids
+    env["CIVITAS_TECHNICAL_OPERATOR_IDS"] = "56, 78, 56"
+    assert load_settings(env).technical_operator_ids == {56, 78}
+    env["CIVITAS_TECHNICAL_OPERATOR_IDS"] = "56, @Technical Admin"
+    with pytest.raises(ConfigurationError, match="CIVITAS_TECHNICAL_OPERATOR_IDS"):
+        load_settings(env)
+
+
 def test_citizen_role_is_optional_and_accepts_a_snowflake(env: dict[str, str]) -> None:
     assert load_settings(env).citizen_role_id is None
     env["CIVITAS_CITIZEN_ROLE_ID"] = "2000"

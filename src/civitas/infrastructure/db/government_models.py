@@ -2,7 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint,
-    Identity, Index, Integer, Numeric, String, Text, UniqueConstraint, text,
+    Identity, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -25,6 +25,14 @@ class ElectionRow(Base):
         ForeignKeyConstraint(
             ["guild_id", "runoff_of_id"], ["elections.guild_id", "elections.id"],
             name="fk_elections_runoff",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "retry_of_id"], ["elections.guild_id", "elections.id"],
+            name="fk_elections_retry",
+        ),
+        CheckConstraint(
+            "retry_of_id IS NULL OR runoff_of_id IS NULL OR retry_of_id = runoff_of_id",
+            name="ck_elections_retry_link",
         ),
         CheckConstraint("office IN ('PRESIDENT', 'PARLIAMENT')", name="ck_elections_office"),
         CheckConstraint(
@@ -60,6 +68,10 @@ class ElectionRow(Base):
     status: Mapped[str] = mapped_column(String(32))
     extended_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     runoff_of_id: Mapped[int | None] = mapped_column(BigInteger)
+    retry_of_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+Index("uq_elections_retry", func.coalesce(ElectionRow.retry_of_id, ElectionRow.runoff_of_id), unique=True)
 
 
 class ElectionProtocolRow(Base):
@@ -92,6 +104,20 @@ class ElectionProtocolRow(Base):
     reason: Mapped[str] = mapped_column(Text)
 
 
+class ElectionPollSourceRow(Base):
+    __tablename__ = "election_poll_sources"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "election_id"], ["elections.guild_id", "elections.id"],
+            name="fk_election_poll_sources_election",
+        ),
+    )
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_url: Mapped[str] = mapped_column(Text, primary_key=True)
+    election_id: Mapped[int] = mapped_column(BigInteger)
+
+
 class ElectionCertificationRow(Base):
     __tablename__ = "election_certifications"
     __table_args__ = (
@@ -109,6 +135,49 @@ class ElectionCertificationRow(Base):
     guild_id: Mapped[int] = mapped_column(BigInteger)
     certified_by_citizen_id: Mapped[int] = mapped_column(BigInteger)
     certified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+
+
+class ElectionCrisisProposalRow(Base):
+    __tablename__ = "election_crisis_proposals"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "election_id", name="uq_crisis_proposals_guild_election"),
+        ForeignKeyConstraint(
+            ["guild_id", "election_id"], ["elections.guild_id", "elections.id"],
+            name="fk_crisis_proposals_election",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "actor_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_crisis_proposals_actor",
+        ),
+        CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_crisis_proposals_reason"),
+    )
+
+    election_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    actor_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+
+
+class ElectionCrisisConfirmationRow(Base):
+    __tablename__ = "election_crisis_confirmations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "election_id"], ["election_crisis_proposals.guild_id", "election_crisis_proposals.election_id"],
+            name="fk_crisis_confirmations_proposal",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "actor_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_crisis_confirmations_actor",
+        ),
+        CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_crisis_confirmations_reason"),
+    )
+
+    election_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    actor_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reason: Mapped[str] = mapped_column(Text)
 
 

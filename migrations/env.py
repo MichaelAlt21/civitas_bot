@@ -5,8 +5,8 @@ from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import Connection
 
 from civitas.infrastructure.db import (  # noqa: F401
-    asset_models, government_models, jobs_models, ledger_models, market_models,
-    private_job_models, report_models, treasury_models,
+    asset_models, government_models, jobs_models, ledger_models, maintenance_models, market_models,
+    private_job_models, receipt_models, report_models, treasury_models,
 )
 from civitas.infrastructure.db.models import Base
 

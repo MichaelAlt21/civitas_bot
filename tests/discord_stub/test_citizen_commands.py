@@ -205,6 +205,26 @@ async def test_help_lists_guild_commands_in_interaction_language():
 
 
 @pytest.mark.asyncio
+async def test_departure_tracking_uses_only_configured_guild_and_members_intent():
+    service = Mock(spec=CitizensService)
+    service.mark_departed = AsyncMock(return_value=True)
+    enabled = create_bot(citizens_service=service, guild_id=GUILD_ID, track_membership=True)
+    disabled = create_bot(citizens_service=service, guild_id=GUILD_ID)
+    user = SimpleNamespace(id=USER_ID)
+    payload = SimpleNamespace(guild_id=GUILD_ID, user=user)
+
+    await disabled.on_raw_member_remove(payload)
+    await enabled.on_raw_member_remove(SimpleNamespace(guild_id=GUILD_ID + 1, user=user))
+    service.mark_departed.assert_not_awaited()
+    await enabled.on_raw_member_remove(payload)
+
+    assert enabled.intents.guilds and enabled.intents.members and not enabled.intents.message_content
+    assert not disabled.intents.members
+    assert service.mark_departed.await_args.args == (GUILD_ID, USER_ID)
+    assert service.mark_departed.await_args.kwargs["observed_at"].tzinfo is not None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("command_name", ["start", "register", "profile"])
 @pytest.mark.parametrize(
     ("guild_id", "user_id", "expected"),

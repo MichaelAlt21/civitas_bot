@@ -58,6 +58,7 @@ class PostResult:
 
 
 class LedgerErrorReason(StrEnum):
+    ECONOMY_READ_ONLY = "economy_read_only"
     INSUFFICIENT_FUNDS = "insufficient_funds"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     BALANCE_OVERFLOW = "balance_overflow"

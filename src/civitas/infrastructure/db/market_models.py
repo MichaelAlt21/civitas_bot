@@ -67,6 +67,27 @@ class OfferRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class OfferWithdrawalRow(Base):
+    __tablename__ = "offer_withdrawals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "offer_id"], ["offers.guild_id", "offers.id"],
+            name="fk_offer_withdrawals_offer",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "withdrawn_by_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_offer_withdrawals_actor",
+        ),
+        CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_offer_withdrawals_reason"),
+    )
+
+    offer_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    withdrawn_by_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    withdrawn_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+
+
 class OrderRow(Base):
     __tablename__ = "orders"
     __table_args__ = (
