@@ -97,6 +97,10 @@ async def test_company_fee_and_repeated_registration_are_atomic(pg_engine: Async
     assert replay == first
     assert first.fee_paid == 150
     assert await service.list_owned_companies(GUILD, SELLER) == (first,)
+    with pytest.raises(MarketError, match=MarketErrorReason.COMPANY_LIMIT):
+        await service.register_company(
+            GUILD, SELLER, name="Second Studio", activity="Design", idempotency_key="second-studio",
+        )
     with pytest.raises(MarketError) as failure:
         await _company(service, BUYER, "  civitas   studio ")
     assert failure.value.reason is MarketErrorReason.NAME_TAKEN
@@ -217,6 +221,60 @@ async def test_withdrawn_offer_blocks_new_orders_but_preserves_funded_order(pg_e
     await restarted.deliver_order(GUILD, SELLER, order.id)
     assert (await restarted.accept_order(GUILD, BUYER, order.id)).status is OrderStatus.COMPLETED
     assert await _balances(unit_of_work, order) == (800, 180, 8170, 0)
+
+
+async def test_offer_pages_filter_withdrawals_before_paginating(pg_engine: AsyncEngine) -> None:
+    unit_of_work, _, service = await _setup(pg_engine)
+    company = await _company(service)
+    offers = [
+        await service.publish_offer(
+            GUILD, SELLER, company_id=company.id, title=f"Sketch {index}", terms="Two sketches",
+            price=20, delivery_hours=24, idempotency_key=f"offer-page-{index}",
+        )
+        for index in range(4)
+    ]
+    await service.withdraw_offer(GUILD, SELLER, offers[2].id, reason="No capacity")
+
+    async with unit_of_work() as repository:
+        assert await repository.list_offers(company.guild_id, 2) == (offers[3], offers[1])
+        assert await repository.list_offers(company.guild_id, 2, offset=2) == (offers[0],)
+        assert await repository.list_offers(company.guild_id, 2, offset=3) == ()
+        assert await repository.list_offers(company.guild_id + 1, 2) == ()
+
+
+async def test_dispute_queue_pages_only_open_independent_orders(pg_engine: AsyncEngine) -> None:
+    unit_of_work, citizens, service = await _setup(pg_engine)
+    offer = await _offer(service, await _company(service))
+    own = await _order(service, offer, "own-dispute", buyer=ARBITER)
+    own = await service.dispute_order(GUILD, ARBITER, own.id, reason="Work is incomplete")
+    older = await _order(service, offer, "older-independent-dispute")
+    older = await service.dispute_order(GUILD, BUYER, older.id, reason="Work is incomplete")
+    newer = await _order(service, offer, "newer-independent-dispute", buyer=OTHER_ARBITER)
+    newer = await service.dispute_order(GUILD, OTHER_ARBITER, newer.id, reason="Work is incomplete")
+    funded = await _order(service, offer, "own-funded", buyer=ARBITER)
+    closed = await _order(service, offer, "closed-dispute", buyer=OTHER_ARBITER)
+    await service.dispute_order(GUILD, OTHER_ARBITER, closed.id, reason="Work is incomplete")
+    await service.resolve_order(GUILD, ARBITER, closed.id, settle=False, reason="Refund approved")
+
+    buyer = await citizens.get_profile(GUILD, BUYER)
+    assert buyer is not None
+    guild_id, arbiter_id = own.guild_id, own.buyer_citizen_id
+    async with unit_of_work() as repository:
+        assert await repository.list_orders(guild_id, arbiter_id, include_disputes=True, limit=3) == (
+            funded, newer, older,
+        )
+        assert await repository.list_orders(guild_id, arbiter_id, include_disputes=True, limit=3, offset=3) == (own,)
+        for offset, expected in enumerate(((newer,), (older,), ())):
+            assert await repository.list_orders(
+                guild_id, arbiter_id, include_disputes=True, limit=1, offset=offset, disputes_only=True,
+            ) == expected
+        assert await repository.list_orders(guild_id, buyer.id, include_disputes=False, limit=10) == (older,)
+        assert await repository.list_orders(
+            guild_id, buyer.id, include_disputes=False, limit=10, disputes_only=True,
+        ) == ()
+        assert await repository.list_orders(
+            guild_id + 1, arbiter_id, include_disputes=True, limit=10, disputes_only=True,
+        ) == ()
 
 
 async def test_funding_waits_for_in_flight_withdrawal(pg_engine: AsyncEngine) -> None:

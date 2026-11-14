@@ -1,5 +1,6 @@
 """Run the Discord bot with explicitly configured credentials."""
 
+import argparse
 import asyncio
 import logging
 import os
@@ -228,11 +229,21 @@ async def run_bot(settings: Settings) -> None:
         await engine.dispose()
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="python -m civitas", description="Бот Civitas для Discord.")
+    parser.add_argument(
+        "--check-config", action="store_true", help="Проверить переменные окружения и завершить работу.",
+    )
+    args = parser.parse_args(argv)
+
     try:
         settings = load_settings(os.environ)
     except ConfigurationError as error:
         raise SystemExit(str(error)) from None
+
+    if args.check_config:
+        print("Конфигурация Civitas валидна.")
+        return
 
     logging.basicConfig(level=logging.INFO)
     # Psycopg's asynchronous connections require a selector loop on Windows.

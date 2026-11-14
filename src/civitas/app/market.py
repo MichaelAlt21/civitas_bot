@@ -16,7 +16,7 @@ from civitas.domain.market import (
     BASIS_POINTS, MAX_DELIVERY_HOURS, Company, MarketOrder, Offer, OfferWithdrawal, OrderQuote, OrderStatus, sales_tax,
 )
 
-_LIST_LIMIT = 10
+MARKET_PAGE_SIZE = 10
 
 
 class MarketErrorReason(StrEnum):
@@ -36,6 +36,7 @@ class MarketErrorReason(StrEnum):
     INVALID_TEXT = "invalid_text"
     INVALID_DEADLINE = "invalid_deadline"
     INVALID_REQUEST_KEY = "invalid_request_key"
+    INVALID_PAGE = "invalid_page"
     QUOTE_CHANGED = "quote_changed"
     INVALID_STATUS = "invalid_status"
     DEADLINE_PASSED = "deadline_passed"
@@ -95,7 +96,7 @@ class MarketRepository(WalletRepository, Protocol):
 
     async def get_offer_by_key(self, guild_id: int, key: str) -> Offer | None: ...
 
-    async def list_offers(self, guild_id: int, limit: int) -> tuple[Offer, ...]: ...
+    async def list_offers(self, guild_id: int, limit: int, *, offset: int = 0) -> tuple[Offer, ...]: ...
 
     async def create_offer(
         self,
@@ -115,7 +116,8 @@ class MarketRepository(WalletRepository, Protocol):
     async def get_order_by_key(self, guild_id: int, key: str) -> MarketOrder | None: ...
 
     async def list_orders(
-        self, guild_id: int, citizen_id: int, *, include_disputes: bool, limit: int
+        self, guild_id: int, citizen_id: int, *, include_disputes: bool, limit: int,
+        offset: int = 0, disputes_only: bool = False,
     ) -> tuple[MarketOrder, ...]: ...
 
     async def create_order(
@@ -165,6 +167,12 @@ def _validate_key(key: str) -> None:
 
 def _valid_id(value: int) -> bool:
     return type(value) is int and 1 <= value <= MAX_AMOUNT
+
+
+def _page_offset(page: int) -> int:
+    if type(page) is not int or not 1 <= page <= MAX_AMOUNT // MARKET_PAGE_SIZE + 1:
+        raise MarketError(MarketErrorReason.INVALID_PAGE)
+    return (page - 1) * MARKET_PAGE_SIZE
 
 
 class MarketService:
@@ -317,11 +325,12 @@ class MarketService:
                 raise MarketError(MarketErrorReason.INVALID_REQUEST_KEY)
             return prior
 
-    async def list_offers(self, guild_id: int | None, user_id: int) -> tuple[Offer, ...]:
+    async def list_offers(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[Offer, ...]:
         self._authorize(guild_id, user_id)
+        offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
-            return await repository.list_offers(citizen.guild_id, _LIST_LIMIT)
+            return await repository.list_offers(citizen.guild_id, MARKET_PAGE_SIZE, offset=offset)
 
     async def withdraw_offer(
         self, guild_id: int | None, user_id: int, offer_id: int, *, reason: str,
@@ -409,12 +418,19 @@ class MarketService:
             )
             return order
 
-    async def list_orders(self, guild_id: int | None, user_id: int) -> tuple[MarketOrder, ...]:
+    async def list_orders(
+        self, guild_id: int | None, user_id: int, *, page: int = 1, disputes_only: bool = False,
+    ) -> tuple[MarketOrder, ...]:
         self._authorize(guild_id, user_id)
+        is_arbiter = user_id in self._arbiter_user_ids
+        if disputes_only and not is_arbiter:
+            raise MarketError(MarketErrorReason.ARBITER_REQUIRED)
+        offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
             return await repository.list_orders(
-                citizen.guild_id, citizen.id, include_disputes=user_id in self._arbiter_user_ids, limit=_LIST_LIMIT
+                citizen.guild_id, citizen.id, include_disputes=is_arbiter, limit=MARKET_PAGE_SIZE,
+                offset=offset, disputes_only=disputes_only,
             )
 
     async def get_order(self, guild_id: int | None, user_id: int, order_id: int) -> MarketOrder:

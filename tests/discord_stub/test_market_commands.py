@@ -7,7 +7,7 @@ import discord
 import pytest
 from discord import app_commands
 
-from civitas.app.market import MarketError, MarketErrorReason, MarketService
+from civitas.app.market import MARKET_PAGE_SIZE, MarketError, MarketErrorReason, MarketService
 from civitas.bot.localization import CommandTranslator, message
 from civitas.bot.market import add_market_commands
 from civitas.domain.ledger import TransactionKind
@@ -89,6 +89,13 @@ async def test_market_metadata_is_guild_only_and_localized(market_commands):
     action_option = next(option for option in commands["order"]["options"] if option["name"] == "action")
     choices = {choice["value"]: choice["name_localizations"] for choice in action_option["choices"]}
     assert choices["resolve_refund"] == {"ru": "Разрешить спор возвратом"}
+    for command in ("list", "order"):
+        page = next(option for option in commands[command]["options"] if option["name"] == "page")
+        assert page["min_value"] == 1
+        assert page["required"] is False
+    disputes = next(option for option in commands["order"]["options"] if option["name"] == "disputes_only")
+    assert disputes["type"] == discord.AppCommandOptionType.boolean.value
+    assert disputes["required"] is False
 
 
 @pytest.mark.asyncio
@@ -126,12 +133,13 @@ async def test_company_registration_previews_fee_and_reuses_the_same_key_on_retr
 
 
 @pytest.mark.asyncio
-async def test_company_info_never_reads_balance_without_request_and_reports_denial(market_commands):
+async def test_company_balance_is_private_and_requires_an_owner_request(market_commands):
     service, _, companies, _ = market_commands
     service.company_info.return_value = COMPANY
-    service.company_balance.side_effect = MarketError(MarketErrorReason.COMPANY_NOT_OWNED)
+    service.company_balance.side_effect = [MarketError(MarketErrorReason.COMPANY_NOT_OWNED), 180]
     public_card = interaction()
     denied_balance = interaction()
+    owner_balance = interaction(actor=SELLER_ID)
 
     await companies.get_command("info").callback(public_card, COMPANY.id)
     service.company_balance.assert_not_awaited()
@@ -140,6 +148,9 @@ async def test_company_info_never_reads_balance_without_request_and_reports_deni
     assert "Деятельность: Woodworking" in private_reply(public_card)
     service.company_balance.assert_awaited_once_with(GUILD_ID, BUYER_ID, COMPANY.id)
     assert private_reply(denied_balance) == "Это действие доступно владельцу компании."
+    await companies.get_command("info").callback(owner_balance, COMPANY.id, True)
+    service.company_balance.assert_awaited_with(GUILD_ID, SELLER_ID, COMPANY.id)
+    assert "180 CP" in private_reply(owner_balance)
 
 
 @pytest.mark.asyncio
@@ -156,6 +167,7 @@ async def test_offer_publish_uses_discord_request_key_and_lists_offer(market_com
         GUILD_ID, SELLER_ID, company_id=COMPANY.id, title=OFFER.title, terms=OFFER.terms,
         price=200, delivery_hours=48, idempotency_key=str(publish.id),
     )
+    service.list_offers.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=1)
     assert "опубликовано" in private_reply(publish)
     assert "Make a desk · 200 CP" in private_reply(browse)
 
@@ -262,10 +274,68 @@ async def test_order_list_hides_dispute_reason_and_detail_is_private(market_comm
     await market.get_command("order").callback(listing)
     await market.get_command("order").callback(detail, ORDER.id)
 
-    service.list_orders.assert_awaited_once_with(GUILD_ID, SELLER_ID)
+    service.list_orders.assert_awaited_once_with(GUILD_ID, SELLER_ID, page=1, disputes_only=False)
     service.get_order.assert_awaited_once_with(GUILD_ID, SELLER_ID, ORDER.id)
     assert "Private details" not in private_reply(listing)
     assert "Private details" in private_reply(detail)
+
+
+@pytest.mark.asyncio
+async def test_market_pages_pass_through_and_next_hint_preserves_dispute_filter(market_commands):
+    service, _, _, market = market_commands
+    service.list_offers.return_value = tuple(replace(OFFER, id=i) for i in range(1, MARKET_PAGE_SIZE + 1))
+    service.list_orders.return_value = tuple(
+        replace(ORDER, id=i, status=OrderStatus.DISPUTED) for i in range(1, MARKET_PAGE_SIZE + 1)
+    )
+    offers = interaction()
+    disputes = interaction(actor=ARBITER_ID, locale=discord.Locale.american_english)
+
+    await market.get_command("list").callback(offers, page=2)
+    await market.get_command("order").callback(disputes, page=3, disputes_only=True)
+
+    service.list_offers.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=2)
+    service.list_orders.assert_awaited_once_with(GUILD_ID, ARBITER_ID, page=3, disputes_only=True)
+    assert "Актуальные предложения · Страница 2" in private_reply(offers)
+    assert "`/market list page:3`" in private_reply(offers)
+    assert "Disputed orders · Page 3" in private_reply(disputes)
+    assert "`/market order disputes_only:true page:4`" in private_reply(disputes)
+
+
+@pytest.mark.asyncio
+async def test_market_empty_later_page_and_unprivileged_dispute_filter_are_private(market_commands):
+    service, _, _, market = market_commands
+    service.list_offers.return_value = ()
+    service.list_orders.side_effect = MarketError(MarketErrorReason.ARBITER_REQUIRED)
+    empty, denied = interaction(), interaction()
+
+    await market.get_command("list").callback(empty, page=3)
+    await market.get_command("order").callback(denied, disputes_only=True)
+
+    assert private_reply(empty) == "На странице 3 нет записей."
+    assert private_reply(denied) == "Для этого действия нужны полномочия арбитра рынка."
+    service.list_orders.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=1, disputes_only=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"order_id": ORDER.id, "page": 1},
+        {"order_id": ORDER.id, "disputes_only": False},
+        {"order_id": ORDER.id, "action": "accept", "disputes_only": True},
+        {"action": "accept", "page": 2},
+    ],
+)
+async def test_market_list_options_cannot_be_combined_with_single_order_or_action(market_commands, options):
+    service, _, _, market = market_commands
+    command = interaction()
+
+    await market.get_command("order").callback(command, **options)
+
+    assert private_reply(command) == "Параметры page и disputes_only доступны для списка заказов без номера и действия."
+    service.list_orders.assert_not_awaited()
+    service.get_order.assert_not_awaited()
+    service.accept_order.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -120,16 +120,22 @@ def load_settings(env: Mapping[str, str]) -> Settings:
                               government.parliament_role_id if government else None) if role is not None]
     if guild_id in roles or len(roles) != len(set(roles)):
         raise ConfigurationError("Укажите отдельные ID для роли гражданина и выборных ролей.")
+    allowed_user_ids = _discord_ids(env, "CIVITAS_ALLOWED_USER_IDS")
+    market = _load_market_settings(env, wallet)
+    if _enabled(env, "CIVITAS_SEASON_ONE") and (market is None or not market.arbiter_ids & allowed_user_ids):
+        raise ConfigurationError(
+            "Для первого сезона укажите в CIVITAS_MARKET_ARBITER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
+        )
     return Settings(
         database_url=database_url,
         discord_token=token,
         guild_id=guild_id,
-        allowed_user_ids=_discord_ids(env, "CIVITAS_ALLOWED_USER_IDS"),
+        allowed_user_ids=allowed_user_ids,
         citizen_role_id=role_id,
         track_membership=_enabled(env, "CIVITAS_TRACK_MEMBERSHIP"),
         wallet=wallet,
         jobs=_load_jobs_settings(env, wallet),
-        market=_load_market_settings(env, wallet),
+        market=market,
         asset_issuer_ids=asset_issuer_ids,
         treasury=treasury,
         treasury_report_channel_id=report_channel_id,

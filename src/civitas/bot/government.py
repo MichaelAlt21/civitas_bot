@@ -11,7 +11,7 @@ from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError, is_discord_id
 from civitas.app.government import GovernmentError, GovernmentErrorReason, GovernmentService
-from civitas.domain.government import CrisisResolution, Election, OfficeKind, OfficeTerm
+from civitas.domain.government import CrisisResolution, Election, ElectionCancellation, OfficeKind, OfficeTerm
 
 from .localization import command_description, message
 from .responses import send_lines, send_private_lines
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _SYNC_INTERVAL_SECONDS = 60
 _CANDIDATE_ID = re.compile(r"(?:([0-9]{1,20})|<@!?([0-9]{1,20})>)")
 _VOTE_COUNT = re.compile(r"[0-9]{1,10}")
+_VOTER_PAGE_SIZE = 20
 
 
 def _candidate_id(text: str, reason: GovernmentErrorReason) -> int:
@@ -84,12 +85,13 @@ def _election_outcome(election: Election) -> str | None:
 
 
 def _election_row(locale: discord.Locale, election: Election, *, summarize_outcome: bool = False) -> str:
+    status = "cancelled" if election.is_cancelled else election.status.value.lower()
     row = message(
         locale, "election.results.row", id=str(election.id),
         office=message(locale, f"government.office.{election.office.value.lower()}"),
-        status=message(locale, f"election.status.{election.status.value.lower()}"),
+        status=message(locale, f"election.status.{status}"),
     )
-    outcome = _election_outcome(election) if summarize_outcome else None
+    outcome = _election_outcome(election) if summarize_outcome and not election.is_cancelled else None
     return f"{row} · {message(locale, f'election.outcome.{outcome}.short')}" if outcome else row
 
 
@@ -107,6 +109,16 @@ def _election_details(locale: discord.Locale, election: Election) -> list[str]:
     ]
     if election.retry_of_id is not None:
         rows.append(message(locale, "election.detail.retry", id=str(election.retry_of_id)))
+    if election.replacement_of_id is not None:
+        rows.append(message(locale, "election.detail.replacement", id=str(election.replacement_of_id)))
+
+    cancellation = election.cancellation
+    if cancellation is not None and cancellation.confirmed_at is not None:
+        rows.extend((
+            message(locale, "election.cancel.confirmed_at", date=discord.utils.format_dt(cancellation.confirmed_at, style="f")),
+            _cancellation_reason(locale, cancellation),
+        ))
+        return rows
 
     protocol = election.protocol
     if protocol is None:
@@ -142,6 +154,17 @@ def _election_details(locale: discord.Locale, election: Election) -> list[str]:
 def _crisis_resolution_reply(locale: discord.Locale, resolution: CrisisResolution) -> str:
     status = "confirmed" if resolution.confirmed_at is not None else "pending"
     return message(locale, f"election.crisis.resolution_{status}", id=str(resolution.election_id))
+
+
+def _cancellation_reply(locale: discord.Locale, cancellation: ElectionCancellation) -> str:
+    status = "confirmed" if cancellation.confirmed_at is not None else "pending"
+    return message(locale, f"election.cancel.{status}", id=str(cancellation.election_id))
+
+
+def _cancellation_reason(locale: discord.Locale, cancellation: ElectionCancellation) -> str:
+    reason = " ".join(cancellation.public_reason.split()).replace("<", "‹").replace(">", "›")
+    reason = discord.utils.escape_mentions(discord.utils.escape_markdown(reason, ignore_links=False))
+    return message(locale, "election.cancel.public_reason", reason=reason)
 
 
 @asynccontextmanager
@@ -233,11 +256,37 @@ def add_government_commands(
                 ) for record in records), message(locale, "election.active.inspect_hint"),
             )
 
+    @commission.command(name="voters", description=command_description("election.commission.voters"))
+    @app_commands.describe(
+        election_id=command_description("election.id"), page=command_description("election.voters.page"),
+    )
+    async def voters(
+        interaction: discord.Interaction, election_id: app_commands.Range[int, 1], page: app_commands.Range[int, 1] = 1,
+    ) -> None:
+        async with _commission_response(interaction):
+            locale = interaction.locale
+            snapshot = await government_service.list_voter_snapshot(interaction.guild_id, interaction.user.id, election_id)
+            offset = (page - 1) * _VOTER_PAGE_SIZE
+            ids = snapshot[offset:offset + _VOTER_PAGE_SIZE]
+            if not ids:
+                await send_private_lines(interaction, message(locale, "election.voters.empty", page=str(page)))
+                return
+            pages = (len(snapshot) + _VOTER_PAGE_SIZE - 1) // _VOTER_PAGE_SIZE
+            await send_private_lines(
+                interaction,
+                message(
+                    locale, "election.voters.title", id=str(election_id), count=str(len(snapshot)),
+                    page=str(page), pages=str(pages),
+                ),
+                "```\n" + "\n".join(str(user_id) for user_id in ids) + "\n```",
+            )
+
     @commission.command(name="open", description=command_description("election.commission.open"))
     @app_commands.choices(office=_office_choices())
     @app_commands.describe(
         office=command_description("election.office"), candidates=command_description("election.candidates"),
         reason=command_description("election.reason"), retry_of_id=command_description("election.retry_of_id"),
+        replacement_of_id=command_description("election.replacement_of_id"),
     )
     async def open_election(
         interaction: discord.Interaction,
@@ -245,12 +294,14 @@ def add_government_commands(
         candidates: app_commands.Range[str, 1, 4000],
         reason: app_commands.Range[str, 1, 200],
         retry_of_id: app_commands.Range[int, 1] | None = None,
+        replacement_of_id: app_commands.Range[int, 1] | None = None,
     ) -> None:
         async with _commission_response(interaction):
             record = await government_service.open_election(
                 interaction.guild_id, interaction.user.id, office=OfficeKind(office),
                 candidate_user_ids=_candidates(candidates), reason=reason,
                 idempotency_key=str(interaction.id), retry_of_id=retry_of_id,
+                replacement_of_id=replacement_of_id,
             )
             await send_private_lines(interaction, *_election_details(interaction.locale, record))
 
@@ -287,6 +338,9 @@ def add_government_commands(
                 rows.append(_crisis_resolution_reply(locale, resolution))
                 proposal = discord.utils.escape_mentions(discord.utils.escape_markdown(resolution.proposal_reason))
                 rows.append(message(locale, "election.crisis.proposal_reason", reason=proposal))
+            cancellation = record.cancellation
+            if cancellation is not None and cancellation.confirmed_at is None:
+                rows.extend((_cancellation_reply(locale, cancellation), _cancellation_reason(locale, cancellation)))
             await send_private_lines(interaction, *rows)
 
     @commission.command(name="certify", description=command_description("election.commission.certify"))
@@ -324,6 +378,32 @@ def add_government_commands(
                 interaction.guild_id, interaction.user.id, election_id, reason=reason,
             )
             await send_private_lines(interaction, _crisis_resolution_reply(interaction.locale, resolution))
+
+    @commission.command(name="cancel", description=command_description("election.commission.cancel"))
+    @app_commands.describe(
+        election_id=command_description("election.id"), reason=command_description("election.cancel.public_reason"),
+    )
+    async def cancel_election(
+        interaction: discord.Interaction, election_id: app_commands.Range[int, 1],
+        reason: app_commands.Range[str, 1, 200],
+    ) -> None:
+        async with _commission_response(interaction):
+            cancellation = await government_service.propose_election_cancellation(
+                interaction.guild_id, interaction.user.id, election_id, reason=reason,
+            )
+            await send_private_lines(interaction, _cancellation_reply(interaction.locale, cancellation))
+
+    @commission.command(name="confirm_cancel", description=command_description("election.commission.confirm_cancel"))
+    @app_commands.describe(election_id=command_description("election.id"), reason=command_description("election.reason"))
+    async def confirm_cancellation(
+        interaction: discord.Interaction, election_id: app_commands.Range[int, 1],
+        reason: app_commands.Range[str, 1, 200],
+    ) -> None:
+        async with _commission_response(interaction):
+            cancellation = await government_service.confirm_election_cancellation(
+                interaction.guild_id, interaction.user.id, election_id, reason=reason,
+            )
+            await send_private_lines(interaction, _cancellation_reply(interaction.locale, cancellation))
 
 
 async def _reconcile_office_roles(

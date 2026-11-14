@@ -14,6 +14,7 @@ from civitas.app.citizens import (
     RegistrationResult,
 )
 from civitas.bot import create_bot
+from civitas.domain.ledger import LedgerError, LedgerErrorReason
 
 GUILD_ID = 123
 USER_ID = 456
@@ -31,6 +32,7 @@ def fake_interaction(guild_id=GUILD_ID, user_id=USER_ID, locale=discord.Locale.r
             is_done=Mock(return_value=False),
         ),
         followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
     )
 
 
@@ -95,9 +97,81 @@ async def test_start_links_registration_and_profile():
 
     service.authorize.assert_called_once_with(GUILD_ID, USER_ID)
     response = interaction.response.send_message.await_args
-    assert response.kwargs == {"ephemeral": True}
+    assert response.kwargs["ephemeral"] is True
+    assert response.kwargs["view"].register_button.label == "Стать гражданином"
     assert "/citizen register" in response.args[0]
     assert "/profile" in response.args[0]
+
+
+@pytest.mark.asyncio
+async def test_start_button_uses_same_registration_as_slash_command():
+    service = Mock(spec=CitizensService)
+    citizen = citizen_record(CitizenStatus.VERIFIED)
+    service.register.side_effect = [
+        RegistrationResult(citizen, RegistrationOutcome.CREATED),
+        RegistrationResult(citizen, RegistrationOutcome.EXISTING),
+    ]
+    bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
+    opening = fake_interaction(locale=discord.Locale.american_english)
+    await get_command(bot, "start").callback(opening)
+    view = opening.response.send_message.await_args.kwargs["view"]
+    assert view.register_button.label == "Become a citizen"
+    service.register.assert_not_awaited()
+
+    click = fake_interaction(locale=discord.Locale.american_english)
+    assert await view.interaction_check(click)
+    await view.register_button.callback(click)
+    slash = fake_interaction(locale=discord.Locale.american_english)
+    await get_command(bot, "register").callback(slash)
+
+    for interaction in (click, slash):
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        assert interaction.followup.send.await_args.kwargs == {"ephemeral": True}
+    assert click.followup.send.await_args.args[0].startswith("Citizenship granted.")
+    assert slash.followup.send.await_args.args[0].startswith("You already have a citizenship record.")
+    assert service.register.await_count == 2
+    service.register.assert_awaited_with(GUILD_ID, USER_ID)
+
+
+@pytest.mark.asyncio
+async def test_start_button_refuses_other_users_and_guilds_and_disappears_on_timeout():
+    service = Mock(spec=CitizensService)
+    bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
+    opening = fake_interaction()
+    await get_command(bot, "start").callback(opening)
+    view = opening.response.send_message.await_args.kwargs["view"]
+    for click in (fake_interaction(user_id=USER_ID + 1), fake_interaction(guild_id=GUILD_ID + 1)):
+        assert not await view.interaction_check(click)
+        click.response.send_message.assert_awaited_once_with(
+            "Эта кнопка регистрации доступна игроку, который вызвал `/start`.", ephemeral=True,
+        )
+    service.register.assert_not_awaited()
+
+    await view.on_timeout()
+
+    opening.edit_original_response.assert_awaited_once_with(view=None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["button", "slash"])
+async def test_registration_explains_economy_pause_privately(route):
+    service = Mock(spec=CitizensService)
+    service.register.side_effect = LedgerError(LedgerErrorReason.ECONOMY_READ_ONLY)
+    bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
+    request = fake_interaction()
+    if route == "button":
+        opening = fake_interaction()
+        await get_command(bot, "start").callback(opening)
+        view = opening.response.send_message.await_args.kwargs["view"]
+        assert await view.interaction_check(request)
+        await view.register_button.callback(request)
+    else:
+        await get_command(bot, "register").callback(request)
+
+    request.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    response = request.followup.send.await_args
+    assert "Экономика временно работает в режиме просмотра" in response.args[0]
+    assert response.kwargs == {"ephemeral": True}
 
 
 @pytest.mark.asyncio
@@ -269,3 +343,18 @@ async def test_unexpected_error_uses_private_safe_response_and_log(caplog):
     )
     assert "RuntimeError" in caplog.text
     assert "database diagnostic contents" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_tree_error_handler_explains_unhandled_economy_pause():
+    bot = create_bot(citizens_service=Mock(spec=CitizensService), guild_id=GUILD_ID)
+    interaction = fake_interaction()
+    error = app_commands.CommandInvokeError(
+        get_command(bot, "register"), LedgerError(LedgerErrorReason.ECONOMY_READ_ONLY),
+    )
+
+    await bot.tree.on_error(interaction, error)
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "Экономика временно работает в режиме просмотра. Существующие записи доступны.", ephemeral=True,
+    )

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
-from civitas.app.market import MarketError, MarketErrorReason, MarketRepository, MarketRules, MarketService
+from civitas.app.market import MARKET_PAGE_SIZE, MarketError, MarketErrorReason, MarketRepository, MarketRules, MarketService
 from civitas.app.wallet import WalletFunding
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.ledger import Account, AccountKind, PostResult, TransactionKind
@@ -112,6 +112,44 @@ def service(
         funding=WalletFunding(starter_grant=250, treasury_genesis=8000),
         clock=lambda: now,
     )
+
+
+@pytest.mark.asyncio
+async def test_market_lists_read_requested_pages_with_actor_scope(repository: AsyncMock) -> None:
+    market = service(repository)
+    repository.list_offers.return_value = (OFFER,)
+    repository.list_orders.return_value = (FUNDED,)
+
+    assert await market.list_offers(DISCORD_GUILD, BUYER.discord_user_id, page=3) == (OFFER,)
+    repository.list_offers.assert_awaited_once_with(GUILD, MARKET_PAGE_SIZE, offset=2 * MARKET_PAGE_SIZE)
+    assert await market.list_orders(DISCORD_GUILD, BUYER.discord_user_id, page=2) == (FUNDED,)
+    repository.list_orders.assert_awaited_once_with(
+        GUILD, BUYER.id, include_disputes=False, limit=MARKET_PAGE_SIZE, offset=MARKET_PAGE_SIZE, disputes_only=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispute_queue_requires_an_arbiter_and_passes_filter_before_paging(repository: AsyncMock) -> None:
+    market = service(repository)
+    with pytest.raises(MarketError, match=MarketErrorReason.ARBITER_REQUIRED):
+        await market.list_orders(DISCORD_GUILD, BUYER.discord_user_id, disputes_only=True)
+    repository.list_orders.assert_not_awaited()
+    repository.list_orders.return_value = ()
+
+    assert await market.list_orders(DISCORD_GUILD, ARBITER.discord_user_id, page=2, disputes_only=True) == ()
+    repository.list_orders.assert_awaited_once_with(
+        GUILD, ARBITER.id, include_disputes=True, limit=MARKET_PAGE_SIZE, offset=MARKET_PAGE_SIZE, disputes_only=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_market_lists_reject_invalid_pages_before_reading(repository: AsyncMock) -> None:
+    market = service(repository)
+    with pytest.raises(MarketError, match=MarketErrorReason.INVALID_PAGE):
+        await market.list_offers(DISCORD_GUILD, BUYER.discord_user_id, page=0)
+    with pytest.raises(MarketError, match=MarketErrorReason.INVALID_PAGE):
+        await market.list_orders(DISCORD_GUILD, BUYER.discord_user_id, page=2**63)
+    repository.get_citizens.assert_not_awaited()
 
 
 @pytest.mark.asyncio

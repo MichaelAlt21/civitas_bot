@@ -49,6 +49,17 @@ class CrisisResolution:
 
 
 @dataclass(frozen=True, slots=True)
+class ElectionCancellation:
+    election_id: int
+    proposed_by_citizen_id: int
+    proposed_at: datetime
+    public_reason: str
+    confirmed_by_citizen_id: int | None = None
+    confirmed_at: datetime | None = None
+    confirmation_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Election:
     id: int
     guild_id: int
@@ -74,6 +85,12 @@ class Election:
     candidate_discord_user_ids: tuple[int, ...] = ()
     retry_of_id: int | None = None
     crisis_resolution: CrisisResolution | None = None
+    replacement_of_id: int | None = None
+    cancellation: ElectionCancellation | None = None
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.cancellation is not None and self.cancellation.confirmed_at is not None
 
     @property
     def failed(self) -> bool:

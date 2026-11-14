@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError
-from civitas.app.market import MarketError, MarketService
+from civitas.app.market import MARKET_PAGE_SIZE, MarketError, MarketService
 from civitas.domain.ledger import LedgerError
 from civitas.domain.market import MAX_DELIVERY_HOURS, Company, MarketOrder, OrderStatus
 
@@ -36,6 +36,30 @@ async def _market_response(interaction: discord.Interaction) -> AsyncIterator[No
         yield
     except _MARKET_ERRORS as error:
         await _reply(interaction, _error_reply(interaction.locale, error))
+
+
+async def _show_page(
+    interaction: discord.Interaction,
+    *,
+    page: int,
+    command: str,
+    title_key: str,
+    empty_key: str,
+    rows: list[str],
+) -> None:
+    locale = interaction.locale
+    if not rows:
+        if page == 1:
+            reply = message(locale, empty_key)
+        else:
+            reply = message(locale, "market.page.empty", page=str(page))
+        await _reply(interaction, reply)
+        return
+
+    parts = [message(locale, "market.page.title", title=message(locale, title_key), page=str(page)), *rows]
+    if len(rows) == MARKET_PAGE_SIZE:
+        parts.append(message(locale, "market.page.next", command=command, page=str(page + 1)))
+    await _reply(interaction, *parts)
 
 
 def _text(value: str) -> str:
@@ -170,24 +194,25 @@ def add_market_commands(
             await _reply(interaction, *parts)
 
     @market.command(name="list", description=command_description("market.list"))
-    async def list_offers(interaction: discord.Interaction) -> None:
+    @app_commands.describe(page=command_description("market.page"))
+    async def list_offers(interaction: discord.Interaction, page: app_commands.Range[int, 1] = 1) -> None:
         locale = interaction.locale
         async with _market_response(interaction):
-            offers = await market_service.list_offers(interaction.guild_id, interaction.user.id)
-            if not offers:
-                await _reply(interaction, message(locale, "market.list.empty"))
-                return
-            await _reply(
+            offers = await market_service.list_offers(interaction.guild_id, interaction.user.id, page=page)
+            await _show_page(
                 interaction,
-                message(locale, "market.list.title"),
-                *(message(
+                page=page,
+                command="/market list",
+                title_key="market.list.title",
+                empty_key="market.list.empty",
+                rows=[message(
                     locale,
                     "market.list.row",
                     id=str(offer.id),
                     title=_label(offer.title),
                     price=f"{offer.price} {currency_symbol}",
                     seller=str(offer.company_id),
-                ) for offer in offers),
+                ) for offer in offers],
             )
 
     @market.command(name="offer", description=command_description("market.offer"))
@@ -269,28 +294,42 @@ def add_market_commands(
     @app_commands.choices(action=_order_choices())
     @app_commands.describe(
         order_id=command_description("market.order_id"), action=command_description("market.action"),
-        reason=command_description("market.reason"),
+        reason=command_description("market.reason"), page=command_description("market.page"),
+        disputes_only=command_description("market.disputes_only"),
     )
     async def order_command(
         interaction: discord.Interaction,
         order_id: app_commands.Range[int, 1] | None = None,
         action: str = "view",
         reason: app_commands.Range[str, 1, 200] | None = None,
+        page: app_commands.Range[int, 1] | None = None,
+        disputes_only: bool | None = None,
     ) -> None:
         locale = interaction.locale
         guild_id, user_id = interaction.guild_id, interaction.user.id
         async with _market_response(interaction):
+            listing = order_id is None and action == "view"
+            if not listing and (page is not None or disputes_only is not None):
+                await _reply(interaction, message(locale, "market.order.list_options_only"))
+                return
             if order_id is None:
-                if action != "view":
+                if not listing:
                     await _reply(interaction, message(locale, "market.order.id_required"))
                     return
-                orders = await market_service.list_orders(guild_id, user_id)
-                if not orders:
-                    await _reply(interaction, message(locale, "market.order.empty"))
-                    return
-                await _reply(
-                    interaction, message(locale, "market.order.list"),
-                    *(_order_row(locale, order, currency_symbol) for order in orders),
+                page_number = 1 if page is None else page
+                orders = await market_service.list_orders(
+                    guild_id, user_id, page=page_number, disputes_only=bool(disputes_only)
+                )
+                title_key = "market.order.disputes_title" if disputes_only else "market.order.list"
+                empty_key = "market.order.disputes_empty" if disputes_only else "market.order.empty"
+                command = "/market order disputes_only:true" if disputes_only else "/market order"
+                await _show_page(
+                    interaction,
+                    page=page_number,
+                    command=command,
+                    title_key=title_key,
+                    empty_key=empty_key,
+                    rows=[_order_row(locale, order, currency_symbol) for order in orders],
                 )
                 return
 

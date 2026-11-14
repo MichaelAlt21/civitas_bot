@@ -10,14 +10,17 @@ from sqlalchemy import text
 
 from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
+from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentService
 from civitas.app.jobs import JobService, JobsRules
-from civitas.app.market import MarketRules, MarketService
+from civitas.app.market import MarketError, MarketErrorReason, MarketRules, MarketService
 from civitas.app.private_jobs import PrivateJobService
 from civitas.app.treasury import TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.domain.assets import AssetKind
+from civitas.domain.government import OfficeKind
 from civitas.domain.jobs import BudgetCaps, JobCategory
 from civitas.infrastructure.db import create_db_engine
+from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 from civitas.infrastructure.db.maintenance import PostgresMaintenanceUnitOfWork
 from civitas.infrastructure.db.private_jobs import PostgresPrivateJobUnitOfWork
 from civitas.infrastructure.db.receipts import PostgresReceiptUnitOfWork
@@ -44,13 +47,39 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         "budget_approvals": "SELECT period_id, activated_by_citizen_id FROM contract_budget_approvals ORDER BY period_id",
         "state_contracts": "SELECT id, status, budget_period_id, amount, payout_transaction_id FROM state_contracts ORDER BY id",
         "private_jobs": "SELECT id, status, amount, worker_citizen_id, payout_transaction_id FROM private_jobs ORDER BY id",
-        "orders": "SELECT id, status, price, tax_bp, buyer_account_id FROM orders ORDER BY id",
+        "orders": "SELECT id, offer_id, status, price, tax_bp, buyer_account_id FROM orders ORDER BY id",
+        "offer_withdrawals": (
+            "SELECT offer_id, guild_id, withdrawn_by_citizen_id, withdrawn_at, reason "
+            "FROM offer_withdrawals ORDER BY offer_id"
+        ),
         "assets": "SELECT id, status, owner_citizen_id, owner_company_id FROM assets ORDER BY id",
         "titles": "SELECT asset_id, kind, buyer_company_id, transaction_id FROM asset_transfers ORDER BY asset_id, kind",
         "receipt_preferences": "SELECT citizen_id, locale FROM receipt_preferences ORDER BY citizen_id",
         "receipts": "SELECT transaction_id, citizen_id, locale, sent_at FROM private_receipts ORDER BY id",
         "maintenance": "SELECT guild_id, read_only FROM economy_maintenance ORDER BY guild_id",
         "maintenance_audit": "SELECT actor_discord_user_id, read_only, reason FROM economy_maintenance_audit ORDER BY id",
+        "elections": "SELECT id, office, status, cancelled, replacement_of_id FROM elections ORDER BY id",
+        "poll_sources": "SELECT source_url, election_id FROM election_poll_sources ORDER BY source_url",
+        "protocols": (
+            "SELECT election_id, round_number, source_url, tallies, winners, recorded_by_citizen_id, recorded_at, reason "
+            "FROM election_protocols ORDER BY election_id, round_number"
+        ),
+        "certifications": (
+            "SELECT election_id, certified_by_citizen_id, certified_at, reason "
+            "FROM election_certifications ORDER BY election_id"
+        ),
+        "office_terms": (
+            "SELECT election_id, office, seat, holder_citizen_id, starts_at, ends_at "
+            "FROM public_offices ORDER BY election_id, seat"
+        ),
+        "cancellation_proposals": (
+            "SELECT election_id, actor_citizen_id, occurred_at, reason "
+            "FROM election_cancellation_proposals ORDER BY election_id"
+        ),
+        "cancellation_confirmations": (
+            "SELECT election_id, actor_citizen_id, occurred_at, reason "
+            "FROM election_cancellation_confirmations ORDER BY election_id"
+        ),
     }
     async with engine.connect() as connection:
         return {
@@ -94,10 +123,10 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     await jobs.submit(101, 202, task.id, "Fictional delivery complete")
     await jobs.review(101, 201, task.id, approve=True, reason="Verified fixture")
     assert await wallet.balance(101, 202) == 280
+    market_rules = MarketRules(registration_fee=150, sales_tax_bp=1000, company_limit=1)
     market = MarketService(
         uow, guild_id=101, authorize=citizens.authorize, arbiter_user_ids=(),
-        rules=MarketRules(registration_fee=150, sales_tax_bp=1000, company_limit=1),
-        funding=funding,
+        rules=market_rules, funding=funding,
     )
     company = await market.register_company(
         101, 201, name="Civitas Fixture", activity="Fictional deliveries", idempotency_key="restore-company"
@@ -109,7 +138,8 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     quote = await market.quote_order(101, 202, offer.id)
     order = await market.fund_order(101, 202, quote, idempotency_key="restore-order")
     await market.deliver_order(101, 201, order.id)
-    await market.accept_order(101, 202, order.id)
+    sale = await market.accept_order(101, 202, order.id)
+    withdrawal = await market.withdraw_offer(101, 201, offer.id, reason="Catalogue closed before backup")
     assert await market.company_balance(101, 201, company.id) == 180
     assert await wallet.balance(101, 202) == 80
     assets = AssetService(
@@ -156,12 +186,54 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert await wallet.balance(101, 202) == 120
     assert await market.company_balance(101, 201, company.id) == 100
 
+    election_now = now
+    election_rules = ElectionRules(
+        min_eligible=3, quorum_bp=4_000, quorum_min=2, parliament_seats=1,
+        term_days=28, voting_hours=1, extension_hours=24, poll_hosts=frozenset({"poll.example.test"}),
+    )
+
+    def government(engine):
+        return GovernmentService(
+            PostgresGovernmentUnitOfWork(engine), guild_id=101, authorize=citizens.authorize,
+            commissioner_user_ids={202, 203}, rules=election_rules, clock=lambda: election_now,
+        )
+
+    politics = government(pg_engine)
+    president = await politics.open_election(
+        101, 202, office=OfficeKind.PRESIDENT, candidate_user_ids=(201,),
+        reason="Fixture presidential election", idempotency_key="restore-president",
+    )
+    election_now = president.closes_at
+    await politics.record_protocol(
+        101, 202, president.id, source_url="https://poll.example.test/president",
+        participants=2, tallies={201: 2}, reason="Recorded presidential poll",
+    )
+    certified = await politics.certify_election(101, 203, president.id, reason="Independent presidential check")
+    parliament = await politics.open_election(
+        101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
+        reason="Fixture parliament election", idempotency_key="restore-parliament",
+    )
+    election_now = parliament.closes_at
+    cancelled_source = "https://poll.example.test/parliament"
+    await politics.record_protocol(
+        101, 202, parliament.id, source_url=cancelled_source, participants=2,
+        tallies={201: 2}, reason="Recorded parliament poll",
+    )
+    await politics.propose_election_cancellation(101, 202, parliament.id, reason="External poll invalidated")
+    cancellation = await politics.confirm_election_cancellation(
+        101, 203, parliament.id, reason="Independent cancellation check",
+    )
+
     async with PostgresMaintenanceUnitOfWork(pg_engine)() as repository:
         assert await repository.set_economy_read_only(
             101, True, actor_discord_user_id=901, reason="Fixture pause before backup", at=now,
         )
 
     expected = await _snapshot(pg_engine)
+    assert [(row.offer_id, row.status) for row in expected["orders"]] == [(offer.id, "COMPLETED")]
+    assert expected["offer_withdrawals"] == [(
+        offer.id, offer.guild_id, company.owner_citizen_id, withdrawal.withdrawn_at, withdrawal.reason,
+    )]
     assert expected["receipts"] and all(row.locale == "ru" for row in expected["receipts"])
     assert [row.read_only for row in expected["maintenance"]] == [True]
     assert [(row.status, row.amount) for row in expected["state_contracts"]] == [("PAID", 50), ("RESERVED", 30)]
@@ -198,11 +270,43 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             restored = create_db_engine(url.set(database=database))
             try:
                 assert await _snapshot(restored) == expected
+                restored_politics = government(restored)
+                assert await restored_politics.get_public_result(101, 201, president.id) == certified
+                (term,) = await restored_politics.list_offices(101, 201)
+                assert (term.election_id, term.holder_discord_user_id) == (president.id, 201)
+                async with PostgresGovernmentUnitOfWork(restored)() as repository:
+                    assert await repository.has_active_office(
+                        president.guild_id, term.holder_citizen_id, OfficeKind.PRESIDENT, election_now,
+                    )
+                assert (await restored_politics.get_election(101, 202, parliament.id)).cancellation == cancellation
+                with pytest.raises(GovernmentError, match=GovernmentErrorReason.REPLACEMENT_REQUIRED):
+                    await restored_politics.open_election(
+                        101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
+                        reason="Unlinked replacement", idempotency_key="restore-unlinked-parliament",
+                    )
+                replacement = await restored_politics.open_election(
+                    101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
+                    reason="Linked replacement", idempotency_key="restore-replacement-parliament",
+                    replacement_of_id=parliament.id,
+                )
+                election_now = replacement.closes_at
+                with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_SOURCE):
+                    await restored_politics.record_protocol(
+                        101, 202, replacement.id, source_url=cancelled_source, participants=2,
+                        tallies={201: 2}, reason="Try previously used source",
+                    )
                 async with PostgresMaintenanceUnitOfWork(restored)() as repository:
                     assert await repository.get_economy_read_only(101)
                     assert await repository.set_economy_read_only(
                         101, False, actor_discord_user_id=901, reason="Recovered fixture", at=now + timedelta(days=7),
                     )
+                restored_market = MarketService(
+                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+                    arbiter_user_ids=(), rules=market_rules, funding=funding,
+                )
+                with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
+                    await restored_market.quote_order(101, 202, offer.id)
+                assert await restored_market.accept_order(101, 202, sale.id) == sale
                 restored_assets = AssetService(
                     PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     staff_user_ids={202}, funding=funding,

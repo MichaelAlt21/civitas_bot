@@ -15,6 +15,7 @@ from civitas.domain.government import (
     CandidateTally,
     CrisisResolution,
     Election,
+    ElectionCancellation,
     ElectionProtocol,
     ElectionStatus,
     OfficeKind,
@@ -53,6 +54,11 @@ class GovernmentErrorReason(StrEnum):
     POLITICAL_CRISIS = "political_crisis"
     CRISIS_NOT_ACTIVE = "crisis_not_active"
     CRISIS_RESOLUTION_NOT_PROPOSED = "crisis_resolution_not_proposed"
+    ELECTION_CANCELLED = "election_cancelled"
+    ELECTION_NOT_CANCELLABLE = "election_not_cancellable"
+    CANCELLATION_NOT_PROPOSED = "cancellation_not_proposed"
+    REPLACEMENT_REQUIRED = "replacement_required"
+    INVALID_REPLACEMENT = "invalid_replacement"
 
 
 class GovernmentError(Exception):
@@ -110,6 +116,14 @@ class GovernmentRepository(WalletRepository, Protocol):
         self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
     ) -> CrisisResolution: ...
 
+    async def propose_election_cancellation(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> ElectionCancellation: ...
+
+    async def confirm_election_cancellation(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> ElectionCancellation: ...
+
     async def bind_poll_source(self, guild_id: int, election_id: int, source_url: str) -> bool:
         """Bind a canonical source to this election or reject its use by another election."""
         ...
@@ -125,6 +139,8 @@ class GovernmentRepository(WalletRepository, Protocol):
     async def list_results(self, guild_id: int, limit: int) -> tuple[Election, ...]: ...
 
     async def list_unfinished_elections(self, guild_id: int) -> tuple[Election, ...]: ...
+
+    async def get_voter_snapshot(self, guild_id: int, election_id: int) -> tuple[int, ...] | None: ...
 
     async def list_office_role_assignments(
         self, discord_guild_id: int, at: datetime
@@ -191,6 +207,7 @@ class GovernmentService:
         idempotency_key: str,
         runoff_of_id: int | None = None,
         retry_of_id: int | None = None,
+        replacement_of_id: int | None = None,
     ) -> Election:
         self._commissioner(guild_id, user_id)
         _validate_key(idempotency_key)
@@ -207,12 +224,14 @@ class GovernmentService:
         if runoff_of_id is not None and retry_of_id is not None and runoff_of_id != retry_of_id:
             raise GovernmentError(GovernmentErrorReason.INVALID_RETRY)
         parent_id = retry_of_id if retry_of_id is not None else runoff_of_id
+        if replacement_of_id is not None and (parent_id is not None or type(replacement_of_id) is not int):
+            raise GovernmentError(GovernmentErrorReason.INVALID_REPLACEMENT)
 
         async with self._unit_of_work() as repository:
             commissioner = await self._verified(repository, user_id, lock=True)
             existing = await repository.get_election_by_key(commissioner.guild_id, idempotency_key)
             if existing is not None:
-                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id)
+                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id, replacement_of_id)
             eligible = await repository.list_verified_citizens(commissioner.guild_id)
             by_discord_id = {citizen.discord_user_id: citizen for citizen in eligible}
             if len(eligible) < self._rules.min_eligible:
@@ -230,10 +249,23 @@ class GovernmentService:
                 raise GovernmentError(GovernmentErrorReason.POLITICAL_CRISIS)
             if parent_id is None and latest is not None and latest.failed and not latest.opens_political_crisis:
                 raise GovernmentError(GovernmentErrorReason.RETRY_REQUIRED)
-            if parent_id is None and latest is not None and latest.certified_at is None:
+            if replacement_of_id is None and latest is not None and latest.is_cancelled:
+                raise GovernmentError(GovernmentErrorReason.REPLACEMENT_REQUIRED)
+            if parent_id is None and replacement_of_id is None and latest is not None and latest.certified_at is None:
                 raise GovernmentError(GovernmentErrorReason.ELECTION_IN_PROGRESS)
             tie_parent_id = None
-            if parent_id is not None:
+            if replacement_of_id is not None:
+                if (
+                    latest is None or latest.id != replacement_of_id or not latest.is_cancelled
+                ):
+                    raise GovernmentError(GovernmentErrorReason.INVALID_REPLACEMENT)
+                if latest.runoff_of_id is not None:
+                    remaining = set(latest.candidate_discord_user_ids) & by_discord_id.keys()
+                    if len(remaining) >= latest.seats and candidates != remaining:
+                        raise GovernmentError(GovernmentErrorReason.INVALID_REPLACEMENT)
+                parent_id, tie_parent_id = latest.retry_of_id, latest.runoff_of_id
+                seats, term_days = latest.seats, latest.term_days
+            elif parent_id is not None:
                 invalid = GovernmentErrorReason.INVALID_RUNOFF if runoff_of_id is not None else GovernmentErrorReason.INVALID_RETRY
                 if (
                     type(parent_id) is not int or latest is None or parent_id != latest.id
@@ -241,7 +273,10 @@ class GovernmentService:
                 ):
                     raise GovernmentError(invalid)
                 if latest.status == ElectionStatus.TIED:
-                    if latest.protocol is None or candidates != self._runoff_candidates(latest):
+                    if latest.protocol is None:
+                        raise GovernmentError(GovernmentErrorReason.INVALID_RUNOFF)
+                    remaining = self._runoff_candidates(latest) & by_discord_id.keys()
+                    if len(remaining) >= latest.seats and candidates != remaining:
                         raise GovernmentError(GovernmentErrorReason.INVALID_RUNOFF)
                     tie_parent_id = latest.id
                 seats, term_days = latest.seats, latest.term_days
@@ -273,6 +308,7 @@ class GovernmentService:
                 candidate_discord_user_ids=tuple(citizen.discord_user_id for citizen in ordered_candidates),
                 runoff_of_id=tie_parent_id,
                 retry_of_id=parent_id,
+                replacement_of_id=replacement_of_id,
                 extension_hours=self._rules.extension_hours,
             )
             created = await repository.create_election(election)
@@ -280,7 +316,7 @@ class GovernmentService:
                 return created
             existing = await repository.get_election_by_key(commissioner.guild_id, idempotency_key)
             if existing is not None:
-                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id)
+                return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id, replacement_of_id)
             raise GovernmentError(GovernmentErrorReason.ELECTION_IN_PROGRESS)
 
     async def record_protocol(
@@ -295,6 +331,8 @@ class GovernmentService:
         reason: str,
     ) -> Election:
         async with self._commission_action(guild_id, user_id, election_id) as (repository, actor, election):
+            if election.is_cancelled:
+                raise GovernmentError(GovernmentErrorReason.ELECTION_CANCELLED)
             source_key = self._validate_source(source_url)
             reason = _reason(reason)
             candidate_tallies = self._validate_tallies(election, participants, tallies)
@@ -341,6 +379,8 @@ class GovernmentService:
         self, guild_id: int | None, user_id: int, election_id: int, *, reason: str
     ) -> Election:
         async with self._commission_action(guild_id, user_id, election_id) as (repository, actor, election):
+            if election.is_cancelled:
+                raise GovernmentError(GovernmentErrorReason.ELECTION_CANCELLED)
             reason = _reason(reason)
             if election.protocol is None:
                 raise GovernmentError(GovernmentErrorReason.INVALID_STATUS)
@@ -365,6 +405,41 @@ class GovernmentService:
             else:
                 await repository.update_election(certified)
             return certified
+
+    async def propose_election_cancellation(
+        self, guild_id: int | None, user_id: int, election_id: int, *, reason: str,
+    ) -> ElectionCancellation:
+        async with self._commission_action(guild_id, user_id, election_id) as (repository, actor, election):
+            reason = _reason(reason)
+            if election.cancellation is not None:
+                return election.cancellation
+            await self._require_cancellable(repository, election)
+            return await repository.propose_election_cancellation(
+                election.guild_id, election.id, actor.id, reason, self._clock(),
+            )
+
+    async def confirm_election_cancellation(
+        self, guild_id: int | None, user_id: int, election_id: int, *, reason: str,
+    ) -> ElectionCancellation:
+        async with self._commission_action(guild_id, user_id, election_id) as (repository, actor, election):
+            reason = _reason(reason)
+            cancellation = election.cancellation
+            if cancellation is None:
+                raise GovernmentError(GovernmentErrorReason.CANCELLATION_NOT_PROPOSED)
+            if cancellation.proposed_by_citizen_id == actor.id:
+                raise GovernmentError(GovernmentErrorReason.INDEPENDENT_CERTIFICATION_REQUIRED)
+            if cancellation.confirmed_at is not None:
+                return cancellation
+            await self._require_cancellable(repository, election)
+            return await repository.confirm_election_cancellation(
+                election.guild_id, election.id, actor.id, reason, self._clock(),
+            )
+
+    @staticmethod
+    async def _require_cancellable(repository: GovernmentRepository, election: Election) -> None:
+        latest = await repository.get_latest_election(election.guild_id, election.office)
+        if election.certified_at is not None or latest is None or latest.id != election.id:
+            raise GovernmentError(GovernmentErrorReason.ELECTION_NOT_CANCELLABLE)
 
     async def propose_crisis_resolution(
         self, guild_id: int | None, user_id: int, election_id: int, *, reason: str,
@@ -426,7 +501,7 @@ class GovernmentService:
         self._public_access(guild_id, user_id)
         async with self._unit_of_work() as repository:
             internal_guild_id = await repository.ensure_guild(self._guild_id)
-            return await repository.list_results(internal_guild_id, 10)
+            return tuple(self._public_election(election) for election in await repository.list_results(internal_guild_id, 10))
 
     async def list_unfinished_elections(self, guild_id: int | None, user_id: int) -> tuple[Election, ...]:
         self._commissioner(guild_id, user_id)
@@ -439,15 +514,35 @@ class GovernmentService:
         async with self._unit_of_work() as repository:
             internal_guild_id = await repository.ensure_guild(self._guild_id)
             election = await self._election(repository, internal_guild_id, election_id)
-            if election.status not in _PUBLIC_OUTCOMES or election.certified_at is None:
+            if not election.is_cancelled and (election.status not in _PUBLIC_OUTCOMES or election.certified_at is None):
                 raise GovernmentError(GovernmentErrorReason.RESULT_NOT_PUBLIC)
+            return self._public_election(election)
+
+    @staticmethod
+    def _public_election(election: Election) -> Election:
+        cancellation = election.cancellation
+        if cancellation is None:
             return election
+        if cancellation.confirmed_at is None:
+            return replace(election, cancellation=None)
+        return replace(election, protocol=None, cancellation=replace(cancellation, confirmation_reason=None))
 
     async def get_election(self, guild_id: int | None, user_id: int, election_id: int) -> Election:
         self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
             return await self._election(repository, actor.guild_id, election_id)
+
+    async def list_voter_snapshot(self, guild_id: int | None, user_id: int, election_id: int) -> tuple[int, ...]:
+        self._commissioner(guild_id, user_id)
+        if type(election_id) is not int or not 1 <= election_id <= MAX_AMOUNT:
+            raise GovernmentError(GovernmentErrorReason.ELECTION_NOT_FOUND)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id)
+            voters = await repository.get_voter_snapshot(actor.guild_id, election_id)
+            if voters is None:
+                raise GovernmentError(GovernmentErrorReason.ELECTION_NOT_FOUND)
+            return voters
 
     async def office_role_assignments(self) -> tuple[OfficeRoleAssignment, ...]:
         async with self._unit_of_work() as repository:
@@ -558,10 +653,14 @@ class GovernmentService:
 
     @staticmethod
     def _replay_open(
-        election: Election, actor_id: int, office: OfficeKind, candidates: set[int], reason: str, retry_of_id: int | None
+        election: Election, actor_id: int, office: OfficeKind, candidates: set[int], reason: str,
+        retry_of_id: int | None, replacement_of_id: int | None,
     ) -> Election:
-        if (election.opened_by_citizen_id, election.office, election.reason, election.retry_of_id) != (
-            actor_id, office, reason, retry_of_id
-        ) or set(election.candidate_discord_user_ids) != candidates:
+        if (
+            (election.opened_by_citizen_id, election.office, election.reason, election.replacement_of_id)
+            != (actor_id, office, reason, replacement_of_id)
+            or (replacement_of_id is None and election.retry_of_id != retry_of_id)
+            or set(election.candidate_discord_user_ids) != candidates
+        ):
             raise GovernmentError(GovernmentErrorReason.INVALID_REQUEST_KEY)
         return election

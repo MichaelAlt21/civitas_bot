@@ -58,6 +58,12 @@ _AUDIT = text("""
         SELECT guild_id, actor_citizen_id, occurred_at, 'election.crisis.confirm', 'election', election_id, 'success', election_id
           FROM election_crisis_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
+        SELECT guild_id, actor_citizen_id, occurred_at, 'election.cancel.propose', 'election', election_id, 'success', election_id
+          FROM election_cancellation_proposals WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, actor_citizen_id, occurred_at, 'election.cancel.confirm', 'election', election_id, 'success', election_id
+          FROM election_cancellation_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
         SELECT guild_id, actor_citizen_id, created_at, 'asset.issue', 'asset', asset_id, 'success', id
           FROM asset_transfers WHERE guild_id = (SELECT id FROM guild_scope) AND kind = 'ISSUE'
         UNION ALL

@@ -1,7 +1,9 @@
 from datetime import UTC
+from pathlib import Path
 
 import pytest
 
+from civitas import __main__ as entrypoint
 from civitas.config import ConfigurationError, load_settings
 
 
@@ -30,6 +32,23 @@ def test_omitted_allowlist_admits_nobody(env: dict[str, str]) -> None:
     assert not load_settings(env).allowed_user_ids
 
 
+def test_config_cli_checks_settings_without_running_the_bot(env, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(entrypoint.os, "environ", env)
+
+    def unexpected_startup(*_args, **_kwargs):
+        pytest.fail("Configuration checking must not start the bot or connect to PostgreSQL")
+
+    monkeypatch.setattr(entrypoint, "run_bot", unexpected_startup)
+    monkeypatch.setattr(entrypoint, "create_db_engine", unexpected_startup)
+    entrypoint.main(["--check-config"])
+    assert capsys.readouterr().out.strip() == "Конфигурация Civitas валидна."
+
+    del env["CIVITAS_DISCORD_GUILD_ID"]
+    with pytest.raises(SystemExit, match="CIVITAS_DISCORD_GUILD_ID"):
+        entrypoint.main(["--check-config"])
+    assert capsys.readouterr().out == ""
+
+
 def test_technical_operators_use_a_separate_explicit_allowlist(env: dict[str, str]) -> None:
     assert not load_settings(env).technical_operator_ids
     env["CIVITAS_TECHNICAL_OPERATOR_IDS"] = "56, 78, 56"
@@ -37,6 +56,63 @@ def test_technical_operators_use_a_separate_explicit_allowlist(env: dict[str, st
     env["CIVITAS_TECHNICAL_OPERATOR_IDS"] = "56, @Technical Admin"
     with pytest.raises(ConfigurationError, match="CIVITAS_TECHNICAL_OPERATOR_IDS"):
         load_settings(env)
+
+
+def test_season_one_profile_loads_approved_values_and_elected_treasury(env: dict[str, str]) -> None:
+    env.update(
+        CIVITAS_NPC_REVIEWER_IDS="12",
+        CIVITAS_NPC_COOLDOWN_MINUTES="30",
+        CIVITAS_COMPANY_LIMIT="3",
+        CIVITAS_MARKET_ARBITER_IDS="12",
+        CIVITAS_ASSET_ISSUER_IDS="12",
+        CIVITAS_ELECTION_COMMISSIONER_IDS="12,34",
+        CIVITAS_ELECTION_POLL_HOSTS="poll.example.test",
+        CIVITAS_TREASURY_INITIATOR_IDS="12",
+        CIVITAS_TREASURY_APPROVER_IDS="34",
+    )
+    profile = Path(__file__).resolve().parents[1] / "config" / "season1.env"
+    env.update(line.split("=", 1) for line in profile.read_text(encoding="utf-8").splitlines() if "=" in line)
+
+    settings = load_settings(env)
+
+    assert (settings.wallet.starter_grant, settings.wallet.treasury_genesis, settings.wallet.currency_symbol) == (250, 8000, "₵")
+    assert (settings.market.company_fee, settings.market.sales_tax_basis_points) == (150, 1000)
+    assert settings.market.company_limit_per_owner == 1
+    assert settings.market.arbiter_ids == {12}
+    assert settings.asset_issuer_ids == {12}
+    assert (settings.jobs.budget_weekly_limit, settings.jobs.npc_weekly_limit, settings.jobs.personal_weekly_limit) == (800, 300, 100)
+    assert (settings.jobs.reward_min, settings.jobs.reward_max, settings.jobs.budget_timezone) == (10, 40, UTC)
+    assert settings.jobs.cooldown_minutes == 0
+    assert settings.treasury.elected_authority
+    assert (settings.treasury.contract_weekly_limit, settings.treasury.budget_timezone) == (250, UTC)
+    assert not settings.treasury.initiator_ids and not settings.treasury.approver_ids
+    government = settings.government
+    assert government is not None
+    assert (government.min_eligible, government.parliament_seats, government.term_days) == (10, 3, 28)
+    assert (government.voting_hours, government.quorum_bp, government.quorum_min, government.extension_hours) == (48, 4000, 4, 24)
+
+
+@pytest.mark.parametrize("arbiter_ids", ["", "56"])
+@pytest.mark.parametrize("args", [[], ["--check-config"]], ids=["startup", "config-check"])
+def test_season_one_requires_admitted_arbiter_before_startup(env, monkeypatch, args, arbiter_ids) -> None:
+    env.update(
+        CIVITAS_SEASON_ONE="true",
+        CIVITAS_STARTER_GRANT="250",
+        CIVITAS_TREASURY_GENESIS="8000",
+        CIVITAS_COMPANY_FEE="150",
+        CIVITAS_COMPANY_LIMIT="1",
+        CIVITAS_SALES_TAX_BP="1000",
+        CIVITAS_MARKET_ARBITER_IDS=arbiter_ids,
+    )
+    monkeypatch.setattr(entrypoint.os, "environ", env)
+
+    def unexpected_startup(*_args, **_kwargs):
+        pytest.fail("Invalid season configuration must be rejected before starting the bot or opening the database")
+
+    monkeypatch.setattr(entrypoint, "run_bot", unexpected_startup)
+    monkeypatch.setattr(entrypoint, "create_db_engine", unexpected_startup)
+    with pytest.raises(SystemExit, match="CIVITAS_MARKET_ARBITER_IDS.*CIVITAS_ALLOWED_USER_IDS"):
+        entrypoint.main(args)
 
 
 def test_citizen_role_is_optional_and_accepts_a_snowflake(env: dict[str, str]) -> None:
@@ -89,7 +165,9 @@ def test_market_rules_are_explicit_and_require_the_wallet(env: dict[str, str]) -
     with pytest.raises(ConfigurationError, match="CIVITAS_STARTER_GRANT"):
         load_settings(env)
 
-    env.update(CIVITAS_STARTER_GRANT="250", CIVITAS_TREASURY_GENESIS="8000", CIVITAS_MARKET_ARBITER_IDS="12")
+    env.update(CIVITAS_STARTER_GRANT="250", CIVITAS_TREASURY_GENESIS="8000")
+    assert not load_settings(env).market.arbiter_ids
+    env["CIVITAS_MARKET_ARBITER_IDS"] = "12"
     market = load_settings(env).market
     assert market is not None
     assert (market.company_fee, market.company_limit_per_owner, market.sales_tax_basis_points) == (150, 1, 1000)

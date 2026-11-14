@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -9,8 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.admin_audit import AdminAuditService
 from civitas.app.admin_operators import AdminOperatorPolicy
-from civitas.app.citizens import MAX_DISCORD_ID, CitizensService
+from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, MAX_DISCORD_ID, CitizensService
 from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentService
+from civitas.app.market import MarketRules, MarketService
 from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding
 from civitas.domain.citizens import CitizenStatus
@@ -20,6 +21,7 @@ from civitas.domain.treasury import ContractStatus
 from civitas.infrastructure.db.admin_audit import PostgresAdminAuditUnitOfWork
 from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 from civitas.infrastructure.db.government_models import (
+    ElectionCancellationConfirmationRow,
     ElectionCertificationRow,
     ElectionCrisisConfirmationRow,
     ElectionCrisisProposalRow,
@@ -103,14 +105,22 @@ async def test_certified_mandates_gate_treasury_and_expiry(pg_engine: AsyncEngin
     )
     await _certify(government, parliament)
     citizens = CitizensService(uow, guild_id=GUILD, allowed_user_ids={WINNER, RUNNER_UP, ORDINARY, RECORDER})
+    funding = WalletFunding(starter_grant=250, treasury_genesis=1000)
     async with uow() as repository:
-        await WalletFunding(starter_grant=0, treasury_genesis=1000).initialize_guild(repository, president.guild_id)
+        await funding.initialize_guild(repository, president.guild_id)
+    market = MarketService(
+        uow, guild_id=GUILD, authorize=citizens.authorize, arbiter_user_ids=(), funding=funding,
+        rules=MarketRules(registration_fee=150, sales_tax_bp=1000, company_limit=1),
+    )
+    company = await market.register_company(
+        GUILD, ORDINARY, name="Survey Studio", activity="Property surveys", idempotency_key="survey-studio",
+    )
     treasury = TreasuryService(
         uow, guild_id=GUILD, authorize=citizens.authorize, initiator_user_ids={RECORDER}, approver_user_ids={RECORDER},
         rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
         elected_authority=True, clock=clock,
     )
-    proposal = dict(recipient_user_id=ORDINARY, title="Survey", terms="Survey the fictional square", amount=50,
+    proposal = dict(recipient_company_id=company.id, title="Survey", terms="Survey the fictional square", amount=50,
                     deadline=clock.now + timedelta(days=1), reason="Public maintenance", idempotency_key="survey")
     with pytest.raises(TreasuryError, match=TreasuryErrorReason.INITIATOR_REQUIRED):
         await treasury.propose_contract(GUILD, RECORDER, **proposal)
@@ -122,8 +132,11 @@ async def test_certified_mandates_gate_treasury_and_expiry(pg_engine: AsyncEngin
         await treasury.reserve_contract(GUILD, ORDINARY, contract.id, reason="Beneficiary conflict")
     await treasury.reserve_contract(GUILD, RUNNER_UP, contract.id, reason="Reserve approved")
     await treasury.submit_contract(GUILD, ORDINARY, contract.id, evidence="Survey completed")
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.CONFLICT_OF_INTEREST):
+        await treasury.pay_contract(GUILD, ORDINARY, contract.id, reason="Beneficiary conflict")
     paid = await treasury.pay_contract(GUILD, RUNNER_UP, contract.id, reason="Work accepted")
     assert paid.status is ContractStatus.PAID
+    assert await market.company_balance(GUILD, ORDINARY, company.id) == 50
 
     clock.now += timedelta(days=RULES.term_days)
     with pytest.raises(TreasuryError, match=TreasuryErrorReason.APPROVER_REQUIRED):
@@ -155,6 +168,44 @@ async def test_ordinary_citizen_cannot_open_or_certify_presidential_election(
     assert denied.value.reason is GovernmentErrorReason.INDEPENDENT_CERTIFICATION_REQUIRED
     assert await service.list_offices(GUILD, ORDINARY) == ()
     assert await service.list_results(GUILD, ORDINARY) == ()
+
+
+async def test_voter_snapshot_keeps_original_discord_ids_and_requires_verified_commissioner(
+    pg_engine: AsyncEngine,
+) -> None:
+    unit_of_work, service, clock = await _setup(pg_engine)
+    election = await _open(service, key="voter-snapshot")
+    original_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, RUNNER_UP, WINNER)
+    assert await service.list_voter_snapshot(GUILD, REVIEWER, election.id) == original_voters
+
+    late_voter = 15
+    citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids={ORDINARY, SECOND_REVIEWER, late_voter})
+    departing = await citizens.get_profile(GUILD, ORDINARY)
+    assert departing is not None and departing.verified_at is not None
+    assert await citizens.mark_departed(GUILD, ORDINARY, observed_at=departing.verified_at + timedelta(seconds=1))
+    await citizens.register(GUILD, late_voter)
+    assert await service.list_voter_snapshot(GUILD, REVIEWER, election.id) == original_voters
+
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.COMMISSIONER_REQUIRED):
+        await service.list_voter_snapshot(GUILD, RUNNER_UP, election.id)
+    with pytest.raises(CitizenshipAccessError, match=AccessDeniedReason.WRONG_GUILD):
+        await service.list_voter_snapshot(GUILD - 1, REVIEWER, election.id)
+    for invalid_id in (0, True, 1 << 63, election.id + 1):
+        with pytest.raises(GovernmentError, match=GovernmentErrorReason.ELECTION_NOT_FOUND):
+            await service.list_voter_snapshot(GUILD, REVIEWER, invalid_id)
+
+    clock.now = election.closes_at
+    await _record(service, election, {WINNER: 2, RUNNER_UP: 1})
+    assert (await _certify(service, election)).status is ElectionStatus.APPLIED
+    assert await service.list_voter_snapshot(GUILD, REVIEWER, election.id) == original_voters
+
+    commissioner = await citizens.get_profile(GUILD, SECOND_REVIEWER)
+    assert commissioner is not None and commissioner.verified_at is not None
+    assert await citizens.mark_departed(
+        GUILD, SECOND_REVIEWER, observed_at=commissioner.verified_at + timedelta(seconds=1),
+    )
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.CITIZEN_NOT_VERIFIED):
+        await service.list_voter_snapshot(GUILD, SECOND_REVIEWER, election.id)
 
 
 async def test_concurrent_independent_attestations_apply_one_term_and_replay(
@@ -480,3 +531,154 @@ async def test_poll_source_is_reserved_across_offices_and_canonical_variants(pg_
         assert (await connection.execute(
             select(ElectionPollSourceRow.source_url, ElectionPollSourceRow.election_id)
         )).one() == (SOURCE, president.id)
+
+
+async def test_cancelled_retry_is_replaced_in_same_slot_with_public_reason(pg_engine: AsyncEngine) -> None:
+    _, service, clock = await _setup(pg_engine)
+    initial = await _open(service, key="initial")
+    clock.now = initial.closes_at
+    await _record(service, initial, {WINNER: 2, RUNNER_UP: 2})
+    await _certify(service, initial)
+    retry = await _open(service, key="retry", runoff_of_id=initial.id)
+    clock.now = retry.closes_at
+    retry_source = f"{SOURCE}-retry"
+    await _record(service, retry, {WINNER: 2, RUNNER_UP: 1}, source_url=retry_source)
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.CANCELLATION_NOT_PROPOSED):
+        await service.confirm_election_cancellation(GUILD, REVIEWER, retry.id, reason="No proposal")
+    proposal = await service.propose_election_cancellation(GUILD, RECORDER, retry.id, reason="External poll lost")
+    assert proposal.confirmed_at is None
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.RESULT_NOT_PUBLIC):
+        await service.get_public_result(GUILD, ORDINARY, retry.id)
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INDEPENDENT_CERTIFICATION_REQUIRED):
+        await service.confirm_election_cancellation(GUILD, RECORDER, retry.id, reason="Same reviewer")
+    (unfinished,) = await service.list_unfinished_elections(GUILD, REVIEWER)
+    assert unfinished.id == retry.id and not unfinished.is_cancelled
+    with pytest.raises(IntegrityError, match="separate reviewer after the proposal"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(insert(ElectionCancellationConfirmationRow).values(
+                guild_id=retry.guild_id, election_id=retry.id, actor_citizen_id=proposal.proposed_by_citizen_id,
+                occurred_at=clock.now, reason="Same actor in direct write",
+            ))
+
+    cancellation = await service.confirm_election_cancellation(GUILD, REVIEWER, retry.id, reason="Private check")
+    assert cancellation.confirmed_at is not None
+    public = await service.get_public_result(GUILD, ORDINARY, retry.id)
+    assert public.is_cancelled and not public.opens_political_crisis
+    assert public.protocol is None and public.cancellation.public_reason == "External poll lost"
+    assert public.cancellation.confirmation_reason is None
+    assert public in await service.list_results(GUILD, ORDINARY)
+    assert await service.list_unfinished_elections(GUILD, REVIEWER) == ()
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.ELECTION_CANCELLED):
+        await _certify(service, retry)
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.ELECTION_CANCELLED):
+        await _record(service, retry, {WINNER: 2, RUNNER_UP: 1}, source_url=retry_source)
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.REPLACEMENT_REQUIRED):
+        await _open(service, key="unlinked")
+    with pytest.raises(IntegrityError, match="Cancelled election cannot record or certify"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(insert(ElectionCertificationRow).values(
+                guild_id=retry.guild_id, election_id=retry.id, certified_at=clock.now,
+                certified_by_citizen_id=cancellation.confirmed_by_citizen_id, reason="Direct certification",
+            ))
+    with pytest.raises(IntegrityError, match="Cancelled election cannot record or certify"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(insert(ElectionProtocolRow).values(
+                guild_id=retry.guild_id, election_id=retry.id, round_number=2, source_url=retry_source,
+                participants=0, tallies=[], winners=[], recorded_at=clock.now,
+                recorded_by_citizen_id=proposal.proposed_by_citizen_id, reason="Direct protocol write",
+            ))
+
+    replacement_options = dict(
+        office=OfficeKind.PRESIDENT, candidate_user_ids=(WINNER, RUNNER_UP),
+        reason="Replace unverifiable runoff", idempotency_key="replacement", replacement_of_id=retry.id,
+    )
+    replacement = await service.open_election(GUILD, RECORDER, **replacement_options)
+    assert replacement.replacement_of_id == retry.id
+    assert replacement.retry_of_id == initial.id and replacement.runoff_of_id == initial.id
+    assert await service.open_election(GUILD, RECORDER, **replacement_options) == replacement
+    clock.now = replacement.closes_at
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_SOURCE):
+        await _record(service, replacement, {WINNER: 2, RUNNER_UP: 2}, source_url=retry_source)
+    await _record(service, replacement, {WINNER: 2, RUNNER_UP: 2}, source_url=f"{SOURCE}-replacement")
+    assert (await _certify(service, replacement)).opens_political_crisis
+
+
+@pytest.mark.parametrize("replacing", [False, True], ids=["first-retry", "cancelled-runoff-replacement"])
+@pytest.mark.parametrize("surviving_candidate", [False, True], ids=["nominations-reopen", "retain-exact-slate"])
+async def test_tied_election_uses_current_verified_candidates_without_consuming_an_extra_attempt(
+    pg_engine: AsyncEngine, replacing: bool, surviving_candidate: bool,
+) -> None:
+    unit_of_work, service, clock = await _setup(pg_engine)
+    initial = await _open(service, key="initial-tie")
+    clock.now = initial.closes_at
+    await _record(service, initial, {WINNER: 2, RUNNER_UP: 2})
+    assert (await _certify(service, initial)).status is ElectionStatus.TIED
+
+    cancelled = None
+    if replacing:
+        cancelled = await _open(service, key="original-retry", runoff_of_id=initial.id)
+        await service.propose_election_cancellation(GUILD, RECORDER, cancelled.id, reason="Poll cannot be verified")
+        await service.confirm_election_cancellation(GUILD, REVIEWER, cancelled.id, reason="Independent review")
+
+    citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids=())
+    assert await citizens.mark_departed(GUILD, RUNNER_UP)
+    if not surviving_candidate:
+        assert await citizens.mark_departed(GUILD, WINNER)
+
+    options = dict(
+        office=OfficeKind.PRESIDENT, reason="Continue the tied election", idempotency_key="adjusted-slate",
+        runoff_of_id=initial.id if cancelled is None else None,
+        replacement_of_id=cancelled.id if cancelled is not None else None,
+    )
+    if surviving_candidate:
+        reason = GovernmentErrorReason.INVALID_REPLACEMENT if replacing else GovernmentErrorReason.INVALID_RUNOFF
+        with pytest.raises(GovernmentError, match=reason):
+            await service.open_election(GUILD, RECORDER, candidate_user_ids=(WINNER, ORDINARY), **options)
+        candidates = (WINNER,)
+    else:
+        candidates = (ORDINARY,)
+
+    opened = await service.open_election(GUILD, RECORDER, candidate_user_ids=candidates, **options)
+    assert opened.status is ElectionStatus.OPEN
+    assert opened.candidate_discord_user_ids == candidates
+    assert (opened.retry_of_id, opened.runoff_of_id) == (initial.id, initial.id)
+    assert opened.replacement_of_id == (cancelled.id if cancelled is not None else None)
+    assert await service.open_election(GUILD, RECORDER, candidate_user_ids=candidates, **options) == opened
+
+    historical = await service.get_public_result(GUILD, ORDINARY, initial.id)
+    assert historical.candidate_discord_user_ids == (WINNER, RUNNER_UP)
+
+
+async def test_season_one_parliament_counts_one_vote_per_participant_and_seats_top_three(
+    pg_engine: AsyncEngine,
+) -> None:
+    unit_of_work, _, clock = await _setup(pg_engine)
+    extra_citizens = (15, 16, 17, 18)
+    citizens = CitizensService(
+        unit_of_work, guild_id=GUILD,
+        allowed_user_ids={RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, WINNER, RUNNER_UP, *extra_citizens},
+    )
+    for user_id in extra_citizens:
+        await citizens.register(GUILD, user_id)
+    service = GovernmentService(
+        unit_of_work, guild_id=GUILD, authorize=citizens.authorize, commissioner_user_ids={RECORDER, REVIEWER},
+        rules=replace(RULES, min_eligible=10, quorum_min=4, parliament_seats=3), clock=clock,
+    )
+    parliament = await service.open_election(
+        GUILD, RECORDER, office=OfficeKind.PARLIAMENT, candidate_user_ids=(WINNER, ORDINARY, RUNNER_UP, 15),
+        reason="Open season vote", idempotency_key="season-parliament",
+    )
+    assert parliament.quorum == 4 and len(parliament.eligible_citizen_ids) == 10
+    clock.now = parliament.closes_at
+    protocol = dict(source_url=f"{SOURCE}-parliament", participants=8, reason="Verify aggregated vote")
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_TALLY):
+        await service.record_protocol(
+            GUILD, RECORDER, parliament.id, tallies={WINNER: 5, ORDINARY: 3, RUNNER_UP: 1, 15: 0}, **protocol,
+        )
+    await service.record_protocol(
+        GUILD, RECORDER, parliament.id, tallies={WINNER: 4, ORDINARY: 2, RUNNER_UP: 1, 15: 0}, **protocol,
+    )
+    assert (await _certify(service, parliament)).status is ElectionStatus.APPLIED
+    assert tuple(term.holder_discord_user_id for term in await service.list_offices(GUILD, ORDINARY)) == (
+        WINNER, ORDINARY, RUNNER_UP,
+    )

@@ -3,21 +3,22 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.government import (
-    CandidateTally, CrisisResolution, Election, ElectionProtocol, ElectionStatus, OfficeKind, OfficeRoleAssignment,
-    OfficeTerm,
+    CandidateTally, CrisisResolution, Election, ElectionCancellation, ElectionProtocol, ElectionStatus, OfficeKind,
+    OfficeRoleAssignment, OfficeTerm,
 )
 
 from .citizens import _to_citizen
 from .government_models import (
-    ElectionCertificationRow, ElectionCrisisConfirmationRow, ElectionCrisisProposalRow, ElectionPollSourceRow,
-    ElectionProtocolRow, ElectionRow, PublicOfficeRow,
+    ElectionCancellationConfirmationRow, ElectionCancellationProposalRow, ElectionCertificationRow,
+    ElectionCrisisConfirmationRow, ElectionCrisisProposalRow, ElectionPollSourceRow, ElectionProtocolRow,
+    ElectionRow, PublicOfficeRow,
 )
 from .models import CitizenRow, GuildRow
 from .private_jobs import PostgresPrivateJobRepository
@@ -42,6 +43,7 @@ def _election(
     evidence: ElectionProtocolRow | None,
     certificate: ElectionCertificationRow | None,
     resolution: CrisisResolution | None = None,
+    cancellation: ElectionCancellation | None = None,
 ) -> Election:
     return Election(
         id=row.id, guild_id=row.guild_id, office=OfficeKind(row.office),
@@ -59,6 +61,7 @@ def _election(
         retry_of_id=row.retry_of_id if row.retry_of_id is not None else row.runoff_of_id,
         candidate_discord_user_ids=tuple(int(user_id) for user_id in row.candidate_discord_user_ids),
         crisis_resolution=resolution,
+        replacement_of_id=row.replacement_of_id, cancellation=cancellation,
     )
 
 
@@ -79,6 +82,17 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
         )
         return tuple(_to_citizen(row) for row in rows)
 
+    async def get_voter_snapshot(self, guild_id: int, election_id: int) -> tuple[int, ...] | None:
+        citizen_ids = await self._session.scalar(select(ElectionRow.eligible_citizen_ids).where(
+            ElectionRow.guild_id == guild_id, ElectionRow.id == election_id,
+        ))
+        if citizen_ids is None:
+            return None
+        discord_ids = await self._session.scalars(select(CitizenRow.discord_user_id).where(
+            CitizenRow.guild_id == guild_id, CitizenRow.id.in_(citizen_ids),
+        ).order_by(CitizenRow.discord_user_id))
+        return tuple(int(discord_id) for discord_id in discord_ids)
+
     async def _election_with_evidence(self, row: ElectionRow) -> Election:
         evidence = await self._session.scalar(
             select(ElectionProtocolRow).where(ElectionProtocolRow.election_id == row.id)
@@ -90,7 +104,8 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             row.retry_of_id is not None or row.runoff_of_id is not None
         ):
             resolution = await self.get_crisis_resolution(row.guild_id, row.id)
-        return _election(row, evidence, certificate, resolution)
+        cancellation = None if certificate is not None else await self.get_election_cancellation(row.guild_id, row.id)
+        return _election(row, evidence, certificate, resolution, cancellation)
 
     async def _get_election(
         self, guild_id: int, criterion: ColumnElement[bool], *, lock: bool = False
@@ -161,9 +176,47 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
         assert resolution is not None
         return resolution
 
+    async def get_election_cancellation(self, guild_id: int, election_id: int) -> ElectionCancellation | None:
+        row = (await self._session.execute(
+            select(ElectionCancellationProposalRow, ElectionCancellationConfirmationRow)
+            .outerjoin(ElectionCancellationConfirmationRow)
+            .where(
+                ElectionCancellationProposalRow.guild_id == guild_id,
+                ElectionCancellationProposalRow.election_id == election_id,
+            )
+        )).one_or_none()
+        if row is None:
+            return None
+        proposal, confirmation = row
+        return ElectionCancellation(
+            election_id=election_id, proposed_by_citizen_id=proposal.actor_citizen_id,
+            proposed_at=proposal.occurred_at.astimezone(UTC), public_reason=proposal.reason,
+            confirmed_by_citizen_id=confirmation.actor_citizen_id if confirmation else None,
+            confirmed_at=confirmation.occurred_at.astimezone(UTC) if confirmation else None,
+            confirmation_reason=confirmation.reason if confirmation else None,
+        )
+
+    async def propose_election_cancellation(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> ElectionCancellation:
+        await self._session.execute(insert(ElectionCancellationProposalRow).values(
+            guild_id=guild_id, election_id=election_id, actor_citizen_id=actor_citizen_id, reason=reason, occurred_at=at,
+        ))
+        return ElectionCancellation(election_id, actor_citizen_id, at, reason)
+
+    async def confirm_election_cancellation(
+        self, guild_id: int, election_id: int, actor_citizen_id: int, reason: str, at: datetime,
+    ) -> ElectionCancellation:
+        await self._session.execute(insert(ElectionCancellationConfirmationRow).values(
+            guild_id=guild_id, election_id=election_id, actor_citizen_id=actor_citizen_id, reason=reason, occurred_at=at,
+        ))
+        cancellation = await self.get_election_cancellation(guild_id, election_id)
+        assert cancellation is not None
+        return cancellation
+
     async def _has_active_election(self, guild_id: int, office: OfficeKind) -> bool:
         active = select(ElectionRow.id).where(
-            ElectionRow.guild_id == guild_id, ElectionRow.office == office.value,
+            ElectionRow.guild_id == guild_id, ElectionRow.office == office.value, ~ElectionRow.cancelled,
             ElectionRow.status.in_([
                 ElectionStatus.OPEN.value, ElectionStatus.EXTENDED.value,
                 ElectionStatus.PENDING_CERTIFICATION.value,
@@ -199,6 +252,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
                 candidate_citizen_ids=list(election.candidate_citizen_ids),
                 candidate_discord_user_ids=[Decimal(user_id) for user_id in election.candidate_discord_user_ids],
                 status=election.status.value, runoff_of_id=election.runoff_of_id, retry_of_id=election.retry_of_id,
+                replacement_of_id=election.replacement_of_id,
                 extension_hours=election.extension_hours,
             ).on_conflict_do_nothing().returning(ElectionRow)
         )
@@ -315,9 +369,15 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
         rows = (
             await self._session.scalars(
                 select(ElectionRow)
-                .join(ElectionCertificationRow, ElectionCertificationRow.election_id == ElectionRow.id)
-                .where(ElectionRow.guild_id == guild_id)
-                .order_by(ElectionCertificationRow.certified_at.desc(), ElectionRow.id.desc()).limit(limit)
+                .outerjoin(ElectionCertificationRow, ElectionCertificationRow.election_id == ElectionRow.id)
+                .outerjoin(ElectionCancellationConfirmationRow, ElectionCancellationConfirmationRow.election_id == ElectionRow.id)
+                .where(ElectionRow.guild_id == guild_id, or_(
+                    ElectionCertificationRow.election_id.is_not(None),
+                    ElectionCancellationConfirmationRow.election_id.is_not(None),
+                ))
+                .order_by(func.coalesce(
+                    ElectionCertificationRow.certified_at, ElectionCancellationConfirmationRow.occurred_at,
+                ).desc(), ElectionRow.id.desc()).limit(limit)
             )
         ).all()
         return tuple([await self._election_with_evidence(row) for row in rows])
@@ -326,7 +386,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
         rows = await self._session.scalars(
             select(ElectionRow)
             .outerjoin(ElectionCertificationRow, ElectionCertificationRow.election_id == ElectionRow.id)
-            .where(ElectionRow.guild_id == guild_id, ElectionCertificationRow.election_id.is_(None))
+            .where(ElectionRow.guild_id == guild_id, ElectionCertificationRow.election_id.is_(None), ~ElectionRow.cancelled)
             .order_by(ElectionRow.opens_at.desc(), ElectionRow.id.desc()).limit(10)
         )
         return tuple(_election(row, None, None) for row in rows)

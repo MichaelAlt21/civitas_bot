@@ -14,6 +14,7 @@ from civitas.domain.government import (
     CandidateTally,
     CrisisResolution,
     Election,
+    ElectionCancellation,
     ElectionProtocol,
     ElectionStatus,
     OfficeKind,
@@ -82,14 +83,24 @@ async def test_localized_government_commands_are_guild_only(commands):
     assert payload["description_localizations"] == {"ru": "Выборы и подтверждённые итоги"}
     commission = next(option for option in payload["options"] if option["name"] == "commission")
     by_name = {item["name"]: item for item in commission["options"]}
-    assert by_name.keys() == {"active", "open", "record", "inspect", "certify", "resolve_crisis", "confirm_crisis"}
-    for command in ("resolve_crisis", "confirm_crisis"):
+    assert by_name.keys() == {
+        "active", "voters", "open", "record", "inspect", "certify", "resolve_crisis", "confirm_crisis", "cancel", "confirm_cancel",
+    }
+    for command in ("resolve_crisis", "confirm_crisis", "cancel", "confirm_cancel"):
         assert {item["name"] for item in by_name[command]["options"] if item["required"]} == {"election_id", "reason"}
         assert "ru" in by_name[command]["description_localizations"]
+    cancel_reason = next(item for item in by_name["cancel"]["options"] if item["name"] == "reason")
+    assert cancel_reason["description"] == "Reason shown to the public after confirmation"
     opening = next(option for option in commission["options"] if option["name"] == "open")
     retry = next(option for option in opening["options"] if option["name"] == "retry_of_id")
     assert retry["description_localizations"] == {"ru": "Номер несостоявшихся выборов для повторного голосования"}
     assert not retry["required"]
+    replacement = next(option for option in opening["options"] if option["name"] == "replacement_of_id")
+    assert not replacement["required"]
+    assert by_name["voters"]["description_localizations"] == {"ru": "Приватно посмотреть зафиксированный список избирателей"}
+    voter_options = {option["name"]: option for option in by_name["voters"]["options"]}
+    assert voter_options["election_id"]["required"] and not voter_options["page"]["required"]
+    assert voter_options["page"]["min_value"] == 1
 
 
 @pytest.mark.asyncio
@@ -106,6 +117,41 @@ async def test_active_elections_list_status_and_deadline_privately(commands):
     content = reply(command, private=True)
     assert f"#{OPEN.id}" in content and discord.utils.format_dt(END, style="f") in content
     assert SOURCE not in content and OPEN.reason not in content
+
+
+@pytest.mark.asyncio
+async def test_voter_snapshot_paginates_copyable_ids_privately(commands):
+    service, _, _, _, commission = commands
+    voters = tuple(range(200000000000000001, 200000000000000026))
+    service.list_voter_snapshot.return_value = voters
+    first = interaction()
+    second = interaction(locale=discord.Locale.american_english)
+    outside = interaction()
+    voters_command = commission.get_command("voters")
+
+    await voters_command.callback(first, OPEN.id)
+    await voters_command.callback(second, OPEN.id, 2)
+    await voters_command.callback(outside, OPEN.id, 3)
+
+    assert service.list_voter_snapshot.await_count == 3
+    service.list_voter_snapshot.assert_awaited_with(GUILD, COMMISSIONER, OPEN.id)
+    first_page, second_page = reply(first, private=True), reply(second, private=True)
+    assert "Допущено · 25 | Страница 1 из 2" in first_page
+    assert "Eligible voters · 25 | Page 2 of 2" in second_page
+    assert first_page.split("```\n", 1)[1].splitlines() == [*(str(user_id) for user_id in voters[:20]), "```"]
+    assert second_page.split("```\n", 1)[1].splitlines() == [*(str(user_id) for user_id in voters[20:]), "```"]
+    assert reply(outside, private=True) == "На странице 3 нет ID избирателей."
+
+
+@pytest.mark.asyncio
+async def test_voter_snapshot_displays_commission_denial_without_exposing_ids(commands):
+    service, _, _, _, commission = commands
+    service.list_voter_snapshot.side_effect = GovernmentError(GovernmentErrorReason.COMMISSIONER_REQUIRED)
+    command = interaction()
+
+    await commission.get_command("voters").callback(command, OPEN.id)
+
+    assert reply(command, private=True) == "Для этого действия нужны полномочия избирательной комиссии."
 
 
 @pytest.mark.asyncio
@@ -246,6 +292,76 @@ async def test_crisis_inspection_access_denial_stays_private(commands):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command, method, confirmed, expected", [
+    ("cancel", "propose_election_cancellation", False, "awaiting confirmation by another commissioner"),
+    ("confirm_cancel", "confirm_election_cancellation", True, "was cancelled"),
+])
+async def test_cancellation_commands_forward_reasons_and_reply_privately(commands, command, method, confirmed, expected):
+    service, _, _, _, commission = commands
+    action = getattr(service, method)
+    cancellation = ElectionCancellation(
+        election_id=OPEN.id, proposed_by_citizen_id=7, proposed_at=END, public_reason="Missing poll",
+    )
+    if confirmed:
+        cancellation = replace(cancellation, confirmed_by_citizen_id=8, confirmed_at=END, confirmation_reason="Check")
+    action.return_value = cancellation
+    request = interaction(locale=discord.Locale.american_english)
+
+    await commission.get_command(command).callback(request, OPEN.id, "Audit reason")
+
+    action.assert_awaited_once_with(GUILD, COMMISSIONER, OPEN.id, reason="Audit reason")
+    content = reply(request, private=True)
+    assert expected in content and "Audit reason" not in content
+
+
+@pytest.mark.asyncio
+async def test_cancelled_public_result_shows_safe_reason_and_hides_unverifiable_protocol(commands):
+    service, _, _, election, commission = commands
+    cancellation = ElectionCancellation(
+        election_id=OPEN.id, proposed_by_citizen_id=7, proposed_at=END,
+        public_reason="**Poll inaccessible** @everyone <#1300>",
+    )
+    pending = replace(OPEN, status=ElectionStatus.PENDING_CERTIFICATION, protocol=PROTOCOL, cancellation=cancellation)
+    confirmed = replace(cancellation, confirmed_by_citizen_id=8, confirmed_at=END, confirmation_reason="Private check")
+    cancelled = replace(pending, cancellation=confirmed)
+    service.get_election.return_value = pending
+    service.get_public_result.return_value = cancelled
+    service.list_results.return_value = (cancelled,)
+    inspection, detail, history = [interaction() for _ in range(3)]
+
+    await commission.get_command("inspect").callback(inspection, OPEN.id)
+    await election.get_command("results").callback(detail, OPEN.id)
+    await election.get_command("results").callback(history)
+
+    private = reply(inspection, private=True)
+    assert "ожидает подтверждения другим членом комиссии" in private
+    assert "Poll inaccessible" in private
+    public = reply(detail, private=False)
+    assert "Отмена подтверждена" in public
+    assert r"\*\*Poll inaccessible\*\*" in public
+    assert "@everyone" not in public and "<#1300>" not in public
+    assert SOURCE not in public and "Число голосов по кандидатам" not in public
+    assert confirmed.confirmation_reason not in public
+    assert "отменены" in reply(history, private=False)
+
+
+@pytest.mark.asyncio
+async def test_commission_opens_replacement_with_link_to_cancelled_election(commands):
+    service, _, _, _, commission = commands
+    replacement = replace(OPEN, id=4, replacement_of_id=OPEN.id)
+    service.open_election.return_value = replacement
+    request = interaction()
+
+    await commission.get_command("open").callback(request, "PRESIDENT", str(CANDIDATE), "Replacement", None, OPEN.id)
+
+    service.open_election.assert_awaited_once_with(
+        GUILD, COMMISSIONER, office=OfficeKind.PRESIDENT, candidate_user_ids=(CANDIDATE,),
+        reason="Replacement", idempotency_key=str(request.id), retry_of_id=None, replacement_of_id=OPEN.id,
+    )
+    assert f"Взамен отменённых выборов № {OPEN.id}" in reply(request, private=True)
+
+
+@pytest.mark.asyncio
 async def test_commission_forwards_failed_election_id_without_publishing_unconfirmed_crisis(commands):
     service, _, _, _, commission = commands
     retry = replace(OPEN, id=4, retry_of_id=OPEN.id)
@@ -258,7 +374,7 @@ async def test_commission_forwards_failed_election_id_without_publishing_unconfi
 
     service.open_election.assert_awaited_once_with(
         GUILD, COMMISSIONER, office=OfficeKind.PRESIDENT, candidate_user_ids=(CANDIDATE,),
-        reason="Repeat", idempotency_key=str(opening.id), retry_of_id=OPEN.id,
+        reason="Repeat", idempotency_key=str(opening.id), retry_of_id=OPEN.id, replacement_of_id=None,
     )
     assert f"Повторное голосование по выборам № {OPEN.id}" in reply(opening, private=True)
     content = reply(recording, private=True)
@@ -296,7 +412,7 @@ async def test_commission_commands_forward_aggregate_only_and_reply_privately(co
 
     service.open_election.assert_awaited_once_with(
         GUILD, COMMISSIONER, office=OfficeKind.PRESIDENT, candidate_user_ids=(CANDIDATE, OTHER_CANDIDATE),
-        reason="Open", idempotency_key=str(opening.id), retry_of_id=None,
+        reason="Open", idempotency_key=str(opening.id), retry_of_id=None, replacement_of_id=None,
     )
     service.record_protocol.assert_awaited_once_with(
         GUILD, COMMISSIONER, OPEN.id, source_url=SOURCE, participants=2,

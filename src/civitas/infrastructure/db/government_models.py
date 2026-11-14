@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint,
+    BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint,
     Identity, Index, Integer, Numeric, String, Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
@@ -9,7 +9,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .models import Base
 
-_ACTIVE_ELECTION = "status IN ('OPEN', 'EXTENDED', 'PENDING_CERTIFICATION')"
+_ACTIVE_ELECTION = "status IN ('OPEN', 'EXTENDED', 'PENDING_CERTIFICATION') AND NOT cancelled"
 
 
 class ElectionRow(Base):
@@ -17,7 +17,7 @@ class ElectionRow(Base):
     __table_args__ = (
         UniqueConstraint("guild_id", "id", name="uq_elections_guild_id"),
         UniqueConstraint("guild_id", "request_key", name="uq_elections_request"),
-        UniqueConstraint("runoff_of_id", name="uq_elections_runoff"),
+        UniqueConstraint("replacement_of_id", name="uq_elections_replacement"),
         ForeignKeyConstraint(
             ["guild_id", "opened_by_citizen_id"], ["citizens.guild_id", "citizens.id"],
             name="fk_elections_opener",
@@ -29,6 +29,10 @@ class ElectionRow(Base):
         ForeignKeyConstraint(
             ["guild_id", "retry_of_id"], ["elections.guild_id", "elections.id"],
             name="fk_elections_retry",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "replacement_of_id"], ["elections.guild_id", "elections.id"],
+            name="fk_elections_replacement",
         ),
         CheckConstraint(
             "retry_of_id IS NULL OR runoff_of_id IS NULL OR retry_of_id = runoff_of_id",
@@ -69,9 +73,14 @@ class ElectionRow(Base):
     extended_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     runoff_of_id: Mapped[int | None] = mapped_column(BigInteger)
     retry_of_id: Mapped[int | None] = mapped_column(BigInteger)
+    replacement_of_id: Mapped[int | None] = mapped_column(BigInteger)
+    cancelled: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
 
 
-Index("uq_elections_retry", func.coalesce(ElectionRow.retry_of_id, ElectionRow.runoff_of_id), unique=True)
+Index(
+    "uq_elections_retry", func.coalesce(ElectionRow.retry_of_id, ElectionRow.runoff_of_id), unique=True,
+    postgresql_where=ElectionRow.replacement_of_id.is_(None),
+)
 
 
 class ElectionProtocolRow(Base):
@@ -172,6 +181,49 @@ class ElectionCrisisConfirmationRow(Base):
             name="fk_crisis_confirmations_actor",
         ),
         CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_crisis_confirmations_reason"),
+    )
+
+    election_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    actor_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+
+
+class ElectionCancellationProposalRow(Base):
+    __tablename__ = "election_cancellation_proposals"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "election_id", name="uq_cancel_proposals_guild_election"),
+        ForeignKeyConstraint(
+            ["guild_id", "election_id"], ["elections.guild_id", "elections.id"],
+            name="fk_cancel_proposals_election",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "actor_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_cancel_proposals_actor",
+        ),
+        CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_cancel_proposals_reason"),
+    )
+
+    election_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    actor_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reason: Mapped[str] = mapped_column(Text)
+
+
+class ElectionCancellationConfirmationRow(Base):
+    __tablename__ = "election_cancellation_confirmations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "election_id"], ["election_cancellation_proposals.guild_id", "election_cancellation_proposals.election_id"],
+            name="fk_cancel_confirmations_proposal",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "actor_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_cancel_confirmations_actor",
+        ),
+        CheckConstraint("length(btrim(reason)) BETWEEN 1 AND 200", name="ck_cancel_confirmations_reason"),
     )
 
     election_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)

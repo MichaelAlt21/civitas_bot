@@ -70,7 +70,10 @@ async def set_member_role(
 
     has_role = member.get_role(role.id) is not None
     if present and not has_role:
-        await member.add_roles(role, reason=reason)
+        # A gateway event may have changed permissions while fetching this member.
+        current_role = safe_assignable_role(guild, role.id)
+        if current_role is not None:
+            await member.add_roles(current_role, reason=reason)
     elif not present and has_role:
         await member.remove_roles(role, reason=reason)
 

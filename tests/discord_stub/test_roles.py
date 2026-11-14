@@ -74,6 +74,55 @@ async def test_gateway_skips_departed_discord_member(discord_server):
 
 
 @pytest.mark.asyncio
+async def test_gateway_rechecks_role_permissions_after_fetching_member(discord_server):
+    _, guild, role = discord_server
+    member = _member_with_role(None)
+
+    async def fetch_member(user_id):
+        assert user_id == USER_ID
+        role.permissions.manage_messages = True
+        return member
+
+    guild.fetch_member.side_effect = fetch_member
+    selected_role = roles.safe_assignable_role(guild, ROLE_ID)
+    assert selected_role is role
+    gateway = roles.DiscordCitizenRoleGateway(guild, selected_role)
+
+    await gateway.set_citizen_role(USER_ID, present=True)
+
+    member.add_roles.assert_not_awaited()
+    member.remove_roles.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("present", [True, False])
+async def test_gateway_handles_role_replacement_during_member_fetch(discord_server, present):
+    _, guild, original_role = discord_server
+    member = _member_with_role(None if present else original_role)
+
+    async def fetch_member(user_id):
+        assert user_id == USER_ID
+        guild.get_role.return_value = SimpleNamespace(
+            id=ROLE_ID, permissions=discord.Permissions(manage_messages=True),
+            is_assignable=Mock(return_value=True),
+        )
+        return member
+
+    guild.fetch_member.side_effect = fetch_member
+    gateway = roles.DiscordCitizenRoleGateway(guild, original_role)
+
+    await gateway.set_citizen_role(USER_ID, present=present)
+
+    member.add_roles.assert_not_awaited()
+    if present:
+        guild.get_role.assert_called_once_with(ROLE_ID)
+        member.remove_roles.assert_not_awaited()
+    else:
+        guild.get_role.assert_not_called()
+        member.remove_roles.assert_awaited_once_with(original_role, reason="Civitas citizenship sync")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permission", [
     "administrator", "manage_guild", "manage_roles", "manage_channels", "kick_members", "ban_members",
     "manage_messages", "manage_webhooks", "moderate_members", "move_members", "view_audit_log", "manage_events",

@@ -30,9 +30,11 @@ async def test_election_upgrade_preserves_legacy_evidence_and_reserves_earliest_
 ) -> None:
     async with pg_engine.begin() as connection:
         await connection.run_sync(_migrate, upgrade=False)
-        # The current ORM maps this nullable field. Leave the column without
-        # its later constraints while producing genuine 0009 election rows.
-        await connection.execute(text("ALTER TABLE elections ADD COLUMN retry_of_id bigint"))
+        # Let the current ORM produce legacy rows without the later guards.
+        await connection.execute(text("""
+            ALTER TABLE elections ADD COLUMN retry_of_id bigint, ADD COLUMN replacement_of_id bigint,
+                ADD COLUMN cancelled boolean NOT NULL DEFAULT false
+        """))
 
     guild, recorder, reviewer, candidate = 101, 201, 202, 203
     unit_of_work = PostgresGovernmentUnitOfWork(pg_engine)
@@ -65,20 +67,30 @@ async def test_election_upgrade_preserves_legacy_evidence_and_reserves_earliest_
         # Revision 0009 permitted reuse and stored the original URL on each protocol.
         return True
 
+    async def no_legacy_cancellation(self, guild_id, election_id):
+        return None
+
     now = parliament.closes_at
     with monkeypatch.context() as legacy:
         legacy.setattr(PostgresGovernmentRepository, "bind_poll_source", accept_legacy_source)
+        legacy.setattr(PostgresGovernmentRepository, "get_election_cancellation", no_legacy_cancellation)
         await service.record_protocol(guild, recorder, parliament.id, source_url=original, **protocol)
         await service.certify_election(guild, reviewer, parliament.id, reason="Verify parliamentary result")
         now += timedelta(hours=1)
         await service.record_protocol(guild, recorder, president.id, source_url=canonical, **protocol)
         await service.certify_election(guild, reviewer, president.id, reason="Verify presidential result")
 
-    legacy_results = await service.list_results(guild, candidate)
+    async with unit_of_work() as repository:
+        legacy_results = (
+            await repository.get_election(president.guild_id, president.id),
+            await repository.get_election(parliament.guild_id, parliament.id),
+        )
     legacy_offices = await service.list_offices(guild, candidate)
     assert len(legacy_results) == len(legacy_offices) == 2
     async with pg_engine.begin() as connection:
-        await connection.execute(text("ALTER TABLE elections DROP COLUMN retry_of_id"))
+        await connection.execute(text("""
+            ALTER TABLE elections DROP COLUMN retry_of_id, DROP COLUMN replacement_of_id, DROP COLUMN cancelled
+        """))
         await connection.run_sync(_migrate, upgrade=True)
 
     assert await service.list_results(guild, candidate) == legacy_results

@@ -8,7 +8,8 @@ from civitas.app.assets import AssetService
 from civitas.app.citizens import CitizensService
 from civitas.app.government import ElectionRules, GovernmentService
 from civitas.app.jobs import JobService, JobsRules
-from civitas.app.market import MarketRules, MarketService
+from civitas.app.market import MarketError, MarketErrorReason, MarketRules, MarketService
+from civitas.app.profile import ProfileService
 from civitas.app.reports import ReportService
 from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding, WalletService
@@ -67,17 +68,6 @@ async def test_season_connects_elected_authority_company_income_ownership_and_pu
         elections.append((election, candidate))
 
     clock = now
-    for election, candidate in elections:
-        await government.record_protocol(
-            guild, recorder, election.id, source_url=f"https://poll.example.test/{election.id}",
-            participants=3, tallies={candidate: 3}, reason="Record aggregated results",
-        )
-        certified = await government.certify_election(guild, verifier, election.id, reason="Verify protocol")
-        assert certified.status is ElectionStatus.APPLIED
-    assert {term.office: term.holder_discord_user_id for term in await government.list_offices(guild, buyer)} == {
-        OfficeKind.PRESIDENT: buyer, OfficeKind.PARLIAMENT: deputy,
-    }
-
     jobs = JobService(
         uow, **access, staff_user_ids={verifier}, clock=current_time,
         rules=JobsRules(
@@ -123,13 +113,28 @@ async def test_season_connects_elected_authority_company_income_ownership_and_pu
         )
 
     treasury = elected_treasury(uow)
+    proposal = dict(
+        recipient_company_id=company.id, title="Town hall plans", terms="File the blueprints",
+        amount=60, deadline=deadline, reason="Public works", idempotency_key="season-contract",
+    )
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.INITIATOR_REQUIRED):
+        await treasury.propose_contract(guild, buyer, **proposal)
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.APPROVER_REQUIRED):
+        await treasury.activate_budget(guild, deputy, reason="No mandate yet")
+    for election, candidate in elections:
+        await government.record_protocol(
+            guild, recorder, election.id, source_url=f"https://poll.example.test/{election.id}",
+            participants=3, tallies={candidate: 3}, reason="Record aggregated results",
+        )
+        certified = await government.certify_election(guild, verifier, election.id, reason="Verify protocol")
+        assert certified.status is ElectionStatus.APPLIED
+    assert {term.office: term.holder_discord_user_id for term in await government.list_offices(guild, buyer)} == {
+        OfficeKind.PRESIDENT: buyer, OfficeKind.PARLIAMENT: deputy,
+    }
     with pytest.raises(TreasuryError, match=TreasuryErrorReason.APPROVER_REQUIRED):
         await treasury.activate_budget(guild, seller, reason="Applicant cannot approve the budget")
     await treasury.activate_budget(guild, deputy, reason="Approve public works")
-    contract = await treasury.propose_contract(
-        guild, buyer, recipient_company_id=company.id, title="Town hall plans", terms="File the blueprints",
-        amount=60, deadline=deadline, reason="Public works", idempotency_key="season-contract",
-    )
+    contract = await treasury.propose_contract(guild, buyer, **proposal)
     await treasury.reserve_contract(guild, deputy, contract.id, reason="Budget verified")
     await treasury.submit_contract(guild, seller, contract.id, evidence="Blueprints filed")
     paid = await treasury.pay_contract(guild, deputy, contract.id, reason="Accept blueprints")
@@ -162,9 +167,47 @@ async def test_season_connects_elected_authority_company_income_ownership_and_pu
 
     (owned,) = await assets.list_owned_assets(guild, seller, company_id=company.id)
     assert (owned.id, owned.owner_company_id) == (office.id, company.id)
+    profiles = ProfileService(uow, authorize=citizens.authorize)
+    president_profile = await profiles.get_profile(guild, buyer)
+    company_owner_profile = await profiles.get_profile(guild, seller)
+    assert president_profile is not None and company_owner_profile is not None
+    assert president_profile.offices == (OfficeKind.PRESIDENT,)
+    assert president_profile.companies == ()
+    assert president_profile.assets == ()
+    assert company_owner_profile.offices == ()
+    assert company_owner_profile.companies == (company.name,)
+    assert company_owner_profile.assets == (office.name,)
     assert await market.company_balance(guild, seller, company.id) == 20
+    with pytest.raises(MarketError, match=MarketErrorReason.COMPANY_NOT_OWNED):
+        await market.company_balance(guild, deputy, company.id)
     assert await wallet.balance(guild, buyer) == 80
     assert await wallet.balance(guild, seller) == 100
+
+    # Start a later season with new settings on the existing guild database.
+    clock = cutoff + timedelta(days=28)
+    new_uow = PostgresReceiptUnitOfWork(pg_engine)
+    new_funding = WalletFunding(starter_grant=300, treasury_genesis=9000)
+    new_citizens = CitizensService(
+        new_uow, guild_id=guild, allowed_user_ids=participants, fund_verified=new_funding.fund_registered_citizen,
+    )
+    new_access = {"guild_id": guild, "authorize": new_citizens.authorize}
+    new_wallet = WalletService(new_uow, **new_access, funding=new_funding)
+    new_market = MarketService(
+        new_uow, **new_access, arbiter_user_ids=(), clock=current_time, funding=new_funding,
+        rules=MarketRules(registration_fee=150, sales_tax_bp=1500, company_limit=1),
+    )
+    new_assets = AssetService(
+        new_uow, **new_access, staff_user_ids={deputy}, funding=new_funding, clock=current_time,
+    )
+    await new_wallet.initialize_guild()
+    await new_citizens.register(guild, buyer)
+    assert await new_wallet.balance(guild, buyer) == 80
+    assert await new_wallet.balance(guild, seller) == 100
+    assert await new_market.company_balance(guild, seller, company.id) == 20
+    assert await new_assets.list_owned_assets(guild, seller, company_id=company.id) == (owned,)
+    assert (await ReportService(
+        new_uow, guild_id=guild, timezone=budget_timezone, clock=current_time,
+    ).get_report(guild)).closing_balance == 8300
 
     account, posting, entry = FinancialAccountRow, FinancialTransactionRow, LedgerEntryRow
     async with pg_engine.connect() as connection:

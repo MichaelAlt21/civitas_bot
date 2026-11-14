@@ -152,12 +152,12 @@ class PostgresMarketRepository(PostgresJobsRepository):
         )
         return _to_offer(row) if row is not None else None
 
-    async def list_offers(self, guild_id: int, limit: int) -> tuple[Offer, ...]:
+    async def list_offers(self, guild_id: int, limit: int, *, offset: int = 0) -> tuple[Offer, ...]:
         rows = await self._session.scalars(
             select(OfferRow).where(
                 OfferRow.guild_id == guild_id,
                 ~select(OfferWithdrawalRow.offer_id).where(OfferWithdrawalRow.offer_id == OfferRow.id).exists(),
-            ).order_by(OfferRow.id.desc()).limit(limit)
+            ).order_by(OfferRow.id.desc()).limit(limit).offset(offset)
         )
         return tuple(_to_offer(row) for row in rows)
 
@@ -198,19 +198,32 @@ class PostgresMarketRepository(PostgresJobsRepository):
         return _to_order(row) if row is not None else None
 
     async def list_orders(
-        self, guild_id: int, citizen_id: int, *, include_disputes: bool, limit: int
+        self,
+        guild_id: int,
+        citizen_id: int,
+        *,
+        include_disputes: bool,
+        limit: int,
+        offset: int = 0,
+        disputes_only: bool = False,
     ) -> tuple[MarketOrder, ...]:
-        criteria = [
+        party = or_(
             OrderRow.buyer_citizen_id == citizen_id,
             OrderRow.seller_citizen_id == citizen_id,
-        ]
-        if include_disputes:
-            criteria.append(OrderRow.status == OrderStatus.DISPUTED.value)
+        )
+        disputed = OrderRow.status == OrderStatus.DISPUTED.value
+        if disputes_only:
+            if not include_disputes:
+                return ()
+            visibility = disputed & ~party
+        else:
+            visibility = or_(party, disputed) if include_disputes else party
         rows = await self._session.scalars(
             select(OrderRow)
-            .where(OrderRow.guild_id == guild_id, or_(*criteria))
+            .where(OrderRow.guild_id == guild_id, visibility)
             .order_by(OrderRow.id.desc())
             .limit(limit)
+            .offset(offset)
         )
         return tuple(_to_order(row) for row in rows)
 

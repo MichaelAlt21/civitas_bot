@@ -20,6 +20,69 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+async def _report_interaction_error(interaction: discord.Interaction, error: Exception) -> None:
+    if isinstance(error, LedgerError) and error.reason == LedgerErrorReason.ECONOMY_READ_ONLY:
+        reply = message(interaction.locale, "wallet.error.economy_read_only")
+    else:
+        logger.error("Ошибка выполнения команды Civitas (%s)", type(error).__name__)
+        reply = message(interaction.locale, "error.temporary")
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(reply, ephemeral=True)
+        else:
+            await interaction.response.send_message(reply, ephemeral=True)
+    except discord.HTTPException as response_error:
+        logger.warning("Discord не принял ответ Civitas (HTTP %s)", response_error.status)
+
+
+async def _register_citizen(service: CitizensService, interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    locale = interaction.locale
+    try:
+        result = await service.register(interaction.guild_id, interaction.user.id)
+    except CitizenshipAccessError as error:
+        reply = message(locale, f"access.{error.reason.value}")
+    except LedgerError as error:
+        if error.reason != LedgerErrorReason.ECONOMY_READ_ONLY:
+            raise
+        reply = message(locale, "wallet.error.economy_read_only")
+    else:
+        reply = message(
+            locale,
+            "registration.result",
+            outcome=message(locale, f"registration.{result.outcome.value}"),
+            status=message(locale, f"status.{result.citizen.status.value.lower()}"),
+        )
+    await interaction.followup.send(reply, ephemeral=True)
+
+
+class _RegistrationView(discord.ui.View):
+    def __init__(self, service: CitizensService, opening: discord.Interaction) -> None:
+        super().__init__(timeout=120)
+        self._service = service
+        self._opening = opening
+        self.register_button.label = message(opening.locale, "start.register_button")
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id == self._opening.guild_id and interaction.user.id == self._opening.user.id:
+            return True
+        await interaction.response.send_message(message(interaction.locale, "start.registration_owner_only"), ephemeral=True)
+        return False
+
+    @discord.ui.button(style=discord.ButtonStyle.primary)
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await _register_citizen(self._service, interaction)
+
+    async def on_timeout(self) -> None:
+        try:
+            await self._opening.edit_original_response(view=None)
+        except discord.HTTPException as error:
+            logger.warning("Не удалось скрыть кнопку регистрации (HTTP %s)", error.status)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+        await _report_interaction_error(interaction, error)
+
+
 class CivitasBot(discord.Client):
     def __init__(
         self,
@@ -80,30 +143,13 @@ class CivitasBot(discord.Client):
                 return
             await interaction.response.send_message(
                 message(interaction.locale, "start.welcome"),
+                view=_RegistrationView(service, interaction),
                 ephemeral=True,
             )
 
         @citizen.command(name="register", description=command_description("register"))
         async def register(interaction: discord.Interaction) -> None:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                result = await service.register(interaction.guild_id, interaction.user.id)
-            except CitizenshipAccessError as error:
-                await interaction.followup.send(
-                    message(interaction.locale, f"access.{error.reason.value}"), ephemeral=True
-                )
-                return
-
-            locale = interaction.locale
-            await interaction.followup.send(
-                message(
-                    locale,
-                    "registration.result",
-                    outcome=message(locale, f"registration.{result.outcome.value}"),
-                    status=message(locale, f"status.{result.citizen.status.value.lower()}"),
-                ),
-                ephemeral=True,
-            )
+            await _register_citizen(service, interaction)
 
         @self.tree.command(
             name="profile", description=command_description("profile"), guild=self.guild_scope
@@ -157,19 +203,7 @@ class CivitasBot(discord.Client):
         async def report_error(
             interaction: discord.Interaction, error: app_commands.AppCommandError
         ) -> None:
-            original = getattr(error, "original", error)
-            if isinstance(original, LedgerError) and original.reason == LedgerErrorReason.ECONOMY_READ_ONLY:
-                reply = message(interaction.locale, "wallet.error.economy_read_only")
-            else:
-                logger.error("Ошибка выполнения команды Civitas (%s)", type(original).__name__)
-                reply = message(interaction.locale, "error.temporary")
-            try:
-                if interaction.response.is_done():
-                    await interaction.followup.send(reply, ephemeral=True)
-                else:
-                    await interaction.response.send_message(reply, ephemeral=True)
-            except discord.HTTPException as response_error:
-                logger.warning("Discord не принял ответ Civitas (HTTP %s)", response_error.status)
+            await _report_interaction_error(interaction, getattr(error, "original", error))
 
 
 def create_bot(
