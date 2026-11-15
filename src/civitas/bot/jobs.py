@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError
-from civitas.app.jobs import JobError, JobErrorReason, JobService
+from civitas.app.jobs import JOBS_PAGE_SIZE, JobError, JobErrorReason, JobService
 from civitas.domain.jobs import JobCategory, JobClaim, JobClaimStatus, JobTask
 from civitas.domain.ledger import LedgerError, LedgerErrorReason
 
@@ -66,6 +66,21 @@ def _category_choices() -> list[app_commands.Choice[str]]:
     return choices
 
 
+async def _reply_page(
+    interaction: discord.Interaction, *rows: str, section: str, page: int, count: int, command: str,
+) -> None:
+    locale = interaction.locale
+    if not count:
+        key = f"jobs.{section}.empty" if page == 1 else "jobs.page.empty"
+        await _reply(interaction, message(locale, key, page=str(page)))
+        return
+    title = message(locale, f"jobs.{section}.title")
+    lines = [message(locale, "jobs.page.title", title=title, page=str(page)), *rows]
+    if count == JOBS_PAGE_SIZE:
+        lines.append(message(locale, "jobs.page.next", command=command, page=str(page + 1)))
+    await _reply(interaction, *lines)
+
+
 def add_job_commands(
     tree: app_commands.CommandTree,
     *,
@@ -79,23 +94,24 @@ def add_job_commands(
     tree.add_command(jobs, guild=guild_scope)
 
     @jobs.command(name="list", description=command_description("jobs.list"))
-    @app_commands.describe(task_id=command_description("jobs.task_id"))
+    @app_commands.describe(task_id=command_description("jobs.task_id"), page=command_description("jobs.page"))
     async def list_jobs(
-        interaction: discord.Interaction, task_id: app_commands.Range[int, 1] | None = None
+        interaction: discord.Interaction, task_id: app_commands.Range[int, 1] | None = None,
+        page: app_commands.Range[int, 1] | None = None,
     ) -> None:
         locale = interaction.locale
         async with _job_response(interaction):
             if task_id is None:
-                tasks = await job_service.list_tasks(interaction.guild_id, interaction.user.id)
-                if not tasks:
-                    await _reply(interaction, message(locale, "jobs.list.empty"))
-                    return
-                await _reply(
-                    interaction,
-                    message(locale, "jobs.list.title"),
-                    *(_summary(locale, task, currency_symbol) for task in tasks),
+                page_number = 1 if page is None else page
+                tasks = await job_service.list_tasks(interaction.guild_id, interaction.user.id, page=page_number)
+                await _reply_page(
+                    interaction, *(_summary(locale, task, currency_symbol) for task in tasks),
                     message(locale, "jobs.list.details"),
+                    section="list", page=page_number, count=len(tasks), command="/jobs list",
                 )
+                return
+            if page is not None:
+                await _reply(interaction, message(locale, "jobs.page.list_only"))
                 return
 
             detail = await job_service.get_task_details(
@@ -174,21 +190,25 @@ def add_job_commands(
             await _reply(interaction, message(interaction.locale, "jobs.task.published", id=str(task.id)))
 
     @staff.command(name="review", description=command_description("jobs.staff.review"))
-    @app_commands.describe(task_id=command_description("jobs.review_task_id"))
+    @app_commands.describe(task_id=command_description("jobs.review_task_id"), page=command_description("jobs.page"))
     async def review(
-        interaction: discord.Interaction, task_id: app_commands.Range[int, 1] | None = None
+        interaction: discord.Interaction, task_id: app_commands.Range[int, 1] | None = None,
+        page: app_commands.Range[int, 1] | None = None,
     ) -> None:
         locale = interaction.locale
         async with _job_response(interaction):
             if task_id is None:
-                task_ids = await job_service.list_submitted_task_ids(interaction.guild_id, interaction.user.id)
-                if task_ids:
-                    reply = message(
-                        locale, "jobs.queue.tasks", ids=", ".join(str(task_id) for task_id in task_ids)
-                    )
-                else:
-                    reply = message(locale, "jobs.queue.empty")
-                await _reply(interaction, reply)
+                page_number = 1 if page is None else page
+                task_ids = await job_service.list_submitted_task_ids(
+                    interaction.guild_id, interaction.user.id, page=page_number,
+                )
+                await _reply_page(
+                    interaction, message(locale, "jobs.queue.tasks", ids=", ".join(map(str, task_ids))),
+                    section="queue", page=page_number, count=len(task_ids), command="/jobs staff review",
+                )
+                return
+            if page is not None:
+                await _reply(interaction, message(locale, "jobs.page.list_only"))
                 return
 
             detail = await job_service.get_review(interaction.guild_id, interaction.user.id, task_id)

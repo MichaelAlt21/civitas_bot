@@ -7,7 +7,7 @@ import discord
 import pytest
 from discord import app_commands
 
-from civitas.app.jobs import JobError, JobErrorReason, JobService
+from civitas.app.jobs import JOBS_PAGE_SIZE, JobError, JobErrorReason, JobService
 from civitas.app.wallet import WalletService
 from civitas.bot.jobs import add_job_commands
 from civitas.bot.localization import CommandTranslator
@@ -81,6 +81,10 @@ async def test_jobs_metadata_is_guild_only_and_localized(job_commands):
     categories = {choice["value"]: choice for choice in publish_parameters["category"]["choices"]}
     assert categories["logistics"]["name_localizations"] == {"ru": "Логистика"}
     assert publish_parameters["requirements"]["max_length"] == 500
+    for entry in (commands["list"], staff["review"]):
+        page = next(option for option in entry["options"] if option["name"] == "page")
+        assert page["min_value"] == 1 and not page["required"]
+        assert page["description_localizations"] == {"ru": "Номер страницы (начиная с 1)"}
 
 
 @pytest.mark.asyncio
@@ -97,7 +101,7 @@ async def test_lists_jobs_and_own_status_without_echoing_proof(job_commands):
     await jobs.get_command("list").callback(list_command)
     await jobs.get_command("list").callback(detail_command, TASK_ID)
 
-    service.list_tasks.assert_awaited_once_with(GUILD_ID, WORKER_ID)
+    service.list_tasks.assert_awaited_once_with(GUILD_ID, WORKER_ID, page=1)
     service.get_task_details.assert_awaited_once_with(GUILD_ID, WORKER_ID, TASK_ID)
     assert "Move supplies · Logistics · 30 CP" in private_replies(list_command)[0]
     reply = private_replies(detail_command)[0]
@@ -158,7 +162,7 @@ async def test_staff_reviews_queue_and_full_proof_privately(job_commands):
     await staff.get_command("review").callback(queue)
     await staff.get_command("review").callback(review, TASK_ID)
 
-    service.list_submitted_task_ids.assert_awaited_once_with(GUILD_ID, STAFF_ID)
+    service.list_submitted_task_ids.assert_awaited_once_with(GUILD_ID, STAFF_ID, page=1)
     service.get_review.assert_awaited_once_with(GUILD_ID, STAFF_ID, TASK_ID)
     queue_reply = private_replies(queue)[0]
     assert "Задания на проверке: 42" in queue_reply
@@ -178,6 +182,33 @@ async def test_staff_review_error_returns_no_proof(job_commands):
 
     service.get_review.assert_awaited_once_with(GUILD_ID, WORKER_ID, TASK_ID)
     assert private_replies(command) == ["Для этого действия нужны полномочия сотрудника NPC."]
+
+
+@pytest.mark.asyncio
+async def test_job_pages_are_private_localized_and_keep_detail_lookup_separate(job_commands):
+    service, _, jobs, staff = job_commands
+    service.list_tasks.side_effect = [tuple(replace(TASK, id=n) for n in range(11, 11 + JOBS_PAGE_SIZE)), ()]
+    service.list_submitted_task_ids.return_value = (21,)
+    listing = interaction()
+    missing_page = interaction(locale=discord.Locale.american_english)
+    review = interaction(actor=STAFF_ID, locale=discord.Locale.american_english)
+    ambiguous = interaction(actor=STAFF_ID)
+
+    await jobs.get_command("list").callback(listing, page=2)
+    await jobs.get_command("list").callback(missing_page, page=3)
+    await staff.get_command("review").callback(review, page=3)
+    await staff.get_command("review").callback(ambiguous, TASK_ID, 2)
+
+    assert service.list_tasks.await_args_list[0].kwargs == {"page": 2}
+    assert service.list_tasks.await_args_list[1].kwargs == {"page": 3}
+    service.list_submitted_task_ids.assert_awaited_once_with(GUILD_ID, STAFF_ID, page=3)
+    service.get_review.assert_not_awaited()
+    assert "Страница 2" in private_replies(listing)[0]
+    assert "`/jobs list page:3`" in private_replies(listing)[0]
+    assert private_replies(missing_page) == ["There are no jobs on page 3."]
+    assert "Review queue · Page 3" in private_replies(review)[0]
+    assert "Jobs awaiting review: 21." in private_replies(review)[0]
+    assert private_replies(ambiguous) == ["Параметр page доступен для списка заданий без номера."]
 
 
 @pytest.mark.asyncio

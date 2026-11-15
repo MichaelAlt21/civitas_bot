@@ -12,7 +12,8 @@ from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
 
 
 @pytest.mark.asyncio
-async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, monkeypatch):
+@pytest.mark.parametrize("asset_resale_tax_bp", [None, 0], ids=["primary-only", "resale-without-issuer"])
+async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, monkeypatch, asset_resale_tax_bp):
     settings = Settings(
         database_url="unused-by-test",
         discord_token="test-token",
@@ -34,7 +35,8 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
             company_fee=150, company_limit_per_owner=1, sales_tax_basis_points=1000,
             arbiter_ids=frozenset({201}),
         ),
-        asset_issuer_ids=frozenset({201}),
+        asset_issuer_ids=frozenset({201}) if asset_resale_tax_bp is None else frozenset(),
+        asset_resale_tax_bp=asset_resale_tax_bp,
         treasury=TreasurySettings(
             initiator_ids=frozenset({201}), approver_ids=frozenset({202}), budget_weekly_limit=800,
             contract_weekly_limit=250, budget_timezone=UTC,
@@ -61,6 +63,10 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         assert {command.name for command in wallet.commands} == {"balance", "history", "transfer", "receipt", "receipts"}
         admin = bot.tree.get_command("admin", guild=bot.guild_scope)
         assert {command.name for command in admin.commands} == {"audit", "maintenance"}
+        assets = bot.tree.get_command("assets", guild=bot.guild_scope)
+        asset_commands = {command.name for command in assets.commands}
+        resale_commands = {"sell", "resale", "resale_buy", "resale_cancel"}
+        assert asset_commands & resale_commands == (resale_commands if asset_resale_tax_bp is not None else set())
         assert not bot.tree.get_commands()
 
     monkeypatch.setattr(entrypoint, "create_db_engine", lambda _url: pg_engine)

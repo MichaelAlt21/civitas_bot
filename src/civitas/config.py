@@ -84,6 +84,7 @@ class Settings:
     report_timezone: tzinfo = UTC
     government: GovernmentSettings | None = None
     technical_operator_ids: frozenset[int] = frozenset()
+    asset_resale_tax_bp: int | None = None
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
@@ -110,22 +111,42 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     report_channel = env.get(report_channel_key, "").strip()
     report_channel_id = _discord_id(report_channel, report_channel_key) if report_channel else None
     asset_issuer_ids = _discord_ids(env, "CIVITAS_ASSET_ISSUER_IDS")
-    if asset_issuer_ids and wallet is None:
+    resale_tax_key = "CIVITAS_ASSET_RESALE_TAX_BP"
+    resale_tax_value = env.get(resale_tax_key, "").strip()
+    resale_tax_bp = _money(resale_tax_value, resale_tax_key) if resale_tax_value else None
+    if resale_tax_bp is not None and resale_tax_bp >= 10_000:
+        raise ConfigurationError(f"{resale_tax_key} должен быть в пределах 0–9999.")
+    if (asset_issuer_ids or resale_tax_bp is not None) and wallet is None:
         raise ConfigurationError("Для продажи имущества настройте CIVITAS_STARTER_GRANT и CIVITAS_TREASURY_GENESIS.")
     government = _load_government_settings(env)
     treasury = _load_treasury_settings(env, wallet)
-    if treasury is not None and treasury.elected_authority and government is None:
-        raise ConfigurationError("Для CIVITAS_ELECTED_TREASURY сначала настройте выборы.")
     roles = [role for role in (role_id, government.president_role_id if government else None,
                               government.parliament_role_id if government else None) if role is not None]
     if guild_id in roles or len(roles) != len(set(roles)):
         raise ConfigurationError("Укажите отдельные ID для роли гражданина и выборных ролей.")
     allowed_user_ids = _discord_ids(env, "CIVITAS_ALLOWED_USER_IDS")
     market = _load_market_settings(env, wallet)
-    if _enabled(env, "CIVITAS_SEASON_ONE") and (market is None or not market.arbiter_ids & allowed_user_ids):
+    season_one = _enabled(env, "CIVITAS_SEASON_ONE")
+    if season_one and (market is None or market.arbiter_ids.isdisjoint(allowed_user_ids)):
         raise ConfigurationError(
             "Для первого сезона укажите в CIVITAS_MARKET_ARBITER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
         )
+    jobs = _load_jobs_settings(env, wallet)
+    if season_one:
+        if asset_issuer_ids.isdisjoint(allowed_user_ids):
+            raise ConfigurationError(
+                "Для первого сезона укажите в CIVITAS_ASSET_ISSUER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
+            )
+        if jobs is None or jobs.reviewer_ids.isdisjoint(allowed_user_ids):
+            raise ConfigurationError(
+                "Для первого сезона укажите в CIVITAS_NPC_REVIEWER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
+            )
+        if government is None or len(government.commissioner_ids & allowed_user_ids) < 2:
+            raise ConfigurationError(
+                "Для первого сезона укажите в CIVITAS_ELECTION_COMMISSIONER_IDS минимум два ID из CIVITAS_ALLOWED_USER_IDS."
+            )
+    if treasury is not None and treasury.elected_authority and government is None:
+        raise ConfigurationError("Для CIVITAS_ELECTED_TREASURY сначала настройте выборы.")
     return Settings(
         database_url=database_url,
         discord_token=token,
@@ -134,9 +155,10 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         citizen_role_id=role_id,
         track_membership=_enabled(env, "CIVITAS_TRACK_MEMBERSHIP"),
         wallet=wallet,
-        jobs=_load_jobs_settings(env, wallet),
+        jobs=jobs,
         market=market,
         asset_issuer_ids=asset_issuer_ids,
+        asset_resale_tax_bp=resale_tax_bp,
         treasury=treasury,
         treasury_report_channel_id=report_channel_id,
         report_timezone=_budget_timezone(env) if wallet is not None or report_channel_id is not None else UTC,

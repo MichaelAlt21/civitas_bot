@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.citizens import CitizensService
-from civitas.app.market import MarketError, MarketErrorReason, MarketRules, MarketService
+from civitas.app.market import MARKET_PAGE_SIZE, MarketError, MarketErrorReason, MarketRules, MarketService
 from civitas.app.wallet import WalletFunding
 from civitas.domain.ledger import MAX_AMOUNT, AccountKind, TransactionKind
 from civitas.domain.market import Company, MarketOrder, Offer, OrderStatus
@@ -231,44 +231,50 @@ async def test_offer_pages_filter_withdrawals_before_paginating(pg_engine: Async
             GUILD, SELLER, company_id=company.id, title=f"Sketch {index}", terms="Two sketches",
             price=20, delivery_hours=24, idempotency_key=f"offer-page-{index}",
         )
-        for index in range(4)
+        for index in range(MARKET_PAGE_SIZE + 3)
     ]
-    await service.withdraw_offer(GUILD, SELLER, offers[2].id, reason="No capacity")
+    withdrawn = offers.pop(-2)
+    await service.withdraw_offer(GUILD, SELLER, withdrawn.id, reason="No capacity")
+    newest_first = tuple(reversed(offers))
 
+    assert await service.list_offers(GUILD, BUYER) == newest_first[:MARKET_PAGE_SIZE]
+    assert await service.list_offers(GUILD, BUYER, page=2) == newest_first[MARKET_PAGE_SIZE:]
+    assert await service.list_offers(GUILD, BUYER, page=3) == ()
     async with unit_of_work() as repository:
-        assert await repository.list_offers(company.guild_id, 2) == (offers[3], offers[1])
-        assert await repository.list_offers(company.guild_id, 2, offset=2) == (offers[0],)
-        assert await repository.list_offers(company.guild_id, 2, offset=3) == ()
         assert await repository.list_offers(company.guild_id + 1, 2) == ()
 
 
 async def test_dispute_queue_pages_only_open_independent_orders(pg_engine: AsyncEngine) -> None:
     unit_of_work, citizens, service = await _setup(pg_engine)
-    offer = await _offer(service, await _company(service))
+    offer = await _offer(service, await _company(service), price=20)
     own = await _order(service, offer, "own-dispute", buyer=ARBITER)
     own = await service.dispute_order(GUILD, ARBITER, own.id, reason="Work is incomplete")
     older = await _order(service, offer, "older-independent-dispute")
     older = await service.dispute_order(GUILD, BUYER, older.id, reason="Work is incomplete")
     newer = await _order(service, offer, "newer-independent-dispute", buyer=OTHER_ARBITER)
     newer = await service.dispute_order(GUILD, OTHER_ARBITER, newer.id, reason="Work is incomplete")
-    funded = await _order(service, offer, "own-funded", buyer=ARBITER)
     closed = await _order(service, offer, "closed-dispute", buyer=OTHER_ARBITER)
     await service.dispute_order(GUILD, OTHER_ARBITER, closed.id, reason="Work is incomplete")
     await service.resolve_order(GUILD, ARBITER, closed.id, settle=False, reason="Refund approved")
+    funded = [
+        await _order(service, offer, f"own-funded-{index}", buyer=ARBITER)
+        for index in range(MARKET_PAGE_SIZE)
+    ]
 
     buyer = await citizens.get_profile(GUILD, BUYER)
     assert buyer is not None
     guild_id, arbiter_id = own.guild_id, own.buyer_citizen_id
+    assert await service.list_orders(GUILD, ARBITER) == tuple(reversed(funded))
+    assert await service.list_orders(GUILD, ARBITER, page=2) == (newer, older, own)
+    assert await service.list_orders(GUILD, ARBITER, disputes_only=True) == (newer, older)
+    assert await service.list_orders(GUILD, BUYER) == (older,)
+    with pytest.raises(MarketError, match=MarketErrorReason.ARBITER_REQUIRED):
+        await service.list_orders(GUILD, BUYER, disputes_only=True)
     async with unit_of_work() as repository:
-        assert await repository.list_orders(guild_id, arbiter_id, include_disputes=True, limit=3) == (
-            funded, newer, older,
-        )
-        assert await repository.list_orders(guild_id, arbiter_id, include_disputes=True, limit=3, offset=3) == (own,)
         for offset, expected in enumerate(((newer,), (older,), ())):
             assert await repository.list_orders(
                 guild_id, arbiter_id, include_disputes=True, limit=1, offset=offset, disputes_only=True,
             ) == expected
-        assert await repository.list_orders(guild_id, buyer.id, include_disputes=False, limit=10) == (older,)
         assert await repository.list_orders(
             guild_id, buyer.id, include_disputes=False, limit=10, disputes_only=True,
         ) == ()

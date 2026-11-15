@@ -16,7 +16,7 @@ from civitas.domain.jobs import BudgetCaps, BudgetPeriod
 from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH, AccountKind, LedgerError, TransactionKind
 from civitas.domain.treasury import ContractBudget, ContractStatus, StateContract
 
-_LIST_LIMIT = 10
+CONTRACT_PAGE_SIZE = 10
 
 
 class TreasuryErrorReason(StrEnum):
@@ -30,6 +30,7 @@ class TreasuryErrorReason(StrEnum):
     NOT_CONTRACT_PARTY = "not_contract_party"
     CONFLICT_OF_INTEREST = "conflict_of_interest"
     INVALID_AMOUNT = "invalid_amount"
+    INVALID_PAGE = "invalid_page"
     INVALID_TEXT = "invalid_text"
     INVALID_DEADLINE = "invalid_deadline"
     INVALID_REQUEST_KEY = "invalid_request_key"
@@ -72,7 +73,7 @@ class TreasuryRepository(JobsRepository, MarketRepository, Protocol):
     async def get_contract_by_key(self, guild_id: int, key: str) -> StateContract | None: ...
 
     async def list_contracts(
-        self, guild_id: int, citizen_id: int, *, include_all: bool, limit: int
+        self, guild_id: int, citizen_id: int, *, include_all: bool, limit: int, offset: int = 0,
     ) -> tuple[StateContract, ...]: ...
 
     async def create_contract(
@@ -381,12 +382,16 @@ class TreasuryService:
         ) as (_, _, contract, _):
             return contract
 
-    async def list_contracts(self, guild_id: int | None, user_id: int) -> tuple[StateContract, ...]:
+    async def list_contracts(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[StateContract, ...]:
         self._authorize(guild_id, user_id)
+        if type(page) is not int or not 1 <= page <= MAX_AMOUNT // CONTRACT_PAGE_SIZE + 1:
+            raise TreasuryError(TreasuryErrorReason.INVALID_PAGE)
+        offset = (page - 1) * CONTRACT_PAGE_SIZE
         async with self._unit_of_work() as repository:
             actor = await self._citizen(repository, user_id)
             return await repository.list_contracts(
-                actor.guild_id, actor.id, include_all=await self._is_staff(repository, actor), limit=_LIST_LIMIT,
+                actor.guild_id, actor.id, include_all=await self._is_staff(repository, actor),
+                limit=CONTRACT_PAGE_SIZE, offset=offset,
             )
 
     @asynccontextmanager

@@ -208,6 +208,70 @@ async def test_voter_snapshot_keeps_original_discord_ids_and_requires_verified_c
         await service.list_voter_snapshot(GUILD, SECOND_REVIEWER, election.id)
 
 
+async def test_new_elections_and_tied_repeats_require_current_admission_and_verified_citizenship(
+    pg_engine: AsyncEngine,
+) -> None:
+    unit_of_work, previous_service, clock = await _setup(pg_engine)
+    initial = await _open(previous_service, key="before-admission-change")
+    old_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, RUNNER_UP, WINNER)
+    assert await previous_service.list_voter_snapshot(GUILD, REVIEWER, initial.id) == old_voters
+
+    unregistered = 15
+    current_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, WINNER)
+    citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids=(*current_voters, unregistered))
+    current_service = GovernmentService(
+        unit_of_work, guild_id=GUILD, authorize=citizens.authorize,
+        commissioner_user_ids=(RECORDER, REVIEWER, SECOND_REVIEWER), rules=RULES, clock=clock,
+    )
+    async with unit_of_work() as repository:
+        (removed,) = await repository.get_citizens(GUILD, (RUNNER_UP,))
+        assert removed.status is CitizenStatus.VERIFIED
+    assert await citizens.get_profile(GUILD, unregistered) is None
+
+    clock.now = initial.closes_at
+    await _record(current_service, initial, {WINNER: 2, RUNNER_UP: 2})
+    assert (await _certify(current_service, initial)).status is ElectionStatus.TIED
+
+    ordinary = await current_service.open_election(
+        GUILD, RECORDER, office=OfficeKind.PARLIAMENT, candidate_user_ids=(WINNER, ORDINARY),
+        reason="Open a separate parliamentary election", idempotency_key="admission-parliament",
+    )
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, ordinary.id) == current_voters
+
+    retry = dict(
+        office=OfficeKind.PRESIDENT, reason="Repeat tied election",
+        idempotency_key="admission-repeat", retry_of_id=initial.id,
+    )
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_CANDIDATES):
+        await current_service.open_election(GUILD, RECORDER, candidate_user_ids=(WINNER, RUNNER_UP), **retry)
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_RUNOFF):
+        await current_service.open_election(GUILD, RECORDER, candidate_user_ids=(WINNER, ORDINARY), **retry)
+    repeated = await current_service.open_election(GUILD, RECORDER, candidate_user_ids=(WINNER,), **retry)
+
+    assert repeated.retry_of_id == repeated.runoff_of_id == initial.id
+    assert repeated.candidate_discord_user_ids == (WINNER,)
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, repeated.id) == current_voters
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, initial.id) == old_voters
+
+    await current_service.propose_election_cancellation(GUILD, RECORDER, repeated.id, reason="Poll unavailable")
+    await current_service.confirm_election_cancellation(GUILD, REVIEWER, repeated.id, reason="Verified outage")
+    remaining_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY)
+    refreshed_citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids=remaining_voters)
+    refreshed_service = GovernmentService(
+        unit_of_work, guild_id=GUILD, authorize=refreshed_citizens.authorize,
+        commissioner_user_ids=(RECORDER, REVIEWER, SECOND_REVIEWER), rules=RULES, clock=clock,
+    )
+    replacement = await refreshed_service.open_election(
+        GUILD, RECORDER, office=OfficeKind.PRESIDENT, candidate_user_ids=(ORDINARY,),
+        reason="Nominate again after the remaining candidate lost admission",
+        idempotency_key="admission-replacement", replacement_of_id=repeated.id,
+    )
+    assert replacement.retry_of_id == replacement.runoff_of_id == initial.id
+    assert replacement.replacement_of_id == repeated.id and replacement.candidate_discord_user_ids == (ORDINARY,)
+    assert await refreshed_service.list_voter_snapshot(GUILD, REVIEWER, replacement.id) == remaining_voters
+    assert await refreshed_service.list_voter_snapshot(GUILD, REVIEWER, repeated.id) == current_voters
+
+
 async def test_concurrent_independent_attestations_apply_one_term_and_replay(
     pg_engine: AsyncEngine,
 ) -> None:

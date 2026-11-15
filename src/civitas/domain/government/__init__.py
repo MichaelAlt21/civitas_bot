@@ -123,3 +123,34 @@ class OfficeRoleAssignment:
     office: OfficeKind
     discord_user_id: int
     present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Impeachment:
+    id: int
+    guild_id: int
+    term_id: int
+    election_id: int
+    president_citizen_id: int
+    president_discord_user_id: int
+    eligible_citizen_ids: tuple[int, ...]
+    quorum: int
+    opened_by_citizen_id: int
+    opened_at: datetime
+    request_key: str
+    source_url: str | None = None
+    participants: int | None = None
+    votes_for: int | None = None
+    recorded_by_citizen_id: int | None = None
+    recorded_at: datetime | None = None
+    public_reason: str | None = None
+    confirmed_by_citizen_id: int | None = None
+    confirmed_at: datetime | None = None
+    confirmation_reason: str | None = None
+
+    @property
+    def has_support(self) -> bool:
+        return (
+            self.participants is not None and self.votes_for is not None
+            and self.participants >= self.quorum and self.votes_for * 3 >= self.participants * 2
+        )

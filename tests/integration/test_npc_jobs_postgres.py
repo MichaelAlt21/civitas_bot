@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.citizens import CitizensService
-from civitas.app.jobs import JobError, JobErrorReason, JobsRules, JobService, budget_week
+from civitas.app.jobs import JOBS_PAGE_SIZE, JobError, JobErrorReason, JobsRules, JobService, budget_week
 from civitas.app.wallet import WalletFunding
 from civitas.domain.jobs import BudgetCaps, JobCategory, JobClaim, JobClaimStatus
 from civitas.domain.ledger import AccountKind, TransactionKind
@@ -65,6 +65,31 @@ async def _submitted_task(service: JobService, worker: int, reward: int) -> int:
 
 async def _approve(service: JobService, task: int, reviewer: int = REVIEWERS[0]) -> JobClaim:
     return await service.review(GUILD, reviewer, task, approve=True, reason="Work confirmed")
+
+
+async def test_open_and_submitted_npc_jobs_keep_their_order_across_pages(pg_engine: AsyncEngine) -> None:
+    _, _, service, _ = await _setup(pg_engine)
+    published = []
+    for hours in range(JOBS_PAGE_SIZE + 3, 0, -1):
+        published.append(await service.publish(
+            GUILD, REVIEWERS[0], category=JobCategory.SERVICES, title=f"Job {hours}",
+            requirements="Submit your results", reward=10, expires_at=NOW + timedelta(hours=hours),
+        ))
+    by_deadline = tuple(reversed(published))
+    assert await service.list_tasks(GUILD, WORKERS[0]) == by_deadline[:JOBS_PAGE_SIZE]
+    assert await service.list_tasks(GUILD, WORKERS[0], page=2) == by_deadline[JOBS_PAGE_SIZE:]
+    assert await service.list_tasks(GUILD, WORKERS[0], page=3) == ()
+
+    submitted = tuple(task.id for task in reversed(published[:JOBS_PAGE_SIZE + 1]))
+    for task_id in submitted:
+        await service.claim(GUILD, WORKERS[0], task_id)
+        await service.submit(GUILD, WORKERS[0], task_id, "Job completed")
+    assert await service.list_submitted_task_ids(GUILD, REVIEWERS[0]) == submitted[:JOBS_PAGE_SIZE]
+    assert await service.list_submitted_task_ids(GUILD, REVIEWERS[0], page=2) == submitted[JOBS_PAGE_SIZE:]
+    assert await service.list_submitted_task_ids(GUILD, REVIEWERS[0], page=3) == ()
+    assert await service.list_tasks(GUILD, WORKERS[0]) == by_deadline[:2]
+    with pytest.raises(JobError, match=JobErrorReason.STAFF_REQUIRED):
+        await service.list_submitted_task_ids(GUILD, WORKERS[0], page=2)
 
 
 async def test_double_approval_and_restart_pay_once(pg_engine: AsyncEngine) -> None:

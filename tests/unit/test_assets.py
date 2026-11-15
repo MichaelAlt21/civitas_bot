@@ -9,7 +9,7 @@ import pytest
 from civitas.app.assets import AssetError, AssetErrorReason, AssetRepository, AssetService
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
 from civitas.app.wallet import WalletFunding
-from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetStatus
+from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetResale, AssetResaleStatus, AssetStatus
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.ledger import MAX_AMOUNT, Account, AccountKind, LedgerError, LedgerErrorReason, PostResult, TransactionKind
 from civitas.domain.market import Company
@@ -92,6 +92,36 @@ def assets(repository: AsyncMock) -> AssetService:
         staff_user_ids=[STAFF.discord_user_id],
         funding=WalletFunding(starter_grant=250, treasury_genesis=8000),
         clock=lambda: NOW,
+        resale_tax_bp=200,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resale_uses_stored_tax_and_replays_completion(assets: AssetService, repository: AsyncMock) -> None:
+    offer = AssetResale(33, GUILD, AVAILABLE.id, OTHER.id, BUYER.id, 200, 500, "offer", NOW, AssetResaleStatus.OPEN)
+    other_account = Account(26, GUILD, AccountKind.PERSONAL, OTHER.id)
+    repository.get_resale_offer.return_value = offer
+    repository.get_asset.return_value = replace(AVAILABLE, status=AssetStatus.SOLD, owner_citizen_id=OTHER.id)
+    repository.get_resale_citizens.return_value = (BUYER, OTHER)
+    repository.ensure_account.side_effect = lambda guild_id, kind, citizen_id=None: (
+        TREASURY if kind == AccountKind.TREASURY else {BUYER.id: PERSONAL, OTHER.id: other_account}[citizen_id]
+    )
+
+    with pytest.raises(AssetError, match=AssetErrorReason.RESALE_NOT_FOUND):
+        await assets.buy_resale(DISCORD_GUILD, STAFF.discord_user_id, offer.id)
+    repository.post.assert_not_awaited()
+    receipt = await assets.buy_resale(DISCORD_GUILD, BUYER.discord_user_id, offer.id)
+    assert (receipt.status, receipt.transaction_id) == (AssetResaleStatus.COMPLETED, 23)
+    repository.get_resale_offer.return_value = receipt
+    assert await assets.buy_resale(DISCORD_GUILD, BUYER.discord_user_id, offer.id) == receipt
+    repository.post.assert_awaited_once_with(
+        GUILD, TransactionKind.ASSET_RESALE, "asset_resale:33",
+        {PERSONAL.id: -200, other_account.id: 190, TREASURY.id: 10},
+        actor_citizen_id=BUYER.id, reason="asset_resale",
+    )
+    repository.update_resale_offer.assert_awaited_once_with(receipt)
+    repository.assign_asset.assert_awaited_once_with(
+        guild_id=GUILD, asset_id=AVAILABLE.id, owner_citizen_id=BUYER.id, owner_company_id=None,
     )
 
 

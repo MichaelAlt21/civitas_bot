@@ -51,7 +51,7 @@ def _to_claim(row: WorkClaimRow, discord_user_id: int) -> JobClaim:
 
 class PostgresJobsRepository(PostgresLedgerRepository):
     async def list_available_tasks(
-        self, guild_id: int, now: datetime, limit: int
+        self, guild_id: int, now: datetime, limit: int, *, offset: int = 0,
     ) -> tuple[JobTask, ...]:
         rows = await self._session.scalars(
             select(WorkTaskRow)
@@ -63,10 +63,11 @@ class PostgresJobsRepository(PostgresLedgerRepository):
             )
             .order_by(WorkTaskRow.expires_at, WorkTaskRow.id)
             .limit(limit)
+            .offset(offset)
         )
         return tuple(_to_task(row) for row in rows)
 
-    async def list_submitted_task_ids(self, guild_id: int, limit: int) -> tuple[int, ...]:
+    async def list_submitted_task_ids(self, guild_id: int, limit: int, *, offset: int = 0) -> tuple[int, ...]:
         rows = await self._session.scalars(
             select(WorkClaimRow.task_id)
             .join(GuildRow, GuildRow.id == WorkClaimRow.guild_id)
@@ -76,6 +77,7 @@ class PostgresJobsRepository(PostgresLedgerRepository):
             )
             .order_by(WorkClaimRow.submitted_at, WorkClaimRow.id)
             .limit(limit)
+            .offset(offset)
         )
         return tuple(rows)
 

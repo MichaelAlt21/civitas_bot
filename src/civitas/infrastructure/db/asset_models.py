@@ -2,7 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint,
-    Identity, Index, String, Text, UniqueConstraint,
+    Identity, Index, String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -100,3 +100,59 @@ class AssetTransferRow(Base):
     transaction_id: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AssetResaleRow(Base):
+    __tablename__ = "asset_resales"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "request_key", name="uq_asset_resales_request"),
+        UniqueConstraint("transaction_id", name="uq_asset_resales_posting"),
+        ForeignKeyConstraint(
+            ["guild_id", "asset_id"], ["assets.guild_id", "assets.id"], name="fk_asset_resales_asset",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "seller_citizen_id"], ["citizens.guild_id", "citizens.id"], name="fk_asset_resales_seller",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "buyer_citizen_id"], ["citizens.guild_id", "citizens.id"], name="fk_asset_resales_buyer",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "transaction_id"], ["financial_transactions.guild_id", "financial_transactions.id"],
+            name="fk_asset_resales_posting",
+        ),
+        CheckConstraint(
+            "price > 0 AND tax_bp BETWEEN 0 AND 9999 AND seller_citizen_id <> buyer_citizen_id "
+            "AND length(btrim(request_key)) > 0",
+            name="ck_asset_resales_terms",
+        ),
+        CheckConstraint(
+            "(status = 'OPEN' AND closed_at IS NULL AND transaction_id IS NULL) OR "
+            "(status = 'CANCELLED' AND closed_at IS NOT NULL AND transaction_id IS NULL) OR "
+            "(status = 'COMPLETED' AND closed_at IS NOT NULL AND transaction_id IS NOT NULL)",
+            name="ck_asset_resales_status",
+        ),
+        CheckConstraint("closed_at >= created_at", name="ck_asset_resales_closure_time"),
+        Index(
+            "uq_asset_resales_open_asset", "guild_id", "asset_id",
+            unique=True, postgresql_where=text("status = 'OPEN'"),
+        ),
+        Index(
+            "ix_asset_resales_completed_asset", "guild_id", "asset_id", "id",
+            postgresql_where=text("status = 'COMPLETED'"),
+        ),
+        Index("ix_asset_resales_seller", "guild_id", "seller_citizen_id", "id"),
+        Index("ix_asset_resales_buyer", "guild_id", "buyer_citizen_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    asset_id: Mapped[int] = mapped_column(BigInteger)
+    seller_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    buyer_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    price: Mapped[int] = mapped_column(BigInteger)
+    tax_bp: Mapped[int]
+    request_key: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16))
+    transaction_id: Mapped[int | None] = mapped_column(BigInteger)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

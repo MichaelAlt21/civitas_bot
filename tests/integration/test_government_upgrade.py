@@ -11,8 +11,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from civitas.app.citizens import CitizensService
 from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentService
 from civitas.domain.government import ElectionStatus, OfficeKind
+from civitas.infrastructure.db import government as sql_government
 from civitas.infrastructure.db.government import PostgresGovernmentRepository, PostgresGovernmentUnitOfWork
-from civitas.infrastructure.db.government_models import ElectionPollSourceRow, ElectionProtocolRow
+from civitas.infrastructure.db.government_models import ElectionPollSourceRow, ElectionProtocolRow, PublicOfficeRow
 
 
 def _migrate(connection: Connection, *, upgrade: bool) -> None:
@@ -74,18 +75,19 @@ async def test_election_upgrade_preserves_legacy_evidence_and_reserves_earliest_
     with monkeypatch.context() as legacy:
         legacy.setattr(PostgresGovernmentRepository, "bind_poll_source", accept_legacy_source)
         legacy.setattr(PostgresGovernmentRepository, "get_election_cancellation", no_legacy_cancellation)
+        legacy.setattr(sql_government, "_effective_office_end", lambda: PublicOfficeRow.ends_at)
         await service.record_protocol(guild, recorder, parliament.id, source_url=original, **protocol)
         await service.certify_election(guild, reviewer, parliament.id, reason="Verify parliamentary result")
         now += timedelta(hours=1)
         await service.record_protocol(guild, recorder, president.id, source_url=canonical, **protocol)
         await service.certify_election(guild, reviewer, president.id, reason="Verify presidential result")
+        legacy_offices = await service.list_offices(guild, candidate)
 
     async with unit_of_work() as repository:
         legacy_results = (
             await repository.get_election(president.guild_id, president.id),
             await repository.get_election(parliament.guild_id, parliament.id),
         )
-    legacy_offices = await service.list_offices(guild, candidate)
     assert len(legacy_results) == len(legacy_offices) == 2
     async with pg_engine.begin() as connection:
         await connection.execute(text("""

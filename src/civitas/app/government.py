@@ -1,4 +1,4 @@
-"""Record and independently certify aggregate external election protocols."""
+"""Record external votes and independently certify public mandates and impeachment."""
 
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -18,6 +18,7 @@ from civitas.domain.government import (
     ElectionCancellation,
     ElectionProtocol,
     ElectionStatus,
+    Impeachment,
     OfficeKind,
     OfficeRoleAssignment,
     OfficeTerm,
@@ -59,6 +60,14 @@ class GovernmentErrorReason(StrEnum):
     CANCELLATION_NOT_PROPOSED = "cancellation_not_proposed"
     REPLACEMENT_REQUIRED = "replacement_required"
     INVALID_REPLACEMENT = "invalid_replacement"
+    NO_ACTIVE_PRESIDENT = "no_active_president"
+    IMPEACHMENT_NOT_FOUND = "impeachment_not_found"
+    IMPEACHMENT_CONFLICT = "impeachment_conflict"
+    IMPEACHMENT_UNRECORDED = "impeachment_unrecorded"
+    IMPEACHMENT_RECORDED = "impeachment_recorded"
+    IMPEACHMENT_INSUFFICIENT_SUPPORT = "impeachment_insufficient_support"
+    IMPEACHMENT_TERM_ENDED = "impeachment_term_ended"
+    INVALID_IMPEACHMENT_TALLY = "invalid_impeachment_tally"
 
 
 class GovernmentError(Exception):
@@ -95,6 +104,22 @@ class ElectionRules:
 
 class GovernmentRepository(WalletRepository, Protocol):
     async def list_verified_citizens(self, guild_id: int) -> tuple[Citizen, ...]: ...
+
+    async def get_current_presidential_term(self, guild_id: int, at: datetime) -> tuple[int, OfficeTerm] | None: ...
+
+    async def get_impeachment(self, guild_id: int, impeachment_id: int) -> Impeachment | None: ...
+
+    async def get_impeachment_by_key(self, guild_id: int, key: str) -> Impeachment | None: ...
+
+    async def create_impeachment(self, impeachment: Impeachment) -> Impeachment: ...
+
+    async def list_impeachment_voters(self, guild_id: int, impeachment_id: int) -> tuple[int, ...] | None: ...
+
+    async def bind_impeachment_source(self, guild_id: int, impeachment_id: int, source_url: str) -> bool: ...
+
+    async def record_impeachment(self, impeachment: Impeachment) -> None: ...
+
+    async def confirm_impeachment(self, impeachment: Impeachment) -> None: ...
 
     async def get_election(self, guild_id: int, election_id: int, *, lock: bool = False) -> Election | None: ...
 
@@ -232,7 +257,7 @@ class GovernmentService:
             existing = await repository.get_election_by_key(commissioner.guild_id, idempotency_key)
             if existing is not None:
                 return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id, replacement_of_id)
-            eligible = await repository.list_verified_citizens(commissioner.guild_id)
+            eligible = await self._eligible_voters(repository, commissioner.guild_id)
             by_discord_id = {citizen.discord_user_id: citizen for citizen in eligible}
             if len(eligible) < self._rules.min_eligible:
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
@@ -284,10 +309,7 @@ class GovernmentService:
                 raise GovernmentError(GovernmentErrorReason.INVALID_CANDIDATES)
             if not self._has_independent_commission(by_discord_id.keys() - candidates):
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_COMMISSIONERS)
-            quorum = max(
-                self._rules.quorum_min,
-                (len(eligible) * self._rules.quorum_bp + _BASIS_POINTS - 1) // _BASIS_POINTS,
-            )
+            quorum = self._quorum(len(eligible))
             if quorum > len(eligible):
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
             ordered_candidates = sorted((by_discord_id[user] for user in candidates), key=lambda citizen: citizen.id)
@@ -491,6 +513,161 @@ class GovernmentService:
         if latest is None or latest.id != election.id or not latest.is_political_crisis_open:
             raise GovernmentError(GovernmentErrorReason.CRISIS_NOT_ACTIVE)
 
+    async def open_impeachment(
+        self, guild_id: int | None, user_id: int, *, idempotency_key: str,
+    ) -> Impeachment:
+        self._commissioner(guild_id, user_id)
+        _validate_key(idempotency_key)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id, lock=True)
+            await repository.lock_election_cycle(actor.guild_id)
+            prior = await repository.get_impeachment_by_key(actor.guild_id, idempotency_key)
+            if prior is not None:
+                if prior.opened_by_citizen_id != actor.id:
+                    raise GovernmentError(GovernmentErrorReason.INVALID_REQUEST_KEY)
+                return prior
+            now = self._clock()
+            active = await repository.get_current_presidential_term(actor.guild_id, now)
+            if active is None:
+                raise GovernmentError(GovernmentErrorReason.NO_ACTIVE_PRESIDENT)
+            term_id, term = active
+            if actor.id == term.holder_citizen_id:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_CONFLICT)
+            eligible = await self._eligible_voters(repository, actor.guild_id)
+            quorum = self._quorum(len(eligible))
+            if quorum > len(eligible):
+                raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
+            if not self._has_independent_commission(
+                {citizen.discord_user_id for citizen in eligible} - {term.holder_discord_user_id}
+            ):
+                raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_COMMISSIONERS)
+            return await repository.create_impeachment(Impeachment(
+                id=0, guild_id=actor.guild_id, term_id=term_id, election_id=term.election_id,
+                president_citizen_id=term.holder_citizen_id, president_discord_user_id=term.holder_discord_user_id,
+                eligible_citizen_ids=tuple(sorted(citizen.id for citizen in eligible)), quorum=quorum,
+                opened_by_citizen_id=actor.id, opened_at=now, request_key=idempotency_key,
+            ))
+
+    async def list_impeachment_voters(
+        self, guild_id: int | None, user_id: int, impeachment_id: int,
+    ) -> tuple[int, ...]:
+        self._commissioner(guild_id, user_id)
+        self._check_impeachment_id(impeachment_id)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id)
+            voters = await repository.list_impeachment_voters(actor.guild_id, impeachment_id)
+            if voters is None:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_NOT_FOUND)
+            return voters
+
+    async def record_impeachment(
+        self, guild_id: int | None, user_id: int, impeachment_id: int, *,
+        source_url: str, participants: int, votes_for: int, reason: str,
+    ) -> Impeachment:
+        async with self._impeachment_action(guild_id, user_id, impeachment_id) as (repository, actor, ballot):
+            source_key = self._validate_source(source_url)
+            reason = _reason(reason)
+            if (
+                type(participants) is not int or not 0 <= participants <= len(ballot.eligible_citizen_ids)
+                or type(votes_for) is not int or not 0 <= votes_for <= participants
+            ):
+                raise GovernmentError(GovernmentErrorReason.INVALID_IMPEACHMENT_TALLY)
+            if ballot.source_url is not None:
+                if (
+                    _poll_source_key(urlsplit(ballot.source_url)), ballot.participants, ballot.votes_for,
+                    ballot.recorded_by_citizen_id, ballot.public_reason,
+                ) == (source_key, participants, votes_for, actor.id, reason):
+                    return ballot
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_RECORDED)
+
+            now = self._clock()
+            await self._require_current_impeachment_term(repository, ballot, now)
+            if not await repository.bind_impeachment_source(ballot.guild_id, ballot.id, source_key):
+                raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
+            recorded = replace(
+                ballot, source_url=source_url, participants=participants, votes_for=votes_for,
+                recorded_by_citizen_id=actor.id, recorded_at=now, public_reason=reason,
+            )
+            await repository.record_impeachment(recorded)
+            return recorded
+
+    async def confirm_impeachment(
+        self, guild_id: int | None, user_id: int, impeachment_id: int, *, reason: str,
+    ) -> Impeachment:
+        async with self._impeachment_action(guild_id, user_id, impeachment_id) as (repository, actor, ballot):
+            reason = _reason(reason)
+            if ballot.recorded_by_citizen_id is None:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_UNRECORDED)
+            if actor.id == ballot.recorded_by_citizen_id:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_CONFLICT)
+            if ballot.confirmed_at is not None:
+                return ballot
+            if not ballot.has_support:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_INSUFFICIENT_SUPPORT)
+            now = self._clock()
+            await self._require_current_impeachment_term(repository, ballot, now)
+            confirmed = replace(
+                ballot, confirmed_by_citizen_id=actor.id, confirmed_at=now, confirmation_reason=reason,
+            )
+            await repository.confirm_impeachment(confirmed)
+            return confirmed
+
+    async def get_public_impeachment(
+        self, guild_id: int | None, user_id: int, impeachment_id: int,
+    ) -> Impeachment:
+        self._public_access(guild_id, user_id)
+        async with self._unit_of_work() as repository:
+            internal_guild_id = await repository.ensure_guild(self._guild_id)
+            ballot = await self._impeachment(repository, internal_guild_id, impeachment_id)
+            return replace(ballot, eligible_citizen_ids=(), confirmation_reason=None)
+
+    @asynccontextmanager
+    async def _impeachment_action(
+        self, guild_id: int | None, user_id: int, impeachment_id: int,
+    ) -> AsyncIterator[tuple[GovernmentRepository, Citizen, Impeachment]]:
+        self._commissioner(guild_id, user_id)
+        async with self._unit_of_work() as repository:
+            actor = await self._verified(repository, user_id)
+            ballot = await self._impeachment(repository, actor.guild_id, impeachment_id)
+            if actor.id == ballot.president_citizen_id:
+                raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_CONFLICT)
+
+            # Treasury operations and impeachment lock the holder before checking the term.
+            locked = await repository.get_citizens(
+                self._guild_id, (user_id, ballot.president_discord_user_id), lock=True,
+            )
+            if not any(citizen.id == actor.id and citizen.status == CitizenStatus.VERIFIED for citizen in locked):
+                raise GovernmentError(GovernmentErrorReason.CITIZEN_NOT_VERIFIED)
+            await repository.lock_election_cycle(actor.guild_id)
+            ballot = await self._impeachment(repository, actor.guild_id, impeachment_id)
+            yield repository, actor, ballot
+
+    @staticmethod
+    def _check_impeachment_id(impeachment_id: int) -> None:
+        if type(impeachment_id) is not int or not 1 <= impeachment_id <= MAX_AMOUNT:
+            raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_NOT_FOUND)
+
+    @staticmethod
+    async def _impeachment(
+        repository: GovernmentRepository, guild_id: int, impeachment_id: int,
+    ) -> Impeachment:
+        GovernmentService._check_impeachment_id(impeachment_id)
+        ballot = await repository.get_impeachment(guild_id, impeachment_id)
+        if ballot is None:
+            raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_NOT_FOUND)
+        return ballot
+
+    @staticmethod
+    async def _require_current_impeachment_term(
+        repository: GovernmentRepository, ballot: Impeachment, now: datetime,
+    ) -> None:
+        active = await repository.get_current_presidential_term(ballot.guild_id, now)
+        if active is None or active[0] != ballot.term_id:
+            raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_TERM_ENDED)
+
+    def _quorum(self, eligible: int) -> int:
+        return max(self._rules.quorum_min, (eligible * self._rules.quorum_bp + _BASIS_POINTS - 1) // _BASIS_POINTS)
+
     async def list_offices(self, guild_id: int | None, user_id: int) -> tuple[OfficeTerm, ...]:
         self._public_access(guild_id, user_id)
         async with self._unit_of_work() as repository:
@@ -572,17 +749,20 @@ class GovernmentService:
         if user_id not in self._commissioners:
             raise GovernmentError(GovernmentErrorReason.COMMISSIONER_REQUIRED)
 
-    def _has_independent_commission(self, eligible: set[int]) -> bool:
-        admitted_count = 0
-        for user_id in self._commissioners & eligible:
+    async def _eligible_voters(
+        self, repository: GovernmentRepository, guild_id: int,
+    ) -> tuple[Citizen, ...]:
+        admitted = []
+        for citizen in await repository.list_verified_citizens(guild_id):
             try:
-                self._authorize(self._guild_id, user_id)
+                self._authorize(self._guild_id, citizen.discord_user_id)
             except CitizenshipAccessError:
                 continue
-            admitted_count += 1
-            if admitted_count == 2:
-                return True
-        return False
+            admitted.append(citizen)
+        return tuple(admitted)
+
+    def _has_independent_commission(self, eligible: set[int]) -> bool:
+        return len(self._commissioners & eligible) >= 2
 
     async def _verified(self, repository: GovernmentRepository, user_id: int, *, lock: bool = False) -> Citizen:
         citizens = await repository.get_citizens(self._guild_id, (user_id,), lock=lock)

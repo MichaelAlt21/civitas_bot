@@ -81,7 +81,7 @@ class PostgresTreasuryRepository(PostgresAssetRepository):
         return _to_contract(*row) if row is not None else None
 
     async def list_contracts(
-        self, guild_id: int, citizen_id: int, *, include_all: bool, limit: int,
+        self, guild_id: int, citizen_id: int, *, include_all: bool, limit: int, offset: int = 0,
     ) -> tuple[StateContract, ...]:
         statement = _contracts().where(StateContractRow.guild_id == guild_id)
         if not include_all:
@@ -89,7 +89,7 @@ class PostgresTreasuryRepository(PostgresAssetRepository):
                 StateContractRow.proposer_citizen_id == citizen_id,
                 StateContractRow.recipient_citizen_id == citizen_id,
             ))
-        rows = await self._session.execute(statement.order_by(StateContractRow.id.desc()).limit(limit))
+        rows = await self._session.execute(statement.order_by(StateContractRow.id.desc()).limit(limit).offset(offset))
         return tuple(_to_contract(*row) for row in rows)
 
     async def create_contract(

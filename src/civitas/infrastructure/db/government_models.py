@@ -236,6 +236,7 @@ class ElectionCancellationConfirmationRow(Base):
 class PublicOfficeRow(Base):
     __tablename__ = "public_offices"
     __table_args__ = (
+        UniqueConstraint("guild_id", "id", name="uq_public_offices_guild_id"),
         UniqueConstraint("election_id", "seat", name="uq_public_offices_election_seat"),
         UniqueConstraint("election_id", "holder_citizen_id", name="uq_public_offices_election_holder"),
         ForeignKeyConstraint(
@@ -259,3 +260,97 @@ class PublicOfficeRow(Base):
     holder_citizen_id: Mapped[int] = mapped_column(BigInteger)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ImpeachmentBallotRow(Base):
+    __tablename__ = "impeachment_ballots"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "id", name="uq_impeachment_ballots_guild_id"),
+        UniqueConstraint("guild_id", "id", "term_id", name="uq_impeachment_ballots_term_link"),
+        UniqueConstraint("guild_id", "request_key", name="uq_impeachment_ballots_request"),
+        ForeignKeyConstraint(
+            ["guild_id", "term_id"], ["public_offices.guild_id", "public_offices.id"],
+            name="fk_impeachment_ballots_term",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "opened_by_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_impeachment_ballots_opener",
+        ),
+        CheckConstraint(
+            "quorum > 0 AND quorum <= cardinality(eligible_citizen_ids) AND length(btrim(request_key)) > 0",
+            name="ck_impeachment_ballots_rules",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    term_id: Mapped[int] = mapped_column(BigInteger)
+    eligible_citizen_ids: Mapped[list[int]] = mapped_column(ARRAY(BigInteger))
+    quorum: Mapped[int] = mapped_column(Integer)
+    opened_by_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    request_key: Mapped[str] = mapped_column(String(128))
+
+
+class ImpeachmentProtocolRow(Base):
+    __tablename__ = "impeachment_protocols"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "impeachment_id"], ["impeachment_ballots.guild_id", "impeachment_ballots.id"],
+            name="fk_impeachment_protocols_ballot",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "recorded_by_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_impeachment_protocols_recorder",
+        ),
+        CheckConstraint(
+            "participants >= 0 AND votes_for BETWEEN 0 AND participants", name="ck_impeachment_protocols_votes",
+        ),
+        CheckConstraint("length(btrim(public_reason)) BETWEEN 1 AND 200", name="ck_impeachment_protocols_reason"),
+    )
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    impeachment_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_url: Mapped[str] = mapped_column(Text)
+    participants: Mapped[int] = mapped_column(Integer)
+    votes_for: Mapped[int] = mapped_column(Integer)
+    recorded_by_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    public_reason: Mapped[str] = mapped_column(Text)
+
+
+Index(
+    "uq_impeachment_protocols_source",
+    ImpeachmentProtocolRow.guild_id, func.civitas_election_source_key(ImpeachmentProtocolRow.source_url),
+    unique=True,
+)
+
+
+class ImpeachmentConfirmationRow(Base):
+    __tablename__ = "impeachment_confirmations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "impeachment_id", "term_id"],
+            ["impeachment_ballots.guild_id", "impeachment_ballots.id", "impeachment_ballots.term_id"],
+            name="fk_impeachment_confirmations_term_link",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "impeachment_id"],
+            ["impeachment_protocols.guild_id", "impeachment_protocols.impeachment_id"],
+            name="fk_impeachment_confirmations_protocol",
+        ),
+        ForeignKeyConstraint(
+            ["guild_id", "confirmed_by_citizen_id"], ["citizens.guild_id", "citizens.id"],
+            name="fk_impeachment_confirmations_actor",
+        ),
+        CheckConstraint(
+            "length(btrim(confirmation_reason)) BETWEEN 1 AND 200", name="ck_impeachment_confirmations_reason",
+        ),
+    )
+
+    term_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    impeachment_id: Mapped[int] = mapped_column(BigInteger)
+    confirmed_by_citizen_id: Mapped[int] = mapped_column(BigInteger)
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    confirmation_reason: Mapped[str] = mapped_column(Text)

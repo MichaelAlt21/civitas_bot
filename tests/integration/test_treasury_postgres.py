@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.citizens import CitizensService
 from civitas.app.jobs import JobError, JobErrorReason, JobsRules, JobService
-from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryRules, TreasuryService
+from civitas.app.treasury import CONTRACT_PAGE_SIZE, TreasuryError, TreasuryErrorReason, TreasuryRules, TreasuryService
 from civitas.app.wallet import WalletFunding
 from civitas.domain.jobs import BudgetCaps, JobCategory, JobClaim, JobClaimStatus
 from civitas.domain.ledger import AccountKind, TransactionKind
@@ -84,13 +84,35 @@ async def _scenario(
 
 
 async def _proposal(
-    service: TreasuryService, amount: int, key: str, *, now: datetime = NOW,
+    service: TreasuryService, amount: int, key: str, *, now: datetime = NOW, recipient_user_id: int = RECIPIENT,
 ) -> StateContract:
     return await service.propose_contract(
-        GUILD, PROPOSER, recipient_user_id=RECIPIENT, title="Repair the town hall",
+        GUILD, PROPOSER, recipient_user_id=recipient_user_id, title="Repair the town hall",
         terms="Repair the entrance", amount=amount, deadline=now + timedelta(days=2),
         reason="Keep the public building open", idempotency_key=key,
     )
+
+
+async def test_contract_pages_filter_private_visibility_before_offset(pg_engine: AsyncEngine) -> None:
+    scenario = await _scenario(pg_engine)
+    service = scenario.treasury()
+    visible = [
+        await _proposal(service, 10, f"worker-contract-{index}", recipient_user_id=NPC_WORKER)
+        for index in range(CONTRACT_PAGE_SIZE + 2)
+    ]
+    hidden = await _proposal(service, 20, "outsider-contract", recipient_user_id=OUTSIDER)
+    newest = tuple(reversed(visible))
+
+    assert await service.list_contracts(GUILD, NPC_WORKER) == newest[:CONTRACT_PAGE_SIZE]
+    assert await service.list_contracts(GUILD, NPC_WORKER, page=2) == newest[CONTRACT_PAGE_SIZE:]
+    assert await service.list_contracts(GUILD, NPC_WORKER, page=3) == ()
+    with pytest.raises(TreasuryError, match=TreasuryErrorReason.NOT_CONTRACT_PARTY):
+        await service.get_contract(GUILD, NPC_WORKER, hidden.id)
+    assert await service.list_contracts(GUILD, OUTSIDER) == (hidden,)
+    assert await service.list_contracts(GUILD, OUTSIDER, page=2) == ()
+    for staff in (PROPOSER, APPROVER):
+        assert await service.list_contracts(GUILD, staff) == (hidden, *newest[:CONTRACT_PAGE_SIZE - 1])
+        assert await service.list_contracts(GUILD, staff, page=2) == newest[CONTRACT_PAGE_SIZE - 1:]
 
 
 async def _balances(scenario: Scenario) -> tuple[int, int]:

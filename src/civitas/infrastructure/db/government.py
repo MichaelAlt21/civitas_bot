@@ -10,7 +10,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.government import (
-    CandidateTally, CrisisResolution, Election, ElectionCancellation, ElectionProtocol, ElectionStatus, OfficeKind,
+    CandidateTally, CrisisResolution, Election, ElectionCancellation, ElectionProtocol, ElectionStatus, Impeachment, OfficeKind,
     OfficeRoleAssignment, OfficeTerm,
 )
 
@@ -18,7 +18,7 @@ from .citizens import _to_citizen
 from .government_models import (
     ElectionCancellationConfirmationRow, ElectionCancellationProposalRow, ElectionCertificationRow,
     ElectionCrisisConfirmationRow, ElectionCrisisProposalRow, ElectionPollSourceRow, ElectionProtocolRow,
-    ElectionRow, PublicOfficeRow,
+    ElectionRow, ImpeachmentBallotRow, ImpeachmentConfirmationRow, ImpeachmentProtocolRow, PublicOfficeRow,
 )
 from .models import CitizenRow, GuildRow
 from .private_jobs import PostgresPrivateJobRepository
@@ -70,6 +70,37 @@ def _term(row: PublicOfficeRow, discord_user_id: int) -> OfficeTerm:
         election_id=row.election_id, office=OfficeKind(row.office), seat=row.seat,
         holder_citizen_id=row.holder_citizen_id, holder_discord_user_id=discord_user_id,
         starts_at=row.starts_at.astimezone(UTC), ends_at=row.ends_at.astimezone(UTC),
+    )
+
+
+def _effective_office_end() -> ColumnElement[datetime]:
+    early_end = select(ImpeachmentConfirmationRow.confirmed_at).where(
+        ImpeachmentConfirmationRow.term_id == PublicOfficeRow.id,
+        ImpeachmentConfirmationRow.guild_id == PublicOfficeRow.guild_id,
+    ).correlate(PublicOfficeRow).scalar_subquery()
+    return func.coalesce(early_end, PublicOfficeRow.ends_at)
+
+
+def _impeachment(
+    ballot: ImpeachmentBallotRow,
+    term: PublicOfficeRow,
+    protocol: ImpeachmentProtocolRow | None,
+    confirmation: ImpeachmentConfirmationRow | None,
+    discord_user_id: int,
+) -> Impeachment:
+    return Impeachment(
+        id=ballot.id, guild_id=ballot.guild_id, term_id=ballot.term_id, election_id=term.election_id,
+        president_citizen_id=term.holder_citizen_id, president_discord_user_id=discord_user_id,
+        eligible_citizen_ids=tuple(ballot.eligible_citizen_ids), quorum=ballot.quorum,
+        opened_by_citizen_id=ballot.opened_by_citizen_id, opened_at=ballot.opened_at.astimezone(UTC),
+        request_key=ballot.request_key, source_url=protocol.source_url if protocol else None,
+        participants=protocol.participants if protocol else None, votes_for=protocol.votes_for if protocol else None,
+        recorded_by_citizen_id=protocol.recorded_by_citizen_id if protocol else None,
+        recorded_at=protocol.recorded_at.astimezone(UTC) if protocol else None,
+        public_reason=protocol.public_reason if protocol else None,
+        confirmed_by_citizen_id=confirmation.confirmed_by_citizen_id if confirmation else None,
+        confirmed_at=confirmation.confirmed_at.astimezone(UTC) if confirmation else None,
+        confirmation_reason=confirmation.confirmation_reason if confirmation else None,
     )
 
 
@@ -225,6 +256,9 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
         return bool(await self._session.scalar(select(active.exists())))
 
     async def bind_poll_source(self, guild_id: int, election_id: int, source_url: str) -> bool:
+        await self.lock_election_cycle(guild_id)
+        if await self._impeachment_source_owner(guild_id, source_url) is not None:
+            return False
         inserted = await self._session.scalar(
             pg_insert(ElectionPollSourceRow).values(
                 guild_id=guild_id, election_id=election_id, source_url=source_url,
@@ -236,6 +270,23 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             ElectionPollSourceRow.guild_id == guild_id, ElectionPollSourceRow.source_url == source_url,
         ))
         return owner == election_id
+
+    async def _impeachment_source_owner(self, guild_id: int, source_url: str) -> int | None:
+        return await self._session.scalar(select(ImpeachmentProtocolRow.impeachment_id).where(
+            ImpeachmentProtocolRow.guild_id == guild_id,
+            func.civitas_election_source_key(ImpeachmentProtocolRow.source_url) == source_url,
+        ))
+
+    async def bind_impeachment_source(self, guild_id: int, impeachment_id: int, source_url: str) -> bool:
+        """Hold the guild cycle lock until the caller inserts the protocol."""
+        await self.lock_election_cycle(guild_id)
+        election_owner = await self._session.scalar(select(ElectionPollSourceRow.election_id).where(
+            ElectionPollSourceRow.guild_id == guild_id, ElectionPollSourceRow.source_url == source_url,
+        ))
+        if election_owner is not None:
+            return False
+        owner = await self._impeachment_source_owner(guild_id, source_url)
+        return owner is None or owner == impeachment_id
 
     async def create_election(self, election: Election) -> Election | None:
         # Certification locks the election before the guild. A visible active
@@ -299,7 +350,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             select(GuildRow.id).where(GuildRow.id == election.guild_id).with_for_update(key_share=True)
         )
         latest_end = await self._session.scalar(
-            select(func.max(PublicOfficeRow.ends_at)).where(
+            select(func.max(_effective_office_end())).where(
                 PublicOfficeRow.guild_id == election.guild_id, PublicOfficeRow.office == election.office.value
             )
         )
@@ -330,7 +381,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             .join(CitizenRow, CitizenRow.id == PublicOfficeRow.holder_citizen_id)
             .where(
                 PublicOfficeRow.guild_id == guild_id,
-                PublicOfficeRow.starts_at <= at, PublicOfficeRow.ends_at > at,
+                PublicOfficeRow.starts_at <= at, _effective_office_end() > at,
                 CitizenRow.status == CitizenStatus.VERIFIED.value,
             ).order_by(PublicOfficeRow.office, PublicOfficeRow.seat)
         )
@@ -341,7 +392,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
     ) -> bool:
         active = select(PublicOfficeRow.id).join(CitizenRow, CitizenRow.id == PublicOfficeRow.holder_citizen_id).where(
             PublicOfficeRow.guild_id == guild_id, PublicOfficeRow.holder_citizen_id == citizen_id,
-            PublicOfficeRow.office == office.value, PublicOfficeRow.starts_at <= at, PublicOfficeRow.ends_at > at,
+            PublicOfficeRow.office == office.value, PublicOfficeRow.starts_at <= at, _effective_office_end() > at,
             CitizenRow.status == CitizenStatus.VERIFIED.value,
         )
         return bool(await self._session.scalar(select(active.exists())))
@@ -353,7 +404,7 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             select(
                 PublicOfficeRow.office, CitizenRow.discord_user_id,
                 func.bool_or(
-                    (PublicOfficeRow.starts_at <= at) & (PublicOfficeRow.ends_at > at)
+                    (PublicOfficeRow.starts_at <= at) & (_effective_office_end() > at)
                     & (CitizenRow.status == CitizenStatus.VERIFIED.value)
                 ),
             )
@@ -364,6 +415,81 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             .order_by(PublicOfficeRow.office, CitizenRow.discord_user_id)
         )
         return tuple(OfficeRoleAssignment(OfficeKind(office), int(user_id), active) for office, user_id, active in rows)
+
+    async def get_current_presidential_term(self, guild_id: int, at: datetime) -> tuple[int, OfficeTerm] | None:
+        current = (await self._session.execute(
+            select(PublicOfficeRow, CitizenRow.discord_user_id)
+            .join(CitizenRow, CitizenRow.id == PublicOfficeRow.holder_citizen_id)
+            .where(
+                PublicOfficeRow.guild_id == guild_id, PublicOfficeRow.office == OfficeKind.PRESIDENT.value,
+                PublicOfficeRow.starts_at <= at, _effective_office_end() > at,
+            )
+        )).one_or_none()
+        if current is None:
+            return None
+        term, user_id = current
+        return term.id, _term(term, int(user_id))
+
+    async def _get_impeachment(self, guild_id: int, criterion: ColumnElement[bool]) -> Impeachment | None:
+        row = (await self._session.execute(
+            select(ImpeachmentBallotRow, PublicOfficeRow, ImpeachmentProtocolRow, ImpeachmentConfirmationRow,
+                   CitizenRow.discord_user_id)
+            .join(PublicOfficeRow, PublicOfficeRow.id == ImpeachmentBallotRow.term_id)
+            .join(CitizenRow, CitizenRow.id == PublicOfficeRow.holder_citizen_id)
+            .outerjoin(ImpeachmentProtocolRow, ImpeachmentProtocolRow.impeachment_id == ImpeachmentBallotRow.id)
+            .outerjoin(
+                ImpeachmentConfirmationRow, ImpeachmentConfirmationRow.impeachment_id == ImpeachmentBallotRow.id,
+            )
+            .where(ImpeachmentBallotRow.guild_id == guild_id, criterion)
+        )).one_or_none()
+        if row is None:
+            return None
+        ballot, term, protocol, confirmation, user_id = row
+        return _impeachment(ballot, term, protocol, confirmation, int(user_id))
+
+    async def get_impeachment(self, guild_id: int, impeachment_id: int) -> Impeachment | None:
+        return await self._get_impeachment(guild_id, ImpeachmentBallotRow.id == impeachment_id)
+
+    async def get_impeachment_by_key(self, guild_id: int, key: str) -> Impeachment | None:
+        return await self._get_impeachment(guild_id, ImpeachmentBallotRow.request_key == key)
+
+    async def create_impeachment(self, impeachment: Impeachment) -> Impeachment:
+        impeachment_id = await self._session.scalar(insert(ImpeachmentBallotRow).values(
+            guild_id=impeachment.guild_id, term_id=impeachment.term_id,
+            eligible_citizen_ids=list(impeachment.eligible_citizen_ids), quorum=impeachment.quorum,
+            opened_by_citizen_id=impeachment.opened_by_citizen_id, opened_at=impeachment.opened_at,
+            request_key=impeachment.request_key,
+        ).returning(ImpeachmentBallotRow.id))
+        assert impeachment_id is not None
+        created = await self.get_impeachment(impeachment.guild_id, impeachment_id)
+        assert created is not None
+        return created
+
+    async def list_impeachment_voters(self, guild_id: int, impeachment_id: int) -> tuple[int, ...] | None:
+        citizen_ids = await self._session.scalar(select(ImpeachmentBallotRow.eligible_citizen_ids).where(
+            ImpeachmentBallotRow.guild_id == guild_id, ImpeachmentBallotRow.id == impeachment_id,
+        ))
+        if citizen_ids is None:
+            return None
+        discord_ids = await self._session.scalars(select(CitizenRow.discord_user_id).where(
+            CitizenRow.guild_id == guild_id, CitizenRow.id.in_(citizen_ids),
+        ).order_by(CitizenRow.discord_user_id))
+        return tuple(int(discord_id) for discord_id in discord_ids)
+
+    async def record_impeachment(self, impeachment: Impeachment) -> None:
+        await self._session.execute(insert(ImpeachmentProtocolRow).values(
+            guild_id=impeachment.guild_id, impeachment_id=impeachment.id, source_url=impeachment.source_url,
+            participants=impeachment.participants, votes_for=impeachment.votes_for,
+            recorded_by_citizen_id=impeachment.recorded_by_citizen_id, recorded_at=impeachment.recorded_at,
+            public_reason=impeachment.public_reason,
+        ))
+
+    async def confirm_impeachment(self, impeachment: Impeachment) -> None:
+        await self._session.execute(insert(ImpeachmentConfirmationRow).values(
+            term_id=impeachment.term_id, guild_id=impeachment.guild_id, impeachment_id=impeachment.id,
+            confirmed_by_citizen_id=impeachment.confirmed_by_citizen_id, confirmed_at=impeachment.confirmed_at,
+            confirmation_reason=impeachment.confirmation_reason,
+        ))
 
     async def list_results(self, guild_id: int, limit: int) -> tuple[Election, ...]:
         rows = (

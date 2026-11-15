@@ -13,7 +13,7 @@ from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.jobs import BudgetCaps, BudgetPeriod, JobCategory, JobClaim, JobClaimStatus, JobDetail, JobTask
 from civitas.domain.ledger import MAX_AMOUNT, AccountKind, LedgerError, LedgerErrorReason, TransactionKind
 
-_LIST_LIMIT = 10
+JOBS_PAGE_SIZE = 10
 _ONE_MINUTE = timedelta(minutes=1)
 
 
@@ -33,6 +33,7 @@ class JobErrorReason(StrEnum):
     INVALID_TEXT = "invalid_text"
     INVALID_DEADLINE = "invalid_deadline"
     INVALID_CATEGORY = "invalid_category"
+    INVALID_PAGE = "invalid_page"
     OVERALL_LIMIT = "overall_limit"
     NPC_LIMIT = "npc_limit"
     PERSONAL_LIMIT = "personal_limit"
@@ -80,10 +81,10 @@ class JobsRules:
 
 class JobsRepository(WalletRepository, Protocol):
     async def list_available_tasks(
-        self, guild_id: int, now: datetime, limit: int
+        self, guild_id: int, now: datetime, limit: int, *, offset: int = 0,
     ) -> tuple[JobTask, ...]: ...
 
-    async def list_submitted_task_ids(self, guild_id: int, limit: int) -> tuple[int, ...]: ...
+    async def list_submitted_task_ids(self, guild_id: int, limit: int, *, offset: int = 0) -> tuple[int, ...]: ...
 
     async def get_task(self, guild_id: int, task_id: int, *, lock: bool = False) -> JobTask | None: ...
 
@@ -156,6 +157,12 @@ def _text(value: str, max_length: int) -> str:
     return normalized
 
 
+def _page_offset(page: int) -> int:
+    if type(page) is not int or not 1 <= page <= MAX_AMOUNT // JOBS_PAGE_SIZE + 1:
+        raise JobError(JobErrorReason.INVALID_PAGE)
+    return (page - 1) * JOBS_PAGE_SIZE
+
+
 class JobService:
     def __init__(
         self,
@@ -177,11 +184,12 @@ class JobService:
         self._rules = rules
         self._clock = clock
 
-    async def list_tasks(self, guild_id: int | None, user_id: int) -> tuple[JobTask, ...]:
+    async def list_tasks(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[JobTask, ...]:
         self._authorize(guild_id, user_id)
+        offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             await self._verified_citizen(repository, user_id)
-            return await repository.list_available_tasks(self._guild_id, self._clock(), _LIST_LIMIT)
+            return await repository.list_available_tasks(self._guild_id, self._clock(), JOBS_PAGE_SIZE, offset=offset)
 
     async def get_task_details(self, guild_id: int | None, user_id: int, task_id: int) -> JobDetail:
         self._authorize(guild_id, user_id)
@@ -193,11 +201,12 @@ class JobService:
                 claim = None
             return JobDetail(task, claim)
 
-    async def list_submitted_task_ids(self, guild_id: int | None, user_id: int) -> tuple[int, ...]:
+    async def list_submitted_task_ids(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[int, ...]:
         self._authorize_staff(guild_id, user_id)
+        offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             await self._verified_citizen(repository, user_id)
-            return await repository.list_submitted_task_ids(self._guild_id, _LIST_LIMIT)
+            return await repository.list_submitted_task_ids(self._guild_id, JOBS_PAGE_SIZE, offset=offset)
 
     async def get_review(self, guild_id: int | None, user_id: int, task_id: int) -> JobDetail:
         self._authorize_staff(guild_id, user_id)

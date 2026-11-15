@@ -17,8 +17,8 @@ def _sample_report():
     return SimpleNamespace(
         window=SimpleNamespace(week_start=date(2026, 11, 9), starts_at=starts_at),
         as_of=datetime(2026, 11, 16, tzinfo=UTC),
-        opening_balance=8000, closing_balance=8180, available_cash=8150, cash_reserved=30,
-        open_escrow=10, total_income=240, company_fees=150, sales_tax=20, asset_sales=70,
+        opening_balance=8000, closing_balance=8184, available_cash=8154, cash_reserved=30,
+        open_escrow=10, total_income=244, company_fees=150, sales_tax=20, asset_sales=70, asset_resale_tax=4,
         treasury_issuance=0, other_income=0, total_expenses=60, npc_payouts=30, contract_payouts=30,
         other_expenses=0, total_issued=250, starter_grants=250, transaction_count=8,
         settled_orders=1, asset_purchases=1, budget_limit=800,
@@ -42,11 +42,11 @@ def _report_command(service, *, has_existing_treasury):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("locale", "title", "label", "has_existing_treasury"), [
-    (discord.Locale.russian, "Отчёт казны", "Налог с продаж", True),
-    (discord.Locale.american_english, "Treasury report", "Sales tax", False),
+@pytest.mark.parametrize(("locale", "title", "label", "resale_label", "has_existing_treasury"), [
+    (discord.Locale.russian, "Отчёт казны", "Налог с продаж", "Налог на перепродажу имущества", True),
+    (discord.Locale.american_english, "Treasury report", "Sales tax", "Property resale tax", False),
 ])
-async def test_treasury_report_is_public_and_aggregated(locale, title, label, has_existing_treasury):
+async def test_treasury_report_is_public_and_aggregated(locale, title, label, resale_label, has_existing_treasury):
     service = SimpleNamespace(get_report=AsyncMock(return_value=_sample_report()))
     command = _report_command(service, has_existing_treasury=has_existing_treasury)
     interaction = SimpleNamespace(
@@ -62,6 +62,7 @@ async def test_treasury_report_is_public_and_aggregated(locale, title, label, ha
     assert not sent.get("ephemeral", False)
     assert sent["embed"].title == title
     assert f"{label} · 20 ₵" in sent["embed"].description
+    assert f"{resale_label} · 4 ₵" in sent["embed"].description
     assert "SECRET" not in sent["embed"].description
     assert sent["allowed_mentions"].to_dict() == {"parse": []}
 

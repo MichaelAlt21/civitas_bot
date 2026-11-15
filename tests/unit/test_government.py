@@ -9,7 +9,7 @@ import pytest
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
 from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentRepository, GovernmentService
 from civitas.domain.citizens import Citizen, CitizenStatus
-from civitas.domain.government import Election, ElectionStatus, OfficeKind, OfficeRoleAssignment
+from civitas.domain.government import Election, ElectionStatus, Impeachment, OfficeKind, OfficeRoleAssignment, OfficeTerm
 
 DISCORD_GUILD = 100
 GUILD = 1
@@ -21,6 +21,9 @@ RULES = ElectionRules(
     voting_hours=48, extension_hours=24, poll_hosts=frozenset({"poll.example"}),
 )
 POLL = "https://poll.example/results/17"
+PRESIDENT_TERM = OfficeTerm(
+    1, OfficeKind.PRESIDENT, 1, ALICE.id, ALICE.discord_user_id, NOW - timedelta(days=1), NOW + timedelta(days=27),
+)
 
 
 @pytest.fixture
@@ -91,6 +94,49 @@ async def open_president(gov: GovernmentService, *, runoff_of_id: int | None = N
         candidate_user_ids=(ALICE.discord_user_id, BOB.discord_user_id), reason="Очередные выборы",
         idempotency_key="open" if runoff_of_id is None else "runoff", runoff_of_id=runoff_of_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_impeachment_snapshot_and_two_independent_signatures(repository: AsyncMock) -> None:
+    gov = service(repository)
+    repository.get_current_presidential_term.return_value = 42, PRESIDENT_TERM
+    repository.get_impeachment_by_key.return_value = None
+    repository.create_impeachment.side_effect = lambda ballot: replace(ballot, id=7)
+    ballot = await gov.open_impeachment(DISCORD_GUILD, FIRST.discord_user_id, idempotency_key="impeachment")
+    assert (ballot.term_id, ballot.quorum, ballot.eligible_citizen_ids) == (
+        42, 4, tuple(citizen.id for citizen in CITIZENS),
+    )
+    repository.get_impeachment.return_value = ballot
+    repository.bind_impeachment_source.return_value = True
+    record = await gov.record_impeachment(
+        DISCORD_GUILD, FIRST.discord_user_id, ballot.id, source_url=POLL,
+        participants=6, votes_for=4, reason="Публичный протокол",
+    )
+    assert record.has_support and record.confirmed_at is None
+    repository.get_impeachment.return_value = record
+    with pytest.raises(GovernmentError, match=GovernmentErrorReason.IMPEACHMENT_CONFLICT):
+        await gov.confirm_impeachment(DISCORD_GUILD, FIRST.discord_user_id, ballot.id, reason="Повтор")
+    repository.confirm_impeachment.assert_not_awaited()
+    confirmed = await gov.confirm_impeachment(DISCORD_GUILD, SECOND.discord_user_id, ballot.id, reason="Проверено")
+    repository.confirm_impeachment.assert_awaited_once_with(confirmed)
+    assert (confirmed.confirmed_at, confirmed.confirmed_by_citizen_id) == (NOW, SECOND.id)
+
+    repository.get_impeachment.return_value = confirmed
+    assert await gov.confirm_impeachment(DISCORD_GUILD, SECOND.discord_user_id, ballot.id, reason="Проверено") == confirmed
+    public = await gov.get_public_impeachment(DISCORD_GUILD, PLAYER.discord_user_id, ballot.id)
+    assert public.has_support and public.eligible_citizen_ids == () and public.confirmation_reason is None
+
+
+@pytest.mark.parametrize(("participants", "votes_for", "accepted"), [(3, 3, False), (6, 3, False), (6, 4, True)])
+def test_impeachment_requires_election_quorum_and_two_thirds(participants: int, votes_for: int, accepted: bool) -> None:
+    ballot = Impeachment(
+        id=1, guild_id=GUILD, term_id=42, election_id=PRESIDENT_TERM.election_id,
+        president_citizen_id=ALICE.id, president_discord_user_id=ALICE.discord_user_id,
+        eligible_citizen_ids=tuple(citizen.id for citizen in CITIZENS), quorum=4,
+        opened_by_citizen_id=FIRST.id, opened_at=NOW, request_key="test-ballot",
+        participants=participants, votes_for=votes_for,
+    )
+    assert ballot.has_support is accepted
 
 
 @pytest.mark.asyncio

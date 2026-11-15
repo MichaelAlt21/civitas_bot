@@ -17,6 +17,7 @@ from civitas.domain.government import (
     ElectionCancellation,
     ElectionProtocol,
     ElectionStatus,
+    Impeachment,
     OfficeKind,
     OfficeRoleAssignment,
     OfficeTerm,
@@ -40,6 +41,19 @@ OPEN = Election(
 PROTOCOL = ElectionProtocol(SOURCE, 2, (CandidateTally(2, 2, CANDIDATE), CandidateTally(3, 0, OTHER_CANDIDATE)),
                             (2,), 1, END, "Private tally reason")
 CERTIFIED = replace(OPEN, status=ElectionStatus.APPLIED, protocol=PROTOCOL, certified_at=END)
+IMPEACHMENT = Impeachment(
+    id=10, guild_id=1, term_id=9, election_id=OPEN.id, president_citizen_id=2,
+    president_discord_user_id=CANDIDATE, eligible_citizen_ids=(201, 202, 203), quorum=2,
+    opened_by_citizen_id=1, opened_at=START, request_key="impeachment",
+)
+IMPEACHMENT_RECORDED = replace(
+    IMPEACHMENT, source_url=SOURCE, participants=3, votes_for=2,
+    recorded_by_citizen_id=201, recorded_at=END, public_reason="**Review** <#123> @everyone",
+)
+IMPEACHMENT_CONFIRMED = replace(
+    IMPEACHMENT_RECORDED, confirmed_at=END + timedelta(minutes=1), confirmed_by_citizen_id=202,
+    confirmation_reason="Private audit evidence",
+)
 
 
 @pytest.fixture
@@ -53,9 +67,9 @@ def commands():
     return service, tree, government, election, election.get_command("commission")
 
 
-def interaction(*, guild_id=GUILD, locale=discord.Locale.russian):
+def interaction(*, guild_id=GUILD, locale=discord.Locale.russian, actor=COMMISSIONER):
     return SimpleNamespace(
-        id=1001, guild_id=guild_id, user=SimpleNamespace(id=COMMISSIONER), locale=locale,
+        id=1001, guild_id=guild_id, user=SimpleNamespace(id=actor), locale=locale,
         response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
         followup=SimpleNamespace(send=AsyncMock()),
     )
@@ -78,13 +92,14 @@ async def test_localized_government_commands_are_guild_only(commands):
     _, tree, government, election, _ = commands
     assert tree.get_commands() == []
     assert tree.get_commands(guild=discord.Object(id=GUILD + 1)) == []
-    assert government.get_command("offices") is not None
+    assert {command.name for command in government.commands} == {"offices", "impeachment"}
     payload = await election.get_translated_payload(tree, CommandTranslator())
     assert payload["description_localizations"] == {"ru": "Выборы и подтверждённые итоги"}
     commission = next(option for option in payload["options"] if option["name"] == "commission")
     by_name = {item["name"]: item for item in commission["options"]}
     assert by_name.keys() == {
         "active", "voters", "open", "record", "inspect", "certify", "resolve_crisis", "confirm_crisis", "cancel", "confirm_cancel",
+        "open_impeachment", "impeachment_voters", "record_impeachment", "confirm_impeachment",
     }
     for command in ("resolve_crisis", "confirm_crisis", "cancel", "confirm_cancel"):
         assert {item["name"] for item in by_name[command]["options"] if item["required"]} == {"election_id", "reason"}
@@ -101,6 +116,12 @@ async def test_localized_government_commands_are_guild_only(commands):
     voter_options = {option["name"]: option for option in by_name["voters"]["options"]}
     assert voter_options["election_id"]["required"] and not voter_options["page"]["required"]
     assert voter_options["page"]["min_value"] == 1
+    for command in ("open_impeachment", "impeachment_voters", "record_impeachment", "confirm_impeachment"):
+        assert "ru" in by_name[command]["description_localizations"]
+    record_options = {option["name"]: option for option in by_name["record_impeachment"]["options"]}
+    assert record_options.keys() == {"impeachment_id", "source_url", "participants", "votes_for", "reason"}
+    assert all(option["required"] for option in record_options.values())
+    assert record_options["votes_for"]["min_value"] == 0
 
 
 @pytest.mark.asyncio
@@ -152,6 +173,100 @@ async def test_voter_snapshot_displays_commission_denial_without_exposing_ids(co
     await commission.get_command("voters").callback(command, OPEN.id)
 
     assert reply(command, private=True) == "Для этого действия нужны полномочия избирательной комиссии."
+
+
+@pytest.mark.asyncio
+async def test_commission_impeachment_records_each_action_privately(commands):
+    service, _, _, _, commission = commands
+    service.open_impeachment.return_value = IMPEACHMENT
+    service.record_impeachment.return_value = IMPEACHMENT_RECORDED
+    service.confirm_impeachment.return_value = IMPEACHMENT_CONFIRMED
+    opening, tally = interaction(), interaction()
+    confirmation = interaction(actor=OTHER_CANDIDATE, locale=discord.Locale.american_english)
+
+    await commission.get_command("open_impeachment").callback(opening)
+    await commission.get_command("record_impeachment").callback(
+        tally, IMPEACHMENT.id, SOURCE, 3, 2, IMPEACHMENT_RECORDED.public_reason,
+    )
+    await commission.get_command("confirm_impeachment").callback(
+        confirmation, IMPEACHMENT.id, IMPEACHMENT_CONFIRMED.confirmation_reason,
+    )
+
+    service.open_impeachment.assert_awaited_once_with(GUILD, COMMISSIONER, idempotency_key=str(opening.id))
+    service.record_impeachment.assert_awaited_once_with(
+        GUILD, COMMISSIONER, IMPEACHMENT.id, source_url=SOURCE, participants=3, votes_for=2,
+        reason=IMPEACHMENT_RECORDED.public_reason,
+    )
+    service.confirm_impeachment.assert_awaited_once_with(
+        GUILD, OTHER_CANDIDATE, IMPEACHMENT.id, reason=IMPEACHMENT_CONFIRMED.confirmation_reason,
+    )
+    assert "Ожидается результат публичного голосования." in reply(opening, private=True)
+    recorded = reply(tally, private=True)
+    assert "Участвовало · 3 | За отстранение · 2" in recorded
+    assert "Ожидается независимое подтверждение." in recorded
+    assert "The presidential term ended at" in reply(confirmation, private=True)
+
+
+@pytest.mark.asyncio
+async def test_impeachment_voter_snapshot_uses_private_numbered_pages(commands):
+    service, _, _, _, commission = commands
+    voters = tuple(range(200000000000000001, 200000000000000022))
+    service.list_impeachment_voters.return_value = voters
+    command = interaction()
+
+    await commission.get_command("impeachment_voters").callback(command, IMPEACHMENT.id, 2)
+
+    service.list_impeachment_voters.assert_awaited_once_with(GUILD, COMMISSIONER, IMPEACHMENT.id)
+    content = reply(command, private=True)
+    assert "Импичмент № 10" in content and "Допущено · 21 | Страница 2 из 2" in content
+    assert str(voters[-1]) in content and str(voters[0]) not in content
+
+
+@pytest.mark.asyncio
+async def test_public_impeachment_shares_aggregate_evidence_without_audit_notes_or_mentions(commands):
+    service, _, government, _, _ = commands
+    service.get_public_impeachment.return_value = replace(
+        IMPEACHMENT_CONFIRMED, eligible_citizen_ids=(), confirmation_reason=None,
+    )
+    command = interaction(locale=discord.Locale.american_english)
+    outside = interaction(guild_id=GUILD + 1)
+    callback = government.get_command("impeachment").callback
+
+    await callback(command, IMPEACHMENT.id)
+    await callback(outside, IMPEACHMENT.id)
+
+    service.get_public_impeachment.assert_awaited_once_with(GUILD, COMMISSIONER, IMPEACHMENT.id)
+    service.list_impeachment_voters.assert_not_awaited()
+    content = reply(command, private=False)
+    assert f"<{SOURCE}>" in content and "Votes for removal · 2" in content
+    assert "Result certified." in content
+    assert "Eligible voters · 0" not in content
+    assert "‹#123›" in content and "@everyone" not in content
+    assert IMPEACHMENT_CONFIRMED.confirmation_reason not in content
+    outside.response.send_message.assert_awaited_once_with(
+        "Команды Civitas доступны на игровом сервере.", ephemeral=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_impeachment_denials_and_failed_threshold_have_localized_status(commands):
+    service, _, government, _, commission = commands
+    service.get_public_impeachment.return_value = replace(IMPEACHMENT_RECORDED, votes_for=1)
+    service.confirm_impeachment.side_effect = GovernmentError(
+        GovernmentErrorReason.IMPEACHMENT_INSUFFICIENT_SUPPORT,
+    )
+    service.record_impeachment.side_effect = GovernmentError(
+        GovernmentErrorReason.INVALID_IMPEACHMENT_TALLY,
+    )
+    public, private, bad_tally = interaction(), interaction(), interaction(locale=discord.Locale.american_english)
+
+    await government.get_command("impeachment").callback(public, IMPEACHMENT.id)
+    await commission.get_command("confirm_impeachment").callback(private, IMPEACHMENT.id, "Verify result")
+    await commission.get_command("record_impeachment").callback(bad_tally, IMPEACHMENT.id, SOURCE, 1, 2, "Tally")
+
+    assert "кворум или порог голосов за отстранение не достигнут" in reply(public, private=False)
+    assert "Для отстранения нужны кворум и не менее двух третей" in reply(private, private=True)
+    assert "Votes for removal must be within the participant count" in reply(bad_tally, private=True)
 
 
 @pytest.mark.asyncio

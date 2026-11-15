@@ -48,6 +48,8 @@ _REPORT_TOTALS = text("""
             coalesce(sum(delta) FILTER (WHERE account_kind = 'TREASURY' AND created_at >= :starts_at
                 AND tx_kind = 'ASSET_PURCHASE'), 0) AS asset_sales,
             coalesce(sum(delta) FILTER (WHERE account_kind = 'TREASURY' AND created_at >= :starts_at
+                AND tx_kind = 'ASSET_RESALE'), 0) AS asset_resale_tax,
+            coalesce(sum(delta) FILTER (WHERE account_kind = 'TREASURY' AND created_at >= :starts_at
                 AND tx_kind = 'GENESIS'), 0) AS treasury_issuance,
             coalesce(sum(-delta) FILTER (WHERE account_kind = 'TREASURY' AND created_at >= :starts_at
                 AND tx_kind = 'NPC_PAYOUT'), 0) AS npc_payouts,
@@ -146,8 +148,9 @@ class PostgresReportRepository(PostgresTreasuryRepository):
             opening_balance=int(row["opening_balance"]), closing_balance=int(row["closing_balance"]),
             company_fees=int(row["company_fees"]), sales_tax=int(row["sales_tax"]),
             asset_sales=int(row["asset_sales"]), treasury_issuance=int(row["treasury_issuance"]),
+            asset_resale_tax=int(row["asset_resale_tax"]),
             other_income=int(row["income"] - row["company_fees"] - row["sales_tax"]
-                             - row["asset_sales"] - row["treasury_issuance"]),
+                             - row["asset_sales"] - row["asset_resale_tax"] - row["treasury_issuance"]),
             npc_payouts=int(row["npc_payouts"]), contract_payouts=int(row["contract_payouts"]),
             other_expenses=int(row["expenses"] - row["npc_payouts"] - row["contract_payouts"]),
             total_issued=int(row["total_issued"]), starter_grants=int(row["starter_grants"]),

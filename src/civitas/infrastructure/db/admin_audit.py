@@ -64,6 +64,17 @@ _AUDIT = text("""
         SELECT guild_id, actor_citizen_id, occurred_at, 'election.cancel.confirm', 'election', election_id, 'success', election_id
           FROM election_cancellation_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
+        SELECT guild_id, opened_by_citizen_id, opened_at, 'impeachment.open', 'impeachment', id, 'success', id
+          FROM impeachment_ballots WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, recorded_by_citizen_id, recorded_at, 'impeachment.record',
+               'impeachment', impeachment_id, 'success', impeachment_id
+          FROM impeachment_protocols WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, confirmed_by_citizen_id, confirmed_at, 'impeachment.confirm',
+               'impeachment', impeachment_id, 'success', impeachment_id
+          FROM impeachment_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
         SELECT guild_id, actor_citizen_id, created_at, 'asset.issue', 'asset', asset_id, 'success', id
           FROM asset_transfers WHERE guild_id = (SELECT id FROM guild_scope) AND kind = 'ISSUE'
         UNION ALL

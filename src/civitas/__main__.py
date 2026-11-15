@@ -154,13 +154,14 @@ async def run_bot(settings: Settings) -> None:
                 private_jobs_service=private_jobs,
                 currency_symbol=currency_symbol,
             )
-        if settings.asset_issuer_ids and funding is not None:
+        if funding is not None and (settings.asset_issuer_ids or settings.asset_resale_tax_bp is not None):
             assets = AssetService(
                 unit_of_work,
                 guild_id=settings.guild_id,
                 authorize=service.authorize,
                 staff_user_ids=settings.asset_issuer_ids,
                 funding=funding,
+                resale_tax_bp=settings.asset_resale_tax_bp,
             )
             add_asset_commands(
                 bot.tree, guild_scope=bot.guild_scope, asset_service=assets, currency_symbol=currency_symbol,

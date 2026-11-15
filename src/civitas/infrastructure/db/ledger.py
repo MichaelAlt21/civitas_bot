@@ -321,6 +321,23 @@ def _validate_accounts(
             return
         raise LedgerError(LedgerErrorReason.INVALID_POSTING)
 
+    if kind == TransactionKind.ASSET_RESALE:
+        prefix, _, offer_id = key.partition(":")
+        debits = [account.kind for account in accounts if entries[account.id] < 0]
+        credits = [account.kind for account in accounts if entries[account.id] > 0]
+        valid_credits = credits == [AccountKind.PERSONAL] or (
+            len(credits) == 2 and set(credits) == {AccountKind.PERSONAL, AccountKind.TREASURY}
+        )
+        if (
+            prefix == "asset_resale"
+            and offer_id.isascii() and offer_id.isdecimal() and not offer_id.startswith("0")
+            and int(offer_id) <= MAX_AMOUNT
+            and debits == [AccountKind.PERSONAL]
+            and valid_credits
+        ):
+            return
+        raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+
     if kind in {
         TransactionKind.COMPANY_FEE, TransactionKind.ORDER_FUND,
         TransactionKind.ORDER_SETTLE, TransactionKind.ORDER_REFUND,

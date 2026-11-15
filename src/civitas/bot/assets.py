@@ -1,4 +1,4 @@
-"""Discord commands for the primary state asset catalog."""
+"""Discord commands for state assets and directed personal asset resales."""
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -8,7 +8,7 @@ from discord import app_commands
 
 from civitas.app.assets import ASSET_PAGE_SIZE, AssetError, AssetService
 from civitas.app.citizens import CitizenshipAccessError
-from civitas.domain.assets import Asset, AssetKind
+from civitas.domain.assets import Asset, AssetKind, AssetResale, AssetResaleStatus
 from civitas.domain.ledger import LedgerError
 from civitas.domain.market import Company
 
@@ -89,13 +89,14 @@ async def _show_page(
     command: str,
     rows: list[str],
     hint: str | None = None,
+    empty_page_key: str = "assets.page.empty",
 ) -> None:
     locale = interaction.locale
     if not rows:
         if page == 1:
             reply = message(locale, f"assets.{section}.empty")
         else:
-            reply = message(locale, "assets.page.empty", page=str(page))
+            reply = message(locale, empty_page_key, page=str(page))
         await send_private_lines(interaction, reply)
         return
 
@@ -249,3 +250,144 @@ def add_asset_commands(
             await send_private_lines(
                 interaction, message(interaction.locale, "assets.issue.done", id=str(asset.id))
             )
+
+    if asset_service.resale_enabled:
+        _add_resale_commands(assets, guild_scope, asset_service, currency_symbol)
+
+
+def _resale_row(locale: discord.Locale, offer: AssetResale, currency_symbol: str) -> str:
+    return message(
+        locale,
+        "assets.resale.row",
+        id=str(offer.id),
+        asset_id=str(offer.asset_id),
+        price=f"{offer.price} {currency_symbol}",
+        status=message(locale, f"assets.resale.status.{offer.status.value.lower()}"),
+    )
+
+
+def _resale_terms(locale: discord.Locale, offer: AssetResale, currency_symbol: str) -> str:
+    return message(
+        locale,
+        "assets.resale.terms",
+        price=f"{offer.price} {currency_symbol}",
+        net=f"{offer.price - offer.tax} {currency_symbol}",
+        tax=f"{offer.tax} {currency_symbol}",
+    )
+
+
+def _resale_receipt(locale: discord.Locale, offer: AssetResale, currency_symbol: str) -> str:
+    return message(
+        locale,
+        "assets.resale.purchased",
+        asset_id=str(offer.asset_id),
+        price=f"{offer.price} {currency_symbol}",
+        transaction_id=str(offer.transaction_id),
+    )
+
+
+def _add_resale_commands(
+    assets: app_commands.Group,
+    guild_scope: discord.Object,
+    service: AssetService,
+    currency_symbol: str,
+) -> None:
+    @assets.command(name="sell", description=command_description("assets.sell"))
+    @app_commands.describe(
+        asset_id=command_description("assets.resale_asset_id"),
+        buyer=command_description("assets.resale_buyer"),
+        price=command_description("assets.price"),
+    )
+    async def sell(
+        interaction: discord.Interaction,
+        asset_id: app_commands.Range[int, 1],
+        buyer: discord.Member,
+        price: app_commands.Range[int, 1],
+    ) -> None:
+        locale = interaction.locale
+        async with _asset_response(interaction):
+            offer = await service.create_resale_offer(
+                interaction.guild_id,
+                interaction.user.id,
+                asset_id=asset_id,
+                buyer_user_id=buyer.id,
+                price=price,
+                idempotency_key=str(interaction.id),
+            )
+            await send_private_lines(
+                interaction,
+                message(locale, "assets.resale.created", id=str(offer.id), buyer=f"<@{buyer.id}>"),
+                _resale_row(locale, offer, currency_symbol),
+                _resale_terms(locale, offer, currency_symbol),
+            )
+
+    @assets.command(name="resale", description=command_description("assets.resale"))
+    @app_commands.describe(
+        offer_id=command_description("assets.resale_offer_id"), page=command_description("assets.page")
+    )
+    async def resale(
+        interaction: discord.Interaction,
+        offer_id: app_commands.Range[int, 1] | None = None,
+        page: app_commands.Range[int, 1] | None = None,
+    ) -> None:
+        locale = interaction.locale
+        async with _asset_response(interaction):
+            if offer_id is not None:
+                if page is not None:
+                    await send_private_lines(interaction, message(locale, "assets.resale.list_options_only"))
+                    return
+                offer = await service.get_resale_offer(interaction.guild_id, interaction.user.id, offer_id)
+                await send_private_lines(
+                    interaction, _resale_row(locale, offer, currency_symbol), _resale_terms(locale, offer, currency_symbol)
+                )
+                return
+
+            page_number = 1 if page is None else page
+            offers = await service.list_resale_offers(interaction.guild_id, interaction.user.id, page=page_number)
+            await _show_page(
+                interaction,
+                section="resale",
+                page=page_number,
+                command="/assets resale",
+                rows=[_resale_row(locale, offer, currency_symbol) for offer in offers],
+                hint=message(locale, "assets.resale.details_hint"),
+                empty_page_key="assets.resale.empty_page",
+            )
+
+    @assets.command(name="resale_buy", description=command_description("assets.resale_buy"))
+    @app_commands.describe(offer_id=command_description("assets.resale_offer_id"))
+    async def resale_buy(interaction: discord.Interaction, offer_id: app_commands.Range[int, 1]) -> None:
+        locale = interaction.locale
+        async with _asset_response(interaction):
+            quote = await service.quote_resale(interaction.guild_id, interaction.user.id, offer_id)
+            offer, asset = quote.offer, quote.asset
+            if offer.status == AssetResaleStatus.COMPLETED:
+                await send_private_lines(interaction, _resale_receipt(locale, offer, currency_symbol))
+                return
+
+            async def commit(click: discord.Interaction, _key: str) -> str:
+                try:
+                    receipt = await service.buy_resale(click.guild_id, click.user.id, offer.id)
+                except _ASSET_ERRORS as error:
+                    return _error_reply(click.locale, error)
+                return _resale_receipt(click.locale, receipt, currency_symbol)
+
+            confirmation = OperationConfirmation(
+                guild_id=guild_scope.id, actor_id=interaction.user.id, locale=locale, commit=commit,
+            )
+            await confirmation.show(
+                interaction,
+                "\n".join((
+                    message(locale, "assets.resale.preview", asset_id=str(offer.asset_id), name=_label(asset.name)),
+                    message(locale, "assets.resale.purpose", purpose=discord.utils.escape_markdown(asset.purpose)),
+                    _resale_row(locale, offer, currency_symbol),
+                    _resale_terms(locale, offer, currency_symbol),
+                )),
+            )
+
+    @assets.command(name="resale_cancel", description=command_description("assets.resale_cancel"))
+    @app_commands.describe(offer_id=command_description("assets.resale_offer_id"))
+    async def resale_cancel(interaction: discord.Interaction, offer_id: app_commands.Range[int, 1]) -> None:
+        async with _asset_response(interaction):
+            offer = await service.cancel_resale_offer(interaction.guild_id, interaction.user.id, offer_id)
+            await send_private_lines(interaction, message(interaction.locale, "assets.resale.cancelled", id=str(offer.id)))

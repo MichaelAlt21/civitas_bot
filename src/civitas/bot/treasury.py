@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError
-from civitas.app.treasury import TreasuryError, TreasuryService
+from civitas.app.treasury import CONTRACT_PAGE_SIZE, TreasuryError, TreasuryService
 from civitas.domain.ledger import LedgerError, LedgerErrorReason
 from civitas.domain.treasury import ContractBudget, StateContract
 
@@ -174,26 +174,34 @@ def add_treasury_commands(
             await send_private_lines(interaction, _contract_row(locale, draft, currency_symbol))
 
     @contracts.command(name="list", description=command_description("contracts.list"))
-    @app_commands.describe(contract_id=command_description("contracts.id"))
+    @app_commands.describe(contract_id=command_description("contracts.id"), page=command_description("contracts.page"))
     async def list_contracts(
-        interaction: discord.Interaction, contract_id: app_commands.Range[int, 1] | None = None
+        interaction: discord.Interaction, contract_id: app_commands.Range[int, 1] | None = None,
+        page: app_commands.Range[int, 1] | None = None,
     ) -> None:
         locale = interaction.locale
         guild_id, user_id = interaction.guild_id, interaction.user.id
         async with _treasury_response(interaction):
             if contract_id is not None:
+                if page is not None:
+                    await send_private_lines(interaction, message(locale, "contracts.list.choose_id_or_page"))
+                    return
                 contract = await treasury_service.get_contract(guild_id, user_id, contract_id)
                 await send_private_lines(interaction, *_contract_details(locale, contract, currency_symbol))
                 return
-            records = await treasury_service.list_contracts(guild_id, user_id)
+            page_number = 1 if page is None else page
+            records = await treasury_service.list_contracts(guild_id, user_id, page=page_number)
             if not records:
-                await send_private_lines(interaction, message(locale, "contracts.list.empty"))
+                empty_key = "contracts.list.empty" if page_number == 1 else "contracts.list.page_empty"
+                await send_private_lines(interaction, message(locale, empty_key, page=str(page_number)))
                 return
-            await send_private_lines(
-                interaction,
-                message(locale, "contracts.list.title"),
+            lines = [
+                message(locale, "contracts.list.title", page=str(page_number)),
                 *(_contract_row(locale, contract, currency_symbol) for contract in records),
-            )
+            ]
+            if len(records) == CONTRACT_PAGE_SIZE:
+                lines.append(message(locale, "contracts.list.next", page=str(page_number + 1)))
+            await send_private_lines(interaction, *lines)
 
     async def confirm_contract_action(
         interaction: discord.Interaction, contract_id: int, reason: str, *, action: str

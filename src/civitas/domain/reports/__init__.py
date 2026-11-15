@@ -43,6 +43,7 @@ class TreasuryReport:
     cash_reserved: int
     budget_limit: int | None
     budget_articles: tuple[BudgetArticleReport, ...]
+    asset_resale_tax: int = 0
 
     @property
     def available_cash(self) -> int:
@@ -50,7 +51,10 @@ class TreasuryReport:
 
     @property
     def total_income(self) -> int:
-        return self.company_fees + self.sales_tax + self.asset_sales + self.treasury_issuance + self.other_income
+        return (
+            self.company_fees + self.sales_tax + self.asset_sales + self.asset_resale_tax
+            + self.treasury_issuance + self.other_income
+        )
 
     @property
     def total_expenses(self) -> int:
@@ -58,6 +62,8 @@ class TreasuryReport:
 
     def to_payload(self) -> dict[str, Any]:
         payload = asdict(self)
+        if self.asset_resale_tax == 0:
+            del payload["asset_resale_tax"]
         payload["version"] = 1
         payload["window"] = {
             "week_start": self.window.week_start.isoformat(),

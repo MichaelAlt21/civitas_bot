@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
-from civitas.app.jobs import JobError, JobErrorReason, JobService, JobsRepository, JobsRules, budget_week
+from civitas.app.jobs import JOBS_PAGE_SIZE, JobError, JobErrorReason, JobService, JobsRepository, JobsRules, budget_week
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.jobs import BudgetCaps, BudgetPeriod, JobCategory, JobClaim, JobClaimStatus, JobTask
 from civitas.domain.ledger import Account, AccountKind, LedgerError, LedgerErrorReason, PostResult, TransactionKind
@@ -130,13 +130,26 @@ async def test_list_and_details_hide_private_submission_from_other_citizens(repo
     jobs = make_service(repository)
 
     assert await jobs.list_tasks(DISCORD_GUILD, OTHER.discord_user_id) == (TASK,)
-    repository.list_available_tasks.assert_awaited_once_with(DISCORD_GUILD, NOW, 10)
+    repository.list_available_tasks.assert_awaited_once_with(DISCORD_GUILD, NOW, JOBS_PAGE_SIZE, offset=0)
     assert (await jobs.get_task_details(DISCORD_GUILD, OTHER.discord_user_id, TASK.id)).claim is None
     assert (await jobs.get_task_details(DISCORD_GUILD, PLAYER.discord_user_id, TASK.id)).claim == SUBMISSION
     assert (await jobs.get_review(DISCORD_GUILD, REVIEWER.discord_user_id, TASK.id)).claim == SUBMISSION
     assert await jobs.list_submitted_task_ids(DISCORD_GUILD, REVIEWER.discord_user_id) == (TASK.id,)
+    repository.list_submitted_task_ids.assert_awaited_once_with(DISCORD_GUILD, JOBS_PAGE_SIZE, offset=0)
     with pytest.raises(JobError, match=JobErrorReason.STAFF_REQUIRED):
         await jobs.get_review(DISCORD_GUILD, PLAYER.discord_user_id, TASK.id)
+
+
+@pytest.mark.asyncio
+async def test_invalid_npc_job_pages_are_rejected_before_querying(repository: AsyncMock) -> None:
+    jobs = make_service(repository)
+
+    with pytest.raises(JobError, match=JobErrorReason.INVALID_PAGE):
+        await jobs.list_tasks(DISCORD_GUILD, PLAYER.discord_user_id, page=0)
+    with pytest.raises(JobError, match=JobErrorReason.INVALID_PAGE):
+        await jobs.list_submitted_task_ids(DISCORD_GUILD, REVIEWER.discord_user_id, page=2**63)
+    repository.list_available_tasks.assert_not_awaited()
+    repository.list_submitted_task_ids.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -146,8 +146,12 @@ async def test_report_reads_persisted_period_boundaries_and_public_totals():
     assert report.opening_balance + report.total_income - report.total_expenses == report.closing_balance
     assert report.available_cash == 315
     assert report.transaction_count == 5
+    assert "asset_resale_tax" not in report.to_payload()
     assert TreasuryReport.from_payload(json.loads(json.dumps(report.to_payload()))) == report
     assert set(report.to_payload()["budget_articles"][0]) == {"code", "cap", "spent", "reserved"}
+    with_resale_tax = replace(report, asset_resale_tax=4, closing_balance=report.closing_balance + 4)
+    assert with_resale_tax.total_income == report.total_income + 4
+    assert TreasuryReport.from_payload(json.loads(json.dumps(with_resale_tax.to_payload()))) == with_resale_tax
 
 
 @pytest.mark.asyncio

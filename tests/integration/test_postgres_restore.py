@@ -54,6 +54,10 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         ),
         "assets": "SELECT id, status, owner_citizen_id, owner_company_id FROM assets ORDER BY id",
         "titles": "SELECT asset_id, kind, buyer_company_id, transaction_id FROM asset_transfers ORDER BY asset_id, kind",
+        "asset_resales": (
+            "SELECT id, asset_id, seller_citizen_id, buyer_citizen_id, price, tax_bp, status, transaction_id "
+            "FROM asset_resales ORDER BY id"
+        ),
         "receipt_preferences": "SELECT citizen_id, locale FROM receipt_preferences ORDER BY citizen_id",
         "receipts": "SELECT transaction_id, citizen_id, locale, sent_at FROM private_receipts ORDER BY id",
         "maintenance": "SELECT guild_id, read_only FROM economy_maintenance ORDER BY guild_id",
@@ -79,6 +83,18 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
         "cancellation_confirmations": (
             "SELECT election_id, actor_citizen_id, occurred_at, reason "
             "FROM election_cancellation_confirmations ORDER BY election_id"
+        ),
+        "impeachment_ballots": (
+            "SELECT id, term_id, eligible_citizen_ids, quorum, opened_by_citizen_id, opened_at, request_key "
+            "FROM impeachment_ballots ORDER BY id"
+        ),
+        "impeachment_protocols": (
+            "SELECT impeachment_id, source_url, participants, votes_for, recorded_by_citizen_id, recorded_at, public_reason "
+            "FROM impeachment_protocols ORDER BY impeachment_id"
+        ),
+        "impeachment_confirmations": (
+            "SELECT term_id, impeachment_id, confirmed_by_citizen_id, confirmed_at, confirmation_reason "
+            "FROM impeachment_confirmations ORDER BY term_id"
         ),
     }
     async with engine.connect() as connection:
@@ -143,7 +159,7 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert await market.company_balance(101, 201, company.id) == 180
     assert await wallet.balance(101, 202) == 80
     assets = AssetService(
-        uow, guild_id=101, authorize=citizens.authorize, staff_user_ids={202}, funding=funding,
+        uow, guild_id=101, authorize=citizens.authorize, staff_user_ids={202}, funding=funding, resale_tax_bp=200,
     )
     asset = await assets.issue_asset(
         101, 202, kind=AssetKind.OFFICE, name="Fixture office", purpose="Fictional company workspace",
@@ -186,6 +202,19 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert await wallet.balance(101, 202) == 120
     assert await market.company_balance(101, 201, company.id) == 100
 
+    personal_asset = await assets.issue_asset(
+        101, 202, kind=AssetKind.HOUSING, name="Fixture apartment", purpose="Fictional residence",
+        price=50, reason="Approved test catalogue", idempotency_key="restore-personal-issue",
+    )
+    personal_quote = await assets.quote_asset(101, 202, personal_asset.id)
+    await assets.buy_asset(101, 202, personal_quote, idempotency_key="restore-personal-buy")
+    resale = await assets.create_resale_offer(
+        101, 202, asset_id=personal_asset.id, buyer_user_id=203, price=200, idempotency_key="restore-resale",
+    )
+    completed_resale = await assets.buy_resale(101, 203, resale.id)
+    assert await wallet.balance(101, 202) == 266
+    assert await wallet.balance(101, 203) == 50
+
     election_now = now
     election_rules = ElectionRules(
         min_eligible=3, quorum_bp=4_000, quorum_min=2, parliament_seats=1,
@@ -199,6 +228,25 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
         )
 
     politics = government(pg_engine)
+    former = await politics.open_election(
+        101, 202, office=OfficeKind.PRESIDENT, candidate_user_ids=(201,),
+        reason="Fixture former presidential term", idempotency_key="restore-former-president",
+    )
+    election_now = former.closes_at
+    await politics.record_protocol(
+        101, 202, former.id, source_url="https://poll.example.test/former-president",
+        participants=2, tallies={201: 2}, reason="Recorded initial presidential poll",
+    )
+    await politics.certify_election(101, 203, former.id, reason="Independent first presidential check")
+    election_now += timedelta(minutes=1)
+    ballot = await politics.open_impeachment(101, 202, idempotency_key="restore-impeachment")
+    await politics.record_impeachment(
+        101, 202, ballot.id, source_url="https://poll.example.test/impeachment",
+        participants=3, votes_for=2, reason="Recorded public confidence vote",
+    )
+    impeachment = await politics.confirm_impeachment(101, 203, ballot.id, reason="Verified confidence vote")
+    assert impeachment.confirmed_at == election_now
+    assert await politics.list_offices(101, 201) == ()
     president = await politics.open_election(
         101, 202, office=OfficeKind.PRESIDENT, candidate_user_ids=(201,),
         reason="Fixture presidential election", idempotency_key="restore-president",
@@ -233,6 +281,10 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert [(row.offer_id, row.status) for row in expected["orders"]] == [(offer.id, "COMPLETED")]
     assert expected["offer_withdrawals"] == [(
         offer.id, offer.guild_id, company.owner_citizen_id, withdrawal.withdrawn_at, withdrawal.reason,
+    )]
+    assert expected["asset_resales"] == [(
+        resale.id, personal_asset.id, resale.seller_citizen_id, resale.buyer_citizen_id,
+        200, 200, "COMPLETED", completed_resale.transaction_id,
     )]
     assert expected["receipts"] and all(row.locale == "ru" for row in expected["receipts"])
     assert [row.read_only for row in expected["maintenance"]] == [True]
@@ -271,6 +323,11 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             try:
                 assert await _snapshot(restored) == expected
                 restored_politics = government(restored)
+                restored_impeachment = await restored_politics.get_public_impeachment(101, 201, ballot.id)
+                assert restored_impeachment.confirmed_at == impeachment.confirmed_at
+                assert await restored_politics.confirm_impeachment(
+                    101, 203, ballot.id, reason="Verified confidence vote",
+                ) == impeachment
                 assert await restored_politics.get_public_result(101, 201, president.id) == certified
                 (term,) = await restored_politics.list_offices(101, 201)
                 assert (term.election_id, term.holder_discord_user_id) == (president.id, 201)
@@ -309,11 +366,13 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
                 assert await restored_market.accept_order(101, 202, sale.id) == sale
                 restored_assets = AssetService(
                     PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
-                    staff_user_ids={202}, funding=funding,
+                    staff_user_ids={202}, funding=funding, resale_tax_bp=200,
                 )
                 assert [
                     item.id for item in await restored_assets.list_owned_assets(101, 201, company_id=company.id)
                 ] == [asset.id]
+                assert [item.id for item in await restored_assets.list_owned_assets(101, 203)] == [personal_asset.id]
+                assert await restored_assets.buy_resale(101, 203, resale.id) == completed_resale
                 restored_treasury = TreasuryService(
                     PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
                     initiator_user_ids={202}, approver_user_ids={203},

@@ -59,6 +59,25 @@ async def _open_wallets(unit_of_work: PostgresLedgerUnitOfWork, amount: int) -> 
     return Wallets(guild, source.id, buyer.id, receiver.id, second.id, treasury.id, issuer.id)
 
 
+async def test_asset_resale_posting_rejects_wrong_accounts_and_noncanonical_keys(pg_engine: AsyncEngine) -> None:
+    unit_of_work = PostgresLedgerUnitOfWork(pg_engine)
+    wallets = await _open_wallets(unit_of_work, 250)
+    for key, entries in (
+        ("asset_resale:1", {wallets.buyer: -200, wallets.treasury: 200}),
+        ("asset_resale:1", {wallets.buyer: -200, wallets.seller: 196, wallets.another_recipient: 4}),
+        ("asset_resale:01", {wallets.buyer: -200, wallets.seller: 196, wallets.treasury: 4}),
+    ):
+        with pytest.raises(LedgerError, match=LedgerErrorReason.INVALID_POSTING):
+            async with unit_of_work() as repository:
+                await repository.post(
+                    wallets.guild, TransactionKind.ASSET_RESALE, key, entries,
+                    actor_citizen_id=wallets.buyer_citizen, reason="asset_resale",
+                )
+    async with unit_of_work() as repository:
+        assert await repository.get_balance(wallets.buyer) == 250
+        assert await repository.get_balance(wallets.seller) == 0
+
+
 async def test_three_entry_settlement_replay_and_reconciliation(pg_engine: AsyncEngine) -> None:
     unit_of_work = PostgresLedgerUnitOfWork(pg_engine)
     wallets = await _open_wallets(unit_of_work, 250)

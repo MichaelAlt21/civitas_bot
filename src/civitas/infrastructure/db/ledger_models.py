@@ -83,7 +83,7 @@ class FinancialTransactionRow(Base):
         ),
         CheckConstraint(
             "kind IN ('GENESIS', 'STARTER_GRANT', 'TRANSFER', 'NPC_PAYOUT', "
-            "'COMPANY_FEE', 'ORDER_FUND', 'ORDER_SETTLE', 'ORDER_REFUND', 'ASSET_PURCHASE', "
+            "'COMPANY_FEE', 'ORDER_FUND', 'ORDER_SETTLE', 'ORDER_REFUND', 'ASSET_PURCHASE', 'ASSET_RESALE', "
             "'STATE_CONTRACT_PAYOUT', 'PRIVATE_JOB_FUND', 'PRIVATE_JOB_PAY', 'PRIVATE_JOB_REFUND')",
             name="ck_financial_transactions_kind",
         ),

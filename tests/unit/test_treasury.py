@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from civitas.app.citizens import CitizensService
-from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryRepository, TreasuryRules, TreasuryService
+from civitas.app.treasury import CONTRACT_PAGE_SIZE, TreasuryError, TreasuryErrorReason, TreasuryRepository, TreasuryRules, TreasuryService
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.government import OfficeKind
 from civitas.domain.jobs import BudgetCaps, BudgetPeriod
-from civitas.domain.ledger import Account, AccountKind, PostResult, TransactionKind
+from civitas.domain.ledger import MAX_AMOUNT, Account, AccountKind, PostResult, TransactionKind
 from civitas.domain.market import Company
 from civitas.domain.treasury import ContractBudget, ContractStatus, StateContract
 
@@ -298,4 +298,31 @@ async def test_contract_proof_is_only_returned_to_parties_and_staff(repository, 
         await service.get_contract(DISCORD_GUILD, OUTSIDER.discord_user_id, DRAFT.id)
     assert (await service.get_contract(DISCORD_GUILD, RECIPIENT.discord_user_id, DRAFT.id)).evidence == SUBMITTED.evidence
     assert await service.list_contracts(DISCORD_GUILD, OUTSIDER.discord_user_id) == ()
-    repository.list_contracts.assert_awaited_once_with(GUILD, OUTSIDER.id, include_all=False, limit=10)
+    repository.list_contracts.assert_awaited_once_with(
+        GUILD, OUTSIDER.id, include_all=False, limit=CONTRACT_PAGE_SIZE, offset=0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_contract_page_is_bounded_and_elected_visibility_is_current(repository, service_factory):
+    service = service_factory(elected=True)
+    largest_page = MAX_AMOUNT // CONTRACT_PAGE_SIZE + 1
+    for invalid_page in (0, True, largest_page + 1):
+        with pytest.raises(TreasuryError, match=TreasuryErrorReason.INVALID_PAGE):
+            await service.list_contracts(DISCORD_GUILD, APPROVER.discord_user_id, page=invalid_page)
+    repository.get_citizens.assert_not_awaited()
+
+    repository.list_contracts.return_value = ()
+    repository.has_active_office.side_effect = lambda guild, citizen, office, at: office == OfficeKind.PARLIAMENT
+    assert await service.list_contracts(DISCORD_GUILD, APPROVER.discord_user_id, page=2) == ()
+    repository.list_contracts.assert_awaited_once_with(
+        GUILD, APPROVER.id, include_all=True, limit=CONTRACT_PAGE_SIZE, offset=CONTRACT_PAGE_SIZE,
+    )
+
+    repository.has_active_office.side_effect = None
+    repository.has_active_office.return_value = False
+    assert await service.list_contracts(DISCORD_GUILD, APPROVER.discord_user_id, page=largest_page) == ()
+    repository.list_contracts.assert_awaited_with(
+        GUILD, APPROVER.id, include_all=False, limit=CONTRACT_PAGE_SIZE,
+        offset=(largest_page - 1) * CONTRACT_PAGE_SIZE,
+    )

@@ -11,7 +11,7 @@ from discord import app_commands
 
 from civitas.app.citizens import CitizenshipAccessError, is_discord_id
 from civitas.app.government import GovernmentError, GovernmentErrorReason, GovernmentService
-from civitas.domain.government import CrisisResolution, Election, ElectionCancellation, OfficeKind, OfficeTerm
+from civitas.domain.government import CrisisResolution, Election, ElectionCancellation, Impeachment, OfficeKind, OfficeTerm
 
 from .localization import command_description, message
 from .responses import send_lines, send_private_lines
@@ -161,10 +161,58 @@ def _cancellation_reply(locale: discord.Locale, cancellation: ElectionCancellati
     return message(locale, f"election.cancel.{status}", id=str(cancellation.election_id))
 
 
+def _public_reason(reason: str) -> str:
+    flattened = " ".join(reason.split()).replace("<", "‹").replace(">", "›")
+    return discord.utils.escape_mentions(discord.utils.escape_markdown(flattened, ignore_links=False))
+
+
 def _cancellation_reason(locale: discord.Locale, cancellation: ElectionCancellation) -> str:
-    reason = " ".join(cancellation.public_reason.split()).replace("<", "‹").replace(">", "›")
-    reason = discord.utils.escape_mentions(discord.utils.escape_markdown(reason, ignore_links=False))
-    return message(locale, "election.cancel.public_reason", reason=reason)
+    return message(locale, "election.cancel.public_reason", reason=_public_reason(cancellation.public_reason))
+
+
+def _impeachment_details(locale: discord.Locale, record: Impeachment) -> list[str]:
+    rows = [
+        message(locale, "impeachment.title", id=str(record.id), president=f"<@{record.president_discord_user_id}>"),
+        message(locale, "impeachment.opened", date=discord.utils.format_dt(record.opened_at, style="f")),
+        message(locale, "impeachment.threshold", quorum=str(record.quorum)),
+    ]
+    if record.eligible_citizen_ids:
+        rows.append(message(locale, "impeachment.eligible", count=str(len(record.eligible_citizen_ids))))
+    if record.source_url is None:
+        rows.append(message(locale, "impeachment.awaiting_record"))
+        return rows
+
+    source = record.source_url.replace("<", "%3C").replace(">", "%3E")
+    rows.extend((
+        message(locale, "election.detail.source", url=source),
+        message(locale, "impeachment.totals", participants=str(record.participants), votes_for=str(record.votes_for)),
+    ))
+    if record.public_reason:
+        rows.append(message(locale, "impeachment.public_reason", reason=_public_reason(record.public_reason)))
+    if record.confirmed_at is not None:
+        rows.append(message(locale, "impeachment.confirmed", date=discord.utils.format_dt(record.confirmed_at, style="f")))
+    elif record.has_support:
+        rows.append(message(locale, "impeachment.awaiting_confirmation"))
+    else:
+        rows.append(message(locale, "impeachment.insufficient_support"))
+    return rows
+
+
+async def _send_voter_page(
+    interaction: discord.Interaction, snapshot: tuple[int, ...], *, page: int, record_id: int, title_key: str,
+) -> None:
+    locale = interaction.locale
+    offset = (page - 1) * _VOTER_PAGE_SIZE
+    ids = snapshot[offset:offset + _VOTER_PAGE_SIZE]
+    if not ids:
+        await send_private_lines(interaction, message(locale, "election.voters.empty", page=str(page)))
+        return
+    pages = (len(snapshot) + _VOTER_PAGE_SIZE - 1) // _VOTER_PAGE_SIZE
+    await send_private_lines(
+        interaction,
+        message(locale, title_key, id=str(record_id), count=str(len(snapshot)), page=str(page), pages=str(pages)),
+        "```\n" + "\n".join(str(user_id) for user_id in ids) + "\n```",
+    )
 
 
 @asynccontextmanager
@@ -264,22 +312,8 @@ def add_government_commands(
         interaction: discord.Interaction, election_id: app_commands.Range[int, 1], page: app_commands.Range[int, 1] = 1,
     ) -> None:
         async with _commission_response(interaction):
-            locale = interaction.locale
             snapshot = await government_service.list_voter_snapshot(interaction.guild_id, interaction.user.id, election_id)
-            offset = (page - 1) * _VOTER_PAGE_SIZE
-            ids = snapshot[offset:offset + _VOTER_PAGE_SIZE]
-            if not ids:
-                await send_private_lines(interaction, message(locale, "election.voters.empty", page=str(page)))
-                return
-            pages = (len(snapshot) + _VOTER_PAGE_SIZE - 1) // _VOTER_PAGE_SIZE
-            await send_private_lines(
-                interaction,
-                message(
-                    locale, "election.voters.title", id=str(election_id), count=str(len(snapshot)),
-                    page=str(page), pages=str(pages),
-                ),
-                "```\n" + "\n".join(str(user_id) for user_id in ids) + "\n```",
-            )
+            await _send_voter_page(interaction, snapshot, page=page, record_id=election_id, title_key="election.voters.title")
 
     @commission.command(name="open", description=command_description("election.commission.open"))
     @app_commands.choices(office=_office_choices())
@@ -404,6 +438,95 @@ def add_government_commands(
                 interaction.guild_id, interaction.user.id, election_id, reason=reason,
             )
             await send_private_lines(interaction, _cancellation_reply(interaction.locale, cancellation))
+
+    _add_impeachment_commands(government, commission, guild_scope, government_service)
+
+
+def _add_impeachment_commands(
+    government: app_commands.Group, commission: app_commands.Group, guild_scope: discord.Object,
+    service: GovernmentService,
+) -> None:
+    @government.command(name="impeachment", description=command_description("government.impeachment"))
+    @app_commands.describe(impeachment_id=command_description("impeachment.id"))
+    async def public_impeachment(
+        interaction: discord.Interaction, impeachment_id: app_commands.Range[int, 1],
+    ) -> None:
+        if not await _in_guild(interaction, guild_scope):
+            return
+        await interaction.response.defer(thinking=True)
+        locale = interaction.locale
+        try:
+            record = await service.get_public_impeachment(interaction.guild_id, interaction.user.id, impeachment_id)
+        except GovernmentError as error:
+            if error.reason != GovernmentErrorReason.IMPEACHMENT_NOT_FOUND:
+                raise
+            await send_lines(interaction, message(locale, "election.error.impeachment_not_found"), ephemeral=False)
+            return
+        await send_lines(interaction, *_impeachment_details(locale, record), ephemeral=False)
+
+    @commission.command(name="open_impeachment", description=command_description("election.commission.open_impeachment"))
+    async def open_impeachment(interaction: discord.Interaction) -> None:
+        async with _commission_response(interaction):
+            record = await service.open_impeachment(
+                interaction.guild_id, interaction.user.id, idempotency_key=str(interaction.id),
+            )
+            locale = interaction.locale
+            await send_private_lines(
+                interaction, *_impeachment_details(locale, record),
+                message(locale, "impeachment.public_record_hint", id=str(record.id)),
+            )
+
+    @commission.command(
+        name="impeachment_voters", description=command_description("election.commission.impeachment_voters"),
+    )
+    @app_commands.describe(
+        impeachment_id=command_description("impeachment.id"), page=command_description("election.voters.page"),
+    )
+    async def impeachment_voters(
+        interaction: discord.Interaction, impeachment_id: app_commands.Range[int, 1],
+        page: app_commands.Range[int, 1] = 1,
+    ) -> None:
+        async with _commission_response(interaction):
+            snapshot = await service.list_impeachment_voters(interaction.guild_id, interaction.user.id, impeachment_id)
+            await _send_voter_page(
+                interaction, snapshot, page=page, record_id=impeachment_id, title_key="impeachment.voters.title",
+            )
+
+    @commission.command(
+        name="record_impeachment", description=command_description("election.commission.record_impeachment"),
+    )
+    @app_commands.describe(
+        impeachment_id=command_description("impeachment.id"), source_url=command_description("impeachment.source_url"),
+        participants=command_description("election.participants"), votes_for=command_description("impeachment.votes_for"),
+        reason=command_description("impeachment.public_reason"),
+    )
+    async def record_impeachment(
+        interaction: discord.Interaction, impeachment_id: app_commands.Range[int, 1],
+        source_url: app_commands.Range[str, 1, 500], participants: app_commands.Range[int, 0],
+        votes_for: app_commands.Range[int, 0], reason: app_commands.Range[str, 1, 200],
+    ) -> None:
+        async with _commission_response(interaction):
+            record = await service.record_impeachment(
+                interaction.guild_id, interaction.user.id, impeachment_id,
+                source_url=source_url, participants=participants, votes_for=votes_for, reason=reason,
+            )
+            await send_private_lines(interaction, *_impeachment_details(interaction.locale, record))
+
+    @commission.command(
+        name="confirm_impeachment", description=command_description("election.commission.confirm_impeachment"),
+    )
+    @app_commands.describe(
+        impeachment_id=command_description("impeachment.id"), reason=command_description("election.reason"),
+    )
+    async def confirm_impeachment(
+        interaction: discord.Interaction, impeachment_id: app_commands.Range[int, 1],
+        reason: app_commands.Range[str, 1, 200],
+    ) -> None:
+        async with _commission_response(interaction):
+            record = await service.confirm_impeachment(
+                interaction.guild_id, interaction.user.id, impeachment_id, reason=reason,
+            )
+            await send_private_lines(interaction, *_impeachment_details(interaction.locale, record))
 
 
 async def _reconcile_office_roles(

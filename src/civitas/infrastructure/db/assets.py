@@ -6,11 +6,14 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetStatus
+from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetResale, AssetResaleStatus, AssetStatus
+from civitas.domain.citizens import Citizen
 
-from .asset_models import AssetRow, AssetTransferRow
+from .asset_models import AssetResaleRow, AssetRow, AssetTransferRow
+from .citizens import _to_citizen
 from .market import PostgresMarketRepository
 from .market_models import OrganizationRow
+from .models import CitizenRow
 
 
 def _to_asset(row: AssetRow) -> Asset:
@@ -44,6 +47,23 @@ def _to_purchase(row: AssetTransferRow) -> AssetPurchase:
         request_key=row.request_key,
         transaction_id=row.transaction_id,
         purchased_at=row.created_at.astimezone(UTC),
+    )
+
+
+def _to_resale(row: AssetResaleRow) -> AssetResale:
+    return AssetResale(
+        id=row.id,
+        guild_id=row.guild_id,
+        asset_id=row.asset_id,
+        seller_citizen_id=row.seller_citizen_id,
+        buyer_citizen_id=row.buyer_citizen_id,
+        price=row.price,
+        tax_bp=row.tax_bp,
+        request_key=row.request_key,
+        created_at=row.created_at.astimezone(UTC),
+        status=AssetResaleStatus(row.status),
+        transaction_id=row.transaction_id,
+        closed_at=row.closed_at.astimezone(UTC) if row.closed_at is not None else None,
     )
 
 
@@ -182,6 +202,66 @@ class PostgresAssetRepository(PostgresMarketRepository):
                 owner_citizen_id=owner_citizen_id,
                 owner_company_id=owner_company_id,
             )
+        )
+
+    async def get_resale_citizens(self, guild_id: int, citizen_ids: tuple[int, ...]) -> tuple[Citizen, ...]:
+        rows = await self._session.scalars(
+            select(CitizenRow)
+            .where(CitizenRow.guild_id == guild_id, CitizenRow.id.in_(citizen_ids))
+            .order_by(CitizenRow.id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+        return tuple(_to_citizen(row) for row in rows)
+
+    async def get_resale_offer(self, guild_id: int, offer_id: int, *, lock: bool = False) -> AssetResale | None:
+        statement = select(AssetResaleRow).where(AssetResaleRow.guild_id == guild_id, AssetResaleRow.id == offer_id)
+        if lock:
+            statement = statement.with_for_update(key_share=True).execution_options(populate_existing=True)
+        row = await self._session.scalar(statement)
+        return _to_resale(row) if row is not None else None
+
+    async def get_resale_offer_by_key(self, guild_id: int, key: str) -> AssetResale | None:
+        row = await self._session.scalar(
+            select(AssetResaleRow).where(AssetResaleRow.guild_id == guild_id, AssetResaleRow.request_key == key)
+        )
+        return _to_resale(row) if row is not None else None
+
+    async def create_resale_offer(
+        self, *, guild_id: int, asset_id: int, seller_citizen_id: int, buyer_citizen_id: int,
+        price: int, tax_bp: int, request_key: str, created_at: datetime,
+    ) -> AssetResale | None:
+        row = await self._session.scalar(
+            insert(AssetResaleRow)
+            .values(
+                guild_id=guild_id, asset_id=asset_id, seller_citizen_id=seller_citizen_id,
+                buyer_citizen_id=buyer_citizen_id, price=price, tax_bp=tax_bp, request_key=request_key,
+                created_at=created_at, status=AssetResaleStatus.OPEN.value,
+            )
+            .on_conflict_do_nothing()
+            .returning(AssetResaleRow)
+        )
+        return _to_resale(row) if row is not None else None
+
+    async def list_resale_offers(
+        self, guild_id: int, citizen_id: int, limit: int, *, offset: int = 0,
+    ) -> tuple[AssetResale, ...]:
+        rows = await self._session.scalars(
+            select(AssetResaleRow)
+            .where(AssetResaleRow.guild_id == guild_id, or_(
+                AssetResaleRow.seller_citizen_id == citizen_id, AssetResaleRow.buyer_citizen_id == citizen_id,
+            ))
+            .order_by(AssetResaleRow.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        return tuple(_to_resale(row) for row in rows)
+
+    async def update_resale_offer(self, offer: AssetResale) -> None:
+        await self._session.execute(
+            update(AssetResaleRow)
+            .where(AssetResaleRow.guild_id == offer.guild_id, AssetResaleRow.id == offer.id)
+            .values(status=offer.status.value, transaction_id=offer.transaction_id, closed_at=offer.closed_at)
         )
 
 

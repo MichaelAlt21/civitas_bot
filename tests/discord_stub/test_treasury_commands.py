@@ -7,7 +7,7 @@ import discord
 import pytest
 from discord import app_commands
 
-from civitas.app.treasury import TreasuryError, TreasuryErrorReason, TreasuryService
+from civitas.app.treasury import CONTRACT_PAGE_SIZE, TreasuryError, TreasuryErrorReason, TreasuryService
 from civitas.bot.localization import CommandTranslator, message
 from civitas.bot.treasury import add_treasury_commands
 from civitas.domain.ledger import LedgerError, LedgerErrorReason, TransactionKind
@@ -146,6 +146,38 @@ async def test_proof_is_omitted_from_list_and_shown_only_in_private_authorized_d
     denial = private_reply(outsider)
     assert denial == message(outsider.locale, "treasury.error.not_contract_party")
     assert DRAFT.title not in denial and "Private proof" not in denial
+
+
+@pytest.mark.asyncio
+async def test_contract_list_pages_stay_private_and_separate_from_id_lookup(commands):
+    service, _, _, contracts = commands
+    records = tuple(replace(DRAFT, id=index) for index in range(12, 0, -1))
+
+    def list_page(guild_id, actor, *, page):
+        assert (guild_id, actor) == (GUILD_ID, RECIPIENT_ID)
+        start = (page - 1) * CONTRACT_PAGE_SIZE
+        return records[start:start + CONTRACT_PAGE_SIZE]
+
+    service.list_contracts.side_effect = list_page
+    callback = contracts.get_command("list").callback
+    first = interaction(actor=RECIPIENT_ID)
+    second = interaction(actor=RECIPIENT_ID, locale=discord.Locale.american_english)
+    empty = interaction(actor=RECIPIENT_ID)
+    conflicting = interaction(actor=RECIPIENT_ID)
+    await callback(first)
+    await callback(second, page=2)
+    await callback(empty, page=3)
+    await callback(conflicting, contract_id=2, page=1)
+
+    first_reply, second_reply = private_reply(first), private_reply(second)
+    assert "Страница 1" in first_reply and "`/contracts list page:2`" in first_reply
+    assert "Контракт № 12 ·" in first_reply and "Контракт № 2 ·" not in first_reply
+    assert "Page 2" in second_reply and "Contract #2 ·" in second_reply and "Contract #1 ·" in second_reply
+    assert "Contract #12 ·" not in second_reply
+    assert private_reply(empty) == "На странице 3 нет контрактов."
+    assert private_reply(conflicting) == "Укажите номер контракта или страницу списка."
+    service.get_contract.assert_not_awaited()
+    assert service.list_contracts.await_count == 3
 
 
 @pytest.mark.parametrize(("command_name", "preview_action", "method", "before", "after"), [
