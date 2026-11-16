@@ -14,7 +14,9 @@ from civitas.domain.government import (
     OfficeRoleAssignment, OfficeTerm,
 )
 
+from .admission_models import AdmittedUserRow
 from .citizens import _to_citizen
+from .court_appeal_models import CourtAppealOpeningRow
 from .government_models import (
     ElectionCancellationConfirmationRow, ElectionCancellationProposalRow, ElectionCertificationRow,
     ElectionCrisisConfirmationRow, ElectionCrisisProposalRow, ElectionPollSourceRow, ElectionProtocolRow,
@@ -110,6 +112,20 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             select(CitizenRow).where(
                 CitizenRow.guild_id == guild_id, CitizenRow.status == CitizenStatus.VERIFIED.value
             ).order_by(CitizenRow.id)
+        )
+        return tuple(_to_citizen(row) for row in rows)
+
+    async def list_verified_admitted_citizens(self, guild_id: int) -> tuple[Citizen, ...]:
+        rows = await self._session.scalars(
+            select(CitizenRow)
+            .join(GuildRow, GuildRow.id == CitizenRow.guild_id)
+            .join(
+                AdmittedUserRow,
+                (AdmittedUserRow.discord_guild_id == GuildRow.discord_guild_id)
+                & (AdmittedUserRow.discord_user_id == CitizenRow.discord_user_id),
+            )
+            .where(CitizenRow.guild_id == guild_id, CitizenRow.status == CitizenStatus.VERIFIED.value)
+            .order_by(CitizenRow.id)
         )
         return tuple(_to_citizen(row) for row in rows)
 
@@ -257,7 +273,8 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
 
     async def bind_poll_source(self, guild_id: int, election_id: int, source_url: str) -> bool:
         await self.lock_election_cycle(guild_id)
-        if await self._impeachment_source_owner(guild_id, source_url) is not None:
+        if (await self._impeachment_source_owner(guild_id, source_url) is not None
+                or await self._appeal_source_owner(guild_id, source_url) is not None):
             return False
         inserted = await self._session.scalar(
             pg_insert(ElectionPollSourceRow).values(
@@ -277,13 +294,18 @@ class PostgresGovernmentRepository(PostgresPrivateJobRepository):
             func.civitas_election_source_key(ImpeachmentProtocolRow.source_url) == source_url,
         ))
 
+    async def _appeal_source_owner(self, guild_id: int, source_url: str) -> int | None:
+        return await self._session.scalar(select(CourtAppealOpeningRow.case_id).where(
+            CourtAppealOpeningRow.guild_id == guild_id, CourtAppealOpeningRow.source_url == source_url,
+        ))
+
     async def bind_impeachment_source(self, guild_id: int, impeachment_id: int, source_url: str) -> bool:
         """Hold the guild cycle lock until the caller inserts the protocol."""
         await self.lock_election_cycle(guild_id)
         election_owner = await self._session.scalar(select(ElectionPollSourceRow.election_id).where(
             ElectionPollSourceRow.guild_id == guild_id, ElectionPollSourceRow.source_url == source_url,
         ))
-        if election_owner is not None:
+        if election_owner is not None or await self._appeal_source_owner(guild_id, source_url) is not None:
             return False
         owner = await self._impeachment_source_owner(guild_id, source_url)
         return owner is None or owner == impeachment_id

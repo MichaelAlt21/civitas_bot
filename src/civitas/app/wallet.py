@@ -5,6 +5,7 @@ from contextlib import AbstractAsyncContextManager
 from enum import StrEnum
 from typing import Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import is_discord_id
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.ledger import (
@@ -122,12 +123,12 @@ class WalletService:
         unit_of_work: Callable[[], AbstractAsyncContextManager[WalletRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         funding: WalletFunding,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._funding = funding
 
     async def initialize_guild(self) -> None:
@@ -136,16 +137,16 @@ class WalletService:
             await self._funding.initialize_guild(repository, guild_id)
 
     async def fund_citizen(self, guild_id: int | None, user_id: int) -> None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             await self._personal_account(repository, user_id)
 
     async def balance(self, guild_id: int | None, user_id: int) -> int:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         return await self._read_wallet(user_id, lambda repo, account_id: repo.get_balance(account_id), empty=0)
 
     async def history(self, guild_id: int | None, user_id: int) -> tuple[HistoryEntry, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         return await self._read_wallet(
             user_id, lambda repo, account_id: repo.get_history(account_id, HISTORY_LIMIT), empty=(),
         )
@@ -174,7 +175,7 @@ class WalletService:
     async def prepare_transfer(
         self, guild_id: int | None, user_id: int, recipient_user_id: int, amount: int
     ) -> None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._validate_transfer(user_id, recipient_user_id, amount)
         async with self._unit_of_work() as repository:
             source, _ = await self._transfer_accounts(repository, user_id, recipient_user_id)
@@ -190,7 +191,7 @@ class WalletService:
         *,
         idempotency_key: str,
     ) -> PostResult:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._validate_transfer(user_id, recipient_user_id, amount)
         if (
             not isinstance(idempotency_key, str)

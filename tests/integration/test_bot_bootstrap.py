@@ -8,6 +8,7 @@ from civitas import __main__ as entrypoint
 from civitas.bot.client import CivitasBot
 from civitas.config import GovernmentSettings, JobsSettings, MarketSettings, Settings, TreasurySettings, WalletSettings
 from civitas.domain.ledger import TransactionKind
+from civitas.infrastructure.db.admission_models import AdmittedUserRow
 from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
 
 
@@ -62,7 +63,24 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         wallet = bot.tree.get_command("wallet", guild=bot.guild_scope)
         assert {command.name for command in wallet.commands} == {"balance", "history", "transfer", "receipt", "receipts"}
         admin = bot.tree.get_command("admin", guild=bot.guild_scope)
-        assert {command.name for command in admin.commands} == {"audit", "maintenance"}
+        assert {command.name for command in admin.commands} == {"admission", "audit", "maintenance", "setup"}
+        court = bot.tree.get_command("court", guild=bot.guild_scope)
+        assert {command.name for command in court.commands} >= {"nominate", "approve", "current", "case"}
+        assert {command.name for command in court.get_command("case").commands} == {
+            "civil", "charge", "challenge", "challenge_decree", "show", "list", "schedule",
+            "decide_challenge", "decision", "returns",
+        }
+        assert {command.name for command in court.get_command("appeal").commands} == {
+            "file", "open", "voters", "record", "confirm", "show",
+        }
+        law = bot.tree.get_command("law", guild=bot.guild_scope)
+        assert {command.name for command in law.commands} == {"register", "confirm", "show", "revision", "list"}
+        decree = bot.tree.get_command("decree", guild=bot.guild_scope)
+        assert {command.name for command in decree.commands} == {command.name for command in law.commands}
+        prosecutor = bot.tree.get_command("prosecutor", guild=bot.guild_scope)
+        assert {command.name for command in prosecutor.commands} == {
+            "nominate", "propose_removal", "approve", "current", "motion",
+        }
         assets = bot.tree.get_command("assets", guild=bot.guild_scope)
         asset_commands = {command.name for command in assets.commands}
         resale_commands = {"sell", "resale", "resale_buy", "resale_cancel"}
@@ -75,10 +93,11 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
 
     assert command_names == {
         "start", "citizen", "profile", "wallet", "jobs", "company", "market", "work", "assets", "treasury", "contracts",
-        "government", "election", "help", "admin",
+        "government", "election", "court", "law", "decree", "prosecutor", "help", "admin",
     }
     assert sync.await_count == 1
     async with pg_engine.connect() as connection:
+        assert set(await connection.scalars(select(AdmittedUserRow.discord_user_id))) == {201, 202}
         assert await connection.scalar(
             select(func.count()).select_from(FinancialTransactionRow).where(
                 FinancialTransactionRow.kind == TransactionKind.GENESIS

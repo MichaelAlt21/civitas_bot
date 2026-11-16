@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import text
 
 from civitas.app.assets import AssetService
+from civitas.app.admission import AdmissionService
 from civitas.app.citizens import CitizensService
 from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentService
 from civitas.app.jobs import JobService, JobsRules
@@ -20,6 +21,7 @@ from civitas.domain.assets import AssetKind
 from civitas.domain.government import OfficeKind
 from civitas.domain.jobs import BudgetCaps, JobCategory
 from civitas.infrastructure.db import create_db_engine
+from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
 from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 from civitas.infrastructure.db.maintenance import PostgresMaintenanceUnitOfWork
 from civitas.infrastructure.db.private_jobs import PostgresPrivateJobUnitOfWork
@@ -36,6 +38,9 @@ async def _run_postgres_tool(tool: Path, arguments: list[str], environment: dict
 async def _snapshot(engine) -> dict[str, list[tuple]]:
     queries = {
         "revision": "SELECT version_num FROM alembic_version ORDER BY version_num",
+        "admission_rosters": "SELECT discord_guild_id FROM admission_rosters ORDER BY 1",
+        "admitted_users": "SELECT discord_guild_id, discord_user_id FROM admitted_users ORDER BY 1, 2",
+        "admission_audit": "SELECT id, discord_guild_id, actor_discord_user_id, target_discord_user_id, allowed, reason, occurred_at FROM admission_audit_events ORDER BY id",
         "citizens": "SELECT id, discord_user_id, status FROM citizens ORDER BY id",
         "audit": "SELECT id, citizen_id, action FROM audit_events ORDER BY id",
         "accounts": "SELECT id, kind, citizen_id FROM financial_accounts ORDER BY id",
@@ -114,6 +119,11 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert pg_dump.is_file() and pg_restore.is_file()
 
     uow = PostgresPrivateJobUnitOfWork(pg_engine)
+    admission = AdmissionService(PostgresAdmissionUnitOfWork(pg_engine), guild_id=101)
+    await admission.initialize((201, 202, 203, 204))
+    assert await admission.set_allowed(
+        101, 901, administrator=True, target_user_id=204, allowed=False, reason="Fixture revoke before backup",
+    )
     now = datetime(2026, 11, 12, 12, tzinfo=UTC)
     funding = WalletFunding(starter_grant=250, treasury_genesis=8000)
     citizens = CitizensService(
@@ -322,6 +332,9 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
             restored = create_db_engine(url.set(database=database))
             try:
                 assert await _snapshot(restored) == expected
+                restored_admission = AdmissionService(PostgresAdmissionUnitOfWork(restored), guild_id=101)
+                await restored_admission.initialize((201, 202, 203, 204))
+                assert await restored_admission.list_allowed(101, 901, administrator=True) == (201, 202, 203)
                 restored_politics = government(restored)
                 restored_impeachment = await restored_politics.get_public_impeachment(101, 201, ballot.id)
                 assert restored_impeachment.confirmed_at == impeachment.confirmed_at

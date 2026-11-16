@@ -67,6 +67,7 @@ class ReportService:
         guild_id: int,
         timezone: tzinfo,
         publication_channel_id: int | None = None,
+        get_publication_channel_id: Callable[[], Awaitable[int | None]] | None = None,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         if not is_discord_id(guild_id) or (
@@ -79,6 +80,7 @@ class ReportService:
         self._guild_id = guild_id
         self._timezone = timezone
         self._channel_id = publication_channel_id
+        self._get_publication_channel_id = get_publication_channel_id
         self._clock = clock
 
     async def get_report(self, guild_id: int | None, *, previous: bool = False) -> TreasuryReport:
@@ -98,11 +100,16 @@ class ReportService:
 
     async def run_due(self, send: Callable[[ReportDelivery], Awaitable[int]]) -> bool:
         """Queue one closed week and attempt one delivery. Return whether it was acknowledged."""
-        if self._channel_id is None:
+        if self._channel_id is None and self._get_publication_channel_id is None:
             return False
 
         now = self._clock()
-        await self._enqueue_next_week(now, self._channel_id)
+        channel_id = (
+            await self._get_publication_channel_id()
+            if self._get_publication_channel_id is not None else self._channel_id
+        )
+        if channel_id is not None:
+            await self._enqueue_next_week(now, channel_id)
         async with self._unit_of_work() as repository:
             delivery = await repository.claim_due_report(
                 self._guild_id, now=now, lease_until=now + _LEASE_DURATION, lease_token=uuid4().hex,

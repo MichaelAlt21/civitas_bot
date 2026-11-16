@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import is_discord_id
 from civitas.app.market import MarketRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
@@ -92,7 +93,7 @@ def _valid_id(value: int) -> bool:
 class PrivateJobService:
     def __init__(
         self, unit_of_work: Callable[[], AbstractAsyncContextManager[PrivateJobRepository]], *, guild_id: int,
-        authorize: Callable[[int | None, int], None], arbiter_user_ids: Iterable[int],
+        authorize: Authorizer, arbiter_user_ids: Iterable[int],
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         arbiters = tuple(arbiter_user_ids)
@@ -100,7 +101,7 @@ class PrivateJobService:
             raise ValueError("Private work arbiter IDs must be Discord snowflakes")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._arbiter_user_ids = frozenset(arbiters)
         self._clock = clock
 
@@ -108,7 +109,7 @@ class PrivateJobService:
         self, guild_id: int | None, user_id: int, *, company_id: int, title: str, terms: str,
         amount: int, deadline: datetime, reason: str, idempotency_key: str,
     ) -> PrivateJob:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         title, terms, reason = _text(title, 80), _text(terms, 500), _text(reason, 200)
         if type(amount) is not int or not 1 <= amount <= MAX_AMOUNT:
             raise PrivateJobError(PrivateJobErrorReason.INVALID_AMOUNT)
@@ -155,14 +156,14 @@ class PrivateJobService:
             return existing
 
     async def list_jobs(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[PrivateJob, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _offset(page)
         async with self._unit_of_work() as repository:
             viewer = await self._citizen(repository, user_id)
             return await repository.list_open_private_jobs(viewer.guild_id, self._clock(), _PAGE_SIZE, offset=offset)
 
     async def list_my_jobs(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[PrivateJob, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _offset(page)
         async with self._unit_of_work() as repository:
             viewer = await self._citizen(repository, user_id)
@@ -173,7 +174,7 @@ class PrivateJobService:
             )
 
     async def get_job(self, guild_id: int | None, user_id: int, job_id: int) -> PrivateJob:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             viewer = await self._citizen(repository, user_id)
             job = await self._job(repository, viewer.guild_id, job_id)
@@ -291,7 +292,7 @@ class PrivateJobService:
     async def _action(
         self, guild_id: int | None, user_id: int, job_id: int, *, arbiter: bool = False,
     ) -> AsyncIterator[tuple[PrivateJobRepository, Citizen, PrivateJob, Citizen | None]]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if arbiter and user_id not in self._arbiter_user_ids:
             raise PrivateJobError(PrivateJobErrorReason.ARBITER_REQUIRED)
         async with self._unit_of_work() as repository:

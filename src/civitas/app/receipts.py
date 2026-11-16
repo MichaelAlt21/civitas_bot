@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 from uuid import UUID
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.ledger import MAX_AMOUNT
@@ -53,15 +54,15 @@ def _utcnow() -> datetime:
 class ReceiptService:
     def __init__(
         self, unit_of_work: Callable[[], AbstractAsyncContextManager[ReceiptRepository]], *, guild_id: int,
-        authorize: Callable[[int | None, int], None], clock: Callable[[], datetime] = _utcnow,
+        authorize: Authorizer, clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._clock = clock
 
     async def set_preference(self, guild_id: int | None, user_id: int, *, locale: str | None) -> None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if locale not in ("ru", "en", None):
             raise ValueError("Receipt locale must be ru, en or disabled")
         async with self._unit_of_work() as repository:
@@ -106,7 +107,7 @@ class ReceiptService:
             )
 
     async def get_receipt(self, guild_id: int | None, user_id: int, transaction_id: int) -> ReceiptDetails | None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if type(transaction_id) is not int or not 1 <= transaction_id <= MAX_AMOUNT:
             return None
         async with self._unit_of_work() as repository:

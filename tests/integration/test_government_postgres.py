@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.admin_audit import AdminAuditService
 from civitas.app.admin_operators import AdminOperatorPolicy
+from civitas.app.admission import AdmissionService
 from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, MAX_DISCORD_ID, CitizensService
 from civitas.app.government import ElectionRules, GovernmentError, GovernmentErrorReason, GovernmentService
 from civitas.app.market import MarketRules, MarketService
@@ -19,6 +20,7 @@ from civitas.domain.government import Election, ElectionStatus, OfficeKind
 from civitas.domain.jobs import BudgetCaps
 from civitas.domain.treasury import ContractStatus
 from civitas.infrastructure.db.admin_audit import PostgresAdminAuditUnitOfWork
+from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
 from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 from civitas.infrastructure.db.government_models import (
     ElectionCancellationConfirmationRow,
@@ -211,17 +213,23 @@ async def test_voter_snapshot_keeps_original_discord_ids_and_requires_verified_c
 async def test_new_elections_and_tied_repeats_require_current_admission_and_verified_citizenship(
     pg_engine: AsyncEngine,
 ) -> None:
-    unit_of_work, previous_service, clock = await _setup(pg_engine)
-    initial = await _open(previous_service, key="before-admission-change")
+    unit_of_work, _, clock = await _setup(pg_engine)
     old_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, RUNNER_UP, WINNER)
-    assert await previous_service.list_voter_snapshot(GUILD, REVIEWER, initial.id) == old_voters
-
     unregistered = 15
-    current_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, WINNER)
-    citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids=(*current_voters, unregistered))
+    admission = AdmissionService(PostgresAdmissionUnitOfWork(pg_engine), guild_id=GUILD)
+    await admission.initialize((*old_voters, unregistered))
+    citizens = CitizensService(unit_of_work, guild_id=GUILD, authorize_admission=admission.authorize)
     current_service = GovernmentService(
         unit_of_work, guild_id=GUILD, authorize=citizens.authorize,
         commissioner_user_ids=(RECORDER, REVIEWER, SECOND_REVIEWER), rules=RULES, clock=clock,
+        use_persisted_admission=True,
+    )
+    initial = await _open(current_service, key="before-admission-change")
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, initial.id) == old_voters
+
+    current_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY, WINNER)
+    assert await admission.set_allowed(
+        GUILD, RECORDER, administrator=True, target_user_id=RUNNER_UP, allowed=False, reason="Revoke admission",
     )
     async with unit_of_work() as repository:
         (removed,) = await repository.get_citizens(GUILD, (RUNNER_UP,))
@@ -256,20 +264,18 @@ async def test_new_elections_and_tied_repeats_require_current_admission_and_veri
     await current_service.propose_election_cancellation(GUILD, RECORDER, repeated.id, reason="Poll unavailable")
     await current_service.confirm_election_cancellation(GUILD, REVIEWER, repeated.id, reason="Verified outage")
     remaining_voters = (RECORDER, REVIEWER, SECOND_REVIEWER, ORDINARY)
-    refreshed_citizens = CitizensService(unit_of_work, guild_id=GUILD, allowed_user_ids=remaining_voters)
-    refreshed_service = GovernmentService(
-        unit_of_work, guild_id=GUILD, authorize=refreshed_citizens.authorize,
-        commissioner_user_ids=(RECORDER, REVIEWER, SECOND_REVIEWER), rules=RULES, clock=clock,
+    assert await admission.set_allowed(
+        GUILD, RECORDER, administrator=True, target_user_id=WINNER, allowed=False, reason="Revoke admission",
     )
-    replacement = await refreshed_service.open_election(
+    replacement = await current_service.open_election(
         GUILD, RECORDER, office=OfficeKind.PRESIDENT, candidate_user_ids=(ORDINARY,),
         reason="Nominate again after the remaining candidate lost admission",
         idempotency_key="admission-replacement", replacement_of_id=repeated.id,
     )
     assert replacement.retry_of_id == replacement.runoff_of_id == initial.id
     assert replacement.replacement_of_id == repeated.id and replacement.candidate_discord_user_ids == (ORDINARY,)
-    assert await refreshed_service.list_voter_snapshot(GUILD, REVIEWER, replacement.id) == remaining_voters
-    assert await refreshed_service.list_voter_snapshot(GUILD, REVIEWER, repeated.id) == current_voters
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, replacement.id) == remaining_voters
+    assert await current_service.list_voter_snapshot(GUILD, REVIEWER, repeated.id) == current_voters
 
 
 async def test_concurrent_independent_attestations_apply_one_term_and_replay(

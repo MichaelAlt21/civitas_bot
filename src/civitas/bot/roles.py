@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import discord
@@ -104,9 +104,10 @@ async def run_role_sync(
     unit_of_work: Callable[[], AbstractAsyncContextManager[CitizenRoleRepository]],
     *,
     guild_id: int,
-    role_id: int | None,
+    role_id: int | None = None,
+    get_role_id: Callable[[], Awaitable[int | None]] | None = None,
 ) -> AsyncIterator[None]:
-    if role_id is None:
+    if role_id is None and get_role_id is None:
         yield
         return
 
@@ -114,7 +115,9 @@ async def run_role_sync(
         await client.wait_until_ready()
         while not client.is_closed():
             try:
-                await _reconcile_once(client, unit_of_work, guild_id, role_id)
+                current_role_id = await get_role_id() if get_role_id is not None else role_id
+                if current_role_id is not None:
+                    await _reconcile_once(client, unit_of_work, guild_id, current_role_id)
             except Exception as error:
                 logger.warning("Сверка роли гражданина завершилась ошибкой (%s)", type(error).__name__)
             await asyncio.sleep(_SYNC_INTERVAL_SECONDS)

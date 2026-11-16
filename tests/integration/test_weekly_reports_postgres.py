@@ -189,11 +189,15 @@ async def test_worker_retries_same_snapshot_after_failed_send_without_reposting_
 
     now = datetime(2026, 11, 16, 9, tzinfo=UTC)
     deliveries = []
+    channel_id = CHANNEL_ID
+
+    async def get_channel_id() -> int | None:
+        return channel_id
 
     def restart() -> ReportService:
         return ReportService(
             PostgresReportUnitOfWork(pg_engine), guild_id=GUILD, timezone=UTC,
-            publication_channel_id=CHANNEL_ID, clock=lambda: now,
+            get_publication_channel_id=get_channel_id, clock=lambda: now,
         )
 
     async def send(delivery) -> int:
@@ -203,6 +207,7 @@ async def test_worker_retries_same_snapshot_after_failed_send_without_reposting_
         return MESSAGE_ID
 
     assert not await restart().run_due(send)
+    channel_id = None
     now += timedelta(seconds=29)
     assert not await restart().run_due(send)
     assert len(deliveries) == 1
@@ -211,7 +216,13 @@ async def test_worker_retries_same_snapshot_after_failed_send_without_reposting_
     assert not await restart().run_due(send)
     assert [item.attempts for item in deliveries] == [1, 2]
     assert deliveries[0].report == deliveries[1].report
+    assert [item.channel_id for item in deliveries] == [CHANNEL_ID, CHANNEL_ID]
     async with pg_engine.connect() as connection:
         assert await connection.scalar(select(func.count()).select_from(WeeklyReportDeliveryRow)) == 1
         assert await connection.scalar(select(WeeklyReportDeliveryRow.state)) == "SENT"
         assert await connection.scalar(select(func.count()).select_from(FinancialTransactionRow)) == 1
+
+    channel_id = CHANNEL_ID + 1
+    now += timedelta(days=7)
+    assert await restart().run_due(send)
+    assert deliveries[-1].channel_id == channel_id

@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetResale, AssetResaleStatus, AssetStatus
 from civitas.domain.citizens import Citizen
 
+from .admission import PostgresAdmissionRepository
 from .asset_models import AssetResaleRow, AssetRow, AssetTransferRow
 from .citizens import _to_citizen
 from .market import PostgresMarketRepository
@@ -68,6 +69,9 @@ def _to_resale(row: AssetResaleRow) -> AssetResale:
 
 
 class PostgresAssetRepository(PostgresMarketRepository):
+    async def is_allowed(self, discord_guild_id: int, user_id: int) -> bool:
+        return await PostgresAdmissionRepository(self._session).is_allowed(discord_guild_id, user_id)
+
     async def get_asset(self, guild_id: int, asset_id: int, *, lock: bool = False) -> Asset | None:
         statement = select(AssetRow).where(AssetRow.guild_id == guild_id, AssetRow.id == asset_id)
         if lock:

@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
 from civitas.app.wallet import WalletRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
@@ -103,6 +104,8 @@ class ElectionRules:
 
 
 class GovernmentRepository(WalletRepository, Protocol):
+    async def list_verified_admitted_citizens(self, guild_id: int) -> tuple[Citizen, ...]: ...
+
     async def list_verified_citizens(self, guild_id: int) -> tuple[Citizen, ...]: ...
 
     async def get_current_presidential_term(self, guild_id: int, at: datetime) -> tuple[int, OfficeTerm] | None: ...
@@ -199,15 +202,38 @@ def _poll_source_key(parts: SplitResult) -> str:
     return urlunsplit((parts.scheme, parts.hostname or "", parts.path.rstrip("/"), parts.query, ""))
 
 
+def public_poll_source(source_url: str, allowed_hosts: frozenset[str]) -> str:
+    if not isinstance(source_url, str) or not 1 <= len(source_url) <= 500 or any(
+        char.isspace() or ord(char) < 32 or char == "\\" for char in source_url
+    ):
+        raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
+    try:
+        parts = urlsplit(source_url)
+        allowed = (
+            parts.scheme == "https" and parts.hostname in allowed_hosts and parts.port in (None, 443)
+            and parts.username is None and parts.password is None and bool(parts.path.strip("/"))
+        )
+    except ValueError:
+        allowed = False
+    if not allowed:
+        raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
+    return _poll_source_key(parts)
+
+
+def poll_quorum(eligible: int, quorum_bp: int, quorum_min: int) -> int:
+    return max(quorum_min, (eligible * quorum_bp + _BASIS_POINTS - 1) // _BASIS_POINTS)
+
+
 class GovernmentService:
     def __init__(
         self,
         unit_of_work: Callable[[], AbstractAsyncContextManager[GovernmentRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         commissioner_user_ids: Iterable[int],
         rules: ElectionRules,
+        use_persisted_admission: bool = False,
         clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         commissioners = tuple(commissioner_user_ids)
@@ -215,9 +241,10 @@ class GovernmentService:
             raise ValueError("Commissioner IDs must be Discord snowflakes")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._commissioners = frozenset(commissioners)
         self._rules = rules
+        self._use_persisted_admission = use_persisted_admission
         self._poll_hosts = frozenset(host.lower() for host in rules.poll_hosts)
         self._clock = clock
 
@@ -234,7 +261,7 @@ class GovernmentService:
         retry_of_id: int | None = None,
         replacement_of_id: int | None = None,
     ) -> Election:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         _validate_key(idempotency_key)
         reason = _reason(reason)
         if not isinstance(office, OfficeKind):
@@ -259,6 +286,8 @@ class GovernmentService:
                 return self._replay_open(existing, commissioner.id, office, candidates, reason, parent_id, replacement_of_id)
             eligible = await self._eligible_voters(repository, commissioner.guild_id)
             by_discord_id = {citizen.discord_user_id: citizen for citizen in eligible}
+            if self._use_persisted_admission and user_id not in by_discord_id:
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
             if len(eligible) < self._rules.min_eligible:
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
             if not candidates.issubset(by_discord_id):
@@ -496,7 +525,7 @@ class GovernmentService:
     async def _crisis_action(
         self, guild_id: int | None, user_id: int, election_id: int,
     ) -> AsyncIterator[tuple[GovernmentRepository, Citizen, Election]]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id, lock=True)
             await repository.lock_election_cycle(actor.guild_id)
@@ -516,7 +545,7 @@ class GovernmentService:
     async def open_impeachment(
         self, guild_id: int | None, user_id: int, *, idempotency_key: str,
     ) -> Impeachment:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         _validate_key(idempotency_key)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id, lock=True)
@@ -534,12 +563,13 @@ class GovernmentService:
             if actor.id == term.holder_citizen_id:
                 raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_CONFLICT)
             eligible = await self._eligible_voters(repository, actor.guild_id)
+            eligible_users = {citizen.discord_user_id for citizen in eligible}
+            if self._use_persisted_admission and user_id not in eligible_users:
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
             quorum = self._quorum(len(eligible))
             if quorum > len(eligible):
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_ELIGIBLE)
-            if not self._has_independent_commission(
-                {citizen.discord_user_id for citizen in eligible} - {term.holder_discord_user_id}
-            ):
+            if not self._has_independent_commission(eligible_users - {term.holder_discord_user_id}):
                 raise GovernmentError(GovernmentErrorReason.INSUFFICIENT_COMMISSIONERS)
             return await repository.create_impeachment(Impeachment(
                 id=0, guild_id=actor.guild_id, term_id=term_id, election_id=term.election_id,
@@ -551,7 +581,7 @@ class GovernmentService:
     async def list_impeachment_voters(
         self, guild_id: int | None, user_id: int, impeachment_id: int,
     ) -> tuple[int, ...]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         self._check_impeachment_id(impeachment_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
@@ -625,7 +655,7 @@ class GovernmentService:
     async def _impeachment_action(
         self, guild_id: int | None, user_id: int, impeachment_id: int,
     ) -> AsyncIterator[tuple[GovernmentRepository, Citizen, Impeachment]]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
             ballot = await self._impeachment(repository, actor.guild_id, impeachment_id)
@@ -666,7 +696,7 @@ class GovernmentService:
             raise GovernmentError(GovernmentErrorReason.IMPEACHMENT_TERM_ENDED)
 
     def _quorum(self, eligible: int) -> int:
-        return max(self._rules.quorum_min, (eligible * self._rules.quorum_bp + _BASIS_POINTS - 1) // _BASIS_POINTS)
+        return poll_quorum(eligible, self._rules.quorum_bp, self._rules.quorum_min)
 
     async def list_offices(self, guild_id: int | None, user_id: int) -> tuple[OfficeTerm, ...]:
         self._public_access(guild_id, user_id)
@@ -681,7 +711,7 @@ class GovernmentService:
             return tuple(self._public_election(election) for election in await repository.list_results(internal_guild_id, 10))
 
     async def list_unfinished_elections(self, guild_id: int | None, user_id: int) -> tuple[Election, ...]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
             return await repository.list_unfinished_elections(actor.guild_id)
@@ -705,13 +735,13 @@ class GovernmentService:
         return replace(election, protocol=None, cancellation=replace(cancellation, confirmation_reason=None))
 
     async def get_election(self, guild_id: int | None, user_id: int, election_id: int) -> Election:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
             return await self._election(repository, actor.guild_id, election_id)
 
     async def list_voter_snapshot(self, guild_id: int | None, user_id: int, election_id: int) -> tuple[int, ...]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         if type(election_id) is not int or not 1 <= election_id <= MAX_AMOUNT:
             raise GovernmentError(GovernmentErrorReason.ELECTION_NOT_FOUND)
         async with self._unit_of_work() as repository:
@@ -729,7 +759,7 @@ class GovernmentService:
     async def _commission_action(
         self, guild_id: int | None, user_id: int, election_id: int
     ) -> AsyncIterator[tuple[GovernmentRepository, Citizen, Election]]:
-        self._commissioner(guild_id, user_id)
+        await self._commissioner(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._verified(repository, user_id)
             election = await self._election(repository, actor.guild_id, election_id, lock=True)
@@ -744,18 +774,21 @@ class GovernmentService:
         if not is_discord_id(user_id):
             raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
 
-    def _commissioner(self, guild_id: int | None, user_id: int) -> None:
-        self._authorize(guild_id, user_id)
+    async def _commissioner(self, guild_id: int | None, user_id: int) -> None:
+        await self._authorize(guild_id, user_id)
         if user_id not in self._commissioners:
             raise GovernmentError(GovernmentErrorReason.COMMISSIONER_REQUIRED)
 
     async def _eligible_voters(
         self, repository: GovernmentRepository, guild_id: int,
     ) -> tuple[Citizen, ...]:
+        if self._use_persisted_admission:
+            return await repository.list_verified_admitted_citizens(guild_id)
+
         admitted = []
         for citizen in await repository.list_verified_citizens(guild_id):
             try:
-                self._authorize(self._guild_id, citizen.discord_user_id)
+                await self._authorize(self._guild_id, citizen.discord_user_id)
             except CitizenshipAccessError:
                 continue
             admitted.append(citizen)
@@ -782,21 +815,7 @@ class GovernmentService:
         return election
 
     def _validate_source(self, source_url: str) -> str:
-        if not isinstance(source_url, str) or not 1 <= len(source_url) <= 500 or any(
-            char.isspace() or ord(char) < 32 or char == "\\" for char in source_url
-        ):
-            raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
-        try:
-            parts = urlsplit(source_url)
-            allowed = (
-                parts.scheme == "https" and parts.hostname in self._poll_hosts and parts.port in (None, 443)
-                and parts.username is None and parts.password is None and bool(parts.path.strip("/"))
-            )
-        except ValueError:
-            allowed = False
-        if not allowed:
-            raise GovernmentError(GovernmentErrorReason.INVALID_SOURCE)
-        return _poll_source_key(parts)
+        return public_poll_source(source_url, self._poll_hosts)
 
     @staticmethod
     def _validate_tallies(

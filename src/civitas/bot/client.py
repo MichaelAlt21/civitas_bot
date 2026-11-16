@@ -134,17 +134,17 @@ class CivitasBot(discord.Client):
             name="start", description=command_description("start"), guild=self.guild_scope
         )
         async def start(interaction: discord.Interaction) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
             try:
-                service.authorize(interaction.guild_id, interaction.user.id)
+                await service.authorize(interaction.guild_id, interaction.user.id)
             except CitizenshipAccessError as error:
-                await interaction.response.send_message(
-                    message(interaction.locale, f"access.{error.reason.value}"), ephemeral=True
+                await interaction.edit_original_response(
+                    content=message(interaction.locale, f"access.{error.reason.value}"),
                 )
                 return
-            await interaction.response.send_message(
-                message(interaction.locale, "start.welcome"),
+            await interaction.edit_original_response(
+                content=message(interaction.locale, "start.welcome"),
                 view=_RegistrationView(service, interaction),
-                ephemeral=True,
             )
 
         @citizen.command(name="register", description=command_description("register"))

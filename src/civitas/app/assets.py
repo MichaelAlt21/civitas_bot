@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
-from civitas.app.citizens import is_discord_id
+from civitas.app.authorization import Authorizer, as_async_authorizer
+from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
 from civitas.app.market import MarketRepository
 from civitas.app.wallet import WalletFunding
 from civitas.domain.assets import (
@@ -114,6 +115,8 @@ class AssetRepository(MarketRepository, Protocol):
 
     async def update_resale_offer(self, offer: AssetResale) -> None: ...
 
+    async def is_allowed(self, discord_guild_id: int, user_id: int) -> bool: ...
+
     async def get_resale_citizens(self, guild_id: int, citizen_ids: tuple[int, ...]) -> tuple[Citizen, ...]: ...
 
 
@@ -156,9 +159,10 @@ class AssetService:
         unit_of_work: Callable[[], AbstractAsyncContextManager[AssetRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         staff_user_ids: Iterable[int],
         funding: WalletFunding,
+        use_persisted_admission: bool = False,
         clock: Callable[[], datetime] = _utcnow,
         resale_tax_bp: int | None = None,
     ) -> None:
@@ -169,8 +173,9 @@ class AssetService:
             raise ValueError("Resale tax must be between 0 and 9999 basis points")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._staff_user_ids = frozenset(staff_ids)
+        self._use_persisted_admission = use_persisted_admission
         self._funding = funding
         self._clock = clock
         self._resale_tax_bp = resale_tax_bp
@@ -191,7 +196,7 @@ class AssetService:
         reason: str,
         idempotency_key: str,
     ) -> Asset:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if user_id not in self._staff_user_ids:
             raise AssetError(AssetErrorReason.STAFF_REQUIRED)
         if not isinstance(kind, AssetKind):
@@ -225,14 +230,14 @@ class AssetService:
             return prior
 
     async def catalog(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[Asset, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
             return await repository.list_assets_for_sale(citizen.guild_id, ASSET_PAGE_SIZE, offset=offset)
 
     async def asset_info(self, guild_id: int | None, user_id: int, asset_id: int) -> Asset:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
             return await self._available_asset(repository, citizen.guild_id, asset_id)
@@ -240,7 +245,7 @@ class AssetService:
     async def list_owned_assets(
         self, guild_id: int | None, user_id: int, *, company_id: int | None = None, page: int = 1
     ) -> tuple[Asset, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
@@ -253,7 +258,7 @@ class AssetService:
     async def quote_asset(
         self, guild_id: int | None, user_id: int, asset_id: int, *, buyer_company_id: int | None = None
     ) -> AssetQuote:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id)
             asset = await self._available_asset(repository, buyer.guild_id, asset_id)
@@ -265,7 +270,7 @@ class AssetService:
     async def buy_asset(
         self, guild_id: int | None, user_id: int, quote: AssetQuote, *, idempotency_key: str
     ) -> AssetPurchase:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         _validate_key(idempotency_key)
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id, lock=True)
@@ -322,9 +327,9 @@ class AssetService:
         self, guild_id: int | None, user_id: int, *, asset_id: int, buyer_user_id: int,
         price: int, idempotency_key: str,
     ) -> AssetResale:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         tax_bp = self._require_resale_tax()
-        self._authorize(guild_id, buyer_user_id)
+        await self._authorize(guild_id, buyer_user_id)
         if buyer_user_id == user_id:
             raise AssetError(AssetErrorReason.RESALE_SELF_TRADE)
         if not _valid_id(price):
@@ -358,7 +363,7 @@ class AssetService:
     async def list_resale_offers(
         self, guild_id: int | None, user_id: int, *, page: int = 1,
     ) -> tuple[AssetResale, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._require_resale_tax()
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
@@ -366,14 +371,14 @@ class AssetService:
             return await repository.list_resale_offers(actor.guild_id, actor.id, ASSET_PAGE_SIZE, offset=offset)
 
     async def get_resale_offer(self, guild_id: int | None, user_id: int, offer_id: int) -> AssetResale:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._require_resale_tax()
         async with self._unit_of_work() as repository:
             actor = await self._citizen(repository, user_id)
             return await self._resale_offer(repository, actor, offer_id)
 
     async def quote_resale(self, guild_id: int | None, user_id: int, offer_id: int) -> AssetResaleQuote:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._require_resale_tax()
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id)
@@ -388,7 +393,7 @@ class AssetService:
             return AssetResaleQuote(offer, asset)
 
     async def buy_resale(self, guild_id: int | None, user_id: int, offer_id: int) -> AssetResale:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._require_resale_tax()
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id)
@@ -405,7 +410,12 @@ class AssetService:
             if buyer.id not in verified or offer.seller_citizen_id not in verified:
                 raise AssetError(AssetErrorReason.CITIZEN_NOT_VERIFIED)
             seller = verified[offer.seller_citizen_id]
-            self._authorize(guild_id, seller.discord_user_id)
+            if self._use_persisted_admission:
+                # This transaction already holds citizen locks and a database connection.
+                if not await repository.is_allowed(self._guild_id, seller.discord_user_id):
+                    raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+            else:
+                await self._authorize(guild_id, seller.discord_user_id)
             asset = await repository.get_asset(buyer.guild_id, offer.asset_id, lock=True)
             offer = await self._resale_offer(repository, buyer, offer_id, lock=True)
             if offer.status == AssetResaleStatus.COMPLETED:
@@ -437,7 +447,7 @@ class AssetService:
             return completed
 
     async def cancel_resale_offer(self, guild_id: int | None, user_id: int, offer_id: int) -> AssetResale:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         self._require_resale_tax()
         async with self._unit_of_work() as repository:
             seller = await self._citizen(repository, user_id, lock=True)

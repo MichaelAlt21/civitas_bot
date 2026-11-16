@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.domain.assets import Asset
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.government import OfficeKind, OfficeTerm
@@ -35,13 +36,13 @@ class ProfileDetails:
 class ProfileService:
     def __init__(
         self, unit_of_work: Callable[[], AbstractAsyncContextManager[ProfileRepository]],
-        *, authorize: Callable[[int | None, int], None],
+        *, authorize: Authorizer,
     ) -> None:
         self._unit_of_work = unit_of_work
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
 
     async def get_profile(self, guild_id: int | None, user_id: int) -> ProfileDetails | None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         assert guild_id is not None  # Authorization requires the configured guild.
         async with self._unit_of_work() as repository:
             citizen = await repository.get_profile(guild_id, user_id)

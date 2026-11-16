@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import is_discord_id
 from civitas.app.wallet import WalletFunding, WalletRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
@@ -181,7 +182,7 @@ class MarketService:
         unit_of_work: Callable[[], AbstractAsyncContextManager[MarketRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         arbiter_user_ids: Iterable[int],
         rules: MarketRules,
         funding: WalletFunding,
@@ -192,7 +193,7 @@ class MarketService:
             raise ValueError("Arbiter IDs must be Discord snowflakes")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._arbiter_user_ids = frozenset(arbiter_ids)
         self._rules = rules
         self._funding = funding
@@ -212,7 +213,7 @@ class MarketService:
         idempotency_key: str,
         expected_fee: int | None = None,
     ) -> Company:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         _validate_key(idempotency_key)
         if not isinstance(name, str):
             raise MarketError(MarketErrorReason.INVALID_TEXT)
@@ -262,13 +263,13 @@ class MarketService:
             return company
 
     async def company_info(self, guild_id: int | None, user_id: int, company_id: int) -> Company:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
             return await self._company(repository, citizen.guild_id, company_id)
 
     async def company_balance(self, guild_id: int | None, user_id: int, company_id: int) -> int:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             owner = await self._citizen(repository, user_id)
             company = await self._owned_company(repository, owner, company_id)
@@ -276,7 +277,7 @@ class MarketService:
             return await repository.get_balance(account.id)
 
     async def list_owned_companies(self, guild_id: int | None, user_id: int) -> tuple[Company, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             owner = await self._citizen(repository, user_id)
             return await repository.list_owned_companies(owner.guild_id, owner.id)
@@ -293,7 +294,7 @@ class MarketService:
         delivery_hours: int,
         idempotency_key: str,
     ) -> Offer:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         _validate_key(idempotency_key)
         title = _text(title, 80)
         terms = _text(terms, 500)
@@ -326,7 +327,7 @@ class MarketService:
             return prior
 
     async def list_offers(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[Offer, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
@@ -335,7 +336,7 @@ class MarketService:
     async def withdraw_offer(
         self, guild_id: int | None, user_id: int, offer_id: int, *, reason: str,
     ) -> OfferWithdrawal:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         reason = _text(reason, 200)
         async with self._unit_of_work() as repository:
             owner = await self._citizen(repository, user_id, lock=True)
@@ -351,7 +352,7 @@ class MarketService:
     async def quote_order(
         self, guild_id: int | None, user_id: int, offer_id: int, *, buyer_company_id: int | None = None
     ) -> OrderQuote:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id)
             offer, seller = await self._trade_parties(repository, buyer, offer_id, buyer_company_id)
@@ -362,7 +363,7 @@ class MarketService:
     async def fund_order(
         self, guild_id: int | None, user_id: int, quote: OrderQuote, *, idempotency_key: str
     ) -> MarketOrder:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         _validate_key(idempotency_key)
         async with self._unit_of_work() as repository:
             buyer = await self._citizen(repository, user_id, lock=True)
@@ -421,7 +422,7 @@ class MarketService:
     async def list_orders(
         self, guild_id: int | None, user_id: int, *, page: int = 1, disputes_only: bool = False,
     ) -> tuple[MarketOrder, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         is_arbiter = user_id in self._arbiter_user_ids
         if disputes_only and not is_arbiter:
             raise MarketError(MarketErrorReason.ARBITER_REQUIRED)
@@ -537,7 +538,7 @@ class MarketService:
     async def _order_action(
         self, guild_id: int | None, user_id: int, order_id: int, *, lock: bool = True, arbiter: bool = False
     ) -> AsyncIterator[tuple[MarketRepository, Citizen, MarketOrder]]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if arbiter and user_id not in self._arbiter_user_ids:
             raise MarketError(MarketErrorReason.ARBITER_REQUIRED)
         if not _valid_id(order_id):

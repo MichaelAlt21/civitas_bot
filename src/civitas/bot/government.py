@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 import discord
@@ -563,14 +563,11 @@ async def _reconcile_office_roles(
 @asynccontextmanager
 async def run_office_role_sync(
     client: discord.Client, service: GovernmentService | None, *, guild_id: int,
-    president_role_id: int | None, parliament_role_id: int | None,
+    president_role_id: int | None = None,
+    parliament_role_id: int | None = None,
+    get_role_ids: Callable[[], Awaitable[tuple[int | None, int | None]]] | None = None,
 ) -> AsyncIterator[None]:
-    role_ids = {
-        office: role_id for office, role_id in (
-            (OfficeKind.PRESIDENT, president_role_id), (OfficeKind.PARLIAMENT, parliament_role_id),
-        ) if role_id is not None
-    }
-    if service is None or not role_ids:
+    if service is None or (president_role_id is None and parliament_role_id is None and get_role_ids is None):
         yield
         return
 
@@ -578,7 +575,16 @@ async def run_office_role_sync(
         await client.wait_until_ready()
         while not client.is_closed():
             try:
-                await _reconcile_office_roles(client, service, guild_id, role_ids)
+                current_president, current_parliament = (
+                    await get_role_ids() if get_role_ids is not None else (president_role_id, parliament_role_id)
+                )
+                role_ids = {
+                    office: role_id for office, role_id in (
+                        (OfficeKind.PRESIDENT, current_president), (OfficeKind.PARLIAMENT, current_parliament),
+                    ) if role_id is not None
+                }
+                if role_ids:
+                    await _reconcile_office_roles(client, service, guild_id, role_ids)
             except Exception as error:
                 logger.warning("Сверка ролей должностей завершилась ошибкой (%s)", type(error).__name__)
             await asyncio.sleep(_SYNC_INTERVAL_SECONDS)

@@ -75,6 +75,69 @@ _AUDIT = text("""
                'impeachment', impeachment_id, 'success', impeachment_id
           FROM impeachment_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
+        SELECT guild_id, proposer_citizen_id, proposed_at, 'court.nominate', 'court_nomination', id, 'success', id
+          FROM court_nominations WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, deputy_citizen_id, approved_at, 'court.approve',
+               'court_nomination', nomination_id, 'success', nomination_id
+          FROM court_approvals WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, filer_citizen_id, filed_at, 'court.file', 'court_case', id, 'success', id
+          FROM court_cases WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, judge_citizen_id, scheduled_at, 'court.hearing', 'court_case', case_id, 'success', id
+          FROM court_hearings WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, judge_citizen_id, decided_at, 'court.act_decision', 'court_case', case_id, 'success', case_id
+          FROM court_act_decisions WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, appellant_citizen_id, filed_at, 'court.appeal.file', 'court_case', case_id, 'success', case_id
+          FROM court_appeals WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, opened_by_citizen_id, opened_at, 'court.appeal.open', 'court_case', case_id, 'success', case_id
+          FROM court_appeal_openings WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, recorded_by_citizen_id, recorded_at, 'court.appeal.record', 'court_case', case_id, 'success', case_id
+          FROM court_appeal_tallies WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, confirmed_by_citizen_id, confirmed_at, 'court.appeal.confirm',
+               'court_case', case_id, lower(outcome), case_id
+          FROM court_appeal_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, proposer_citizen_id, proposed_at,
+               CASE act_kind WHEN 'DECREE' THEN 'decree.propose' ELSE 'law.propose' END,
+               CASE act_kind WHEN 'DECREE' THEN 'decree_revision' ELSE 'law_revision' END, id, 'success', id
+          FROM law_revisions WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, confirmed_by_citizen_id, confirmed_at,
+               CASE act_kind WHEN 'DECREE' THEN 'decree.confirm' ELSE 'law.confirm' END,
+               CASE act_kind WHEN 'DECREE' THEN 'decree_revision' ELSE 'law_revision' END,
+               revision_id, 'success', revision_id
+          FROM law_confirmations WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, proposer_citizen_id, proposed_at,
+               CASE action WHEN 'APPOINT' THEN 'prosecutor.propose_appointment' ELSE 'prosecutor.propose_removal' END,
+               'prosecutor_motion', id, 'success', id
+          FROM prosecutor_motions WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT guild_id, senator_citizen_id, approved_at, 'prosecutor.approve',
+               'prosecutor_motion', motion_id, 'success', id
+          FROM prosecutor_approvals WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
+        SELECT resolution.guild_id, signer.senator_citizen_id, resolution.applied_at,
+               CASE motion.action WHEN 'APPOINT' THEN 'prosecutor.appoint' ELSE 'prosecutor.remove' END,
+               'prosecutor_motion', motion.id, 'success', resolution.id
+          FROM prosecutor_resolutions AS resolution
+          JOIN prosecutor_motions AS motion ON (motion.guild_id, motion.id) = (resolution.guild_id, resolution.motion_id)
+          JOIN LATERAL (
+              SELECT senator_citizen_id FROM prosecutor_approvals AS approval
+               WHERE (approval.guild_id, approval.motion_id) = (resolution.guild_id, resolution.motion_id)
+                 AND approval.senator_citizen_id NOT IN (motion.proposer_citizen_id, motion.subject_citizen_id)
+                 AND approval.approved_at BETWEEN motion.proposed_at AND resolution.applied_at
+               ORDER BY approval.id DESC LIMIT 1
+          ) AS signer ON TRUE
+         WHERE resolution.guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
         SELECT guild_id, actor_citizen_id, created_at, 'asset.issue', 'asset', asset_id, 'success', id
           FROM asset_transfers WHERE guild_id = (SELECT id FROM guild_scope) AND kind = 'ISSUE'
         UNION ALL
@@ -101,6 +164,17 @@ _AUDIT = text("""
         SELECT occurred_at, action, actor_discord_user_id, 'citizen', citizen_id, 'success',
                CASE WHEN reason IN ('discord_allowlist', 'discord_membership') THEN reason END, id
           FROM audit_events WHERE guild_id = (SELECT id FROM guild_scope) AND action = ANY(:citizen_actions)
+        UNION ALL
+        SELECT occurred_at,
+               CASE WHEN allowed THEN 'admission.grant' ELSE 'admission.revoke' END,
+               actor_discord_user_id, 'discord_user', target_discord_user_id, 'success', NULL::text, id
+          FROM admission_audit_events WHERE discord_guild_id = :discord_guild_id
+        UNION ALL
+        SELECT occurred_at,
+               CASE WHEN new_discord_id IS NULL THEN 'presentation.clear' ELSE 'presentation.set' END,
+               actor_discord_user_id, left(binding, -3), coalesce(new_discord_id, previous_discord_id),
+               'success', NULL::text, id
+          FROM presentation_audit_events WHERE discord_guild_id = :discord_guild_id
         UNION ALL
         SELECT occurred_at, action, actor_discord_user_id,
                CASE action WHEN 'budget.activate' THEN 'budget_period' ELSE 'contract' END,
@@ -141,7 +215,7 @@ class PostgresAdminAuditRepository:
             action=row.action,
             actor_discord_user_id=int(row.actor_discord_user_id),
             subject_kind=row.subject_kind,
-            subject_id=row.subject_id,
+            subject_id=int(row.subject_id) if row.subject_id is not None else None,
             result=row.result,
             reason_code=row.reason_code,
         ) for row in rows)

@@ -127,23 +127,17 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     allowed_user_ids = _discord_ids(env, "CIVITAS_ALLOWED_USER_IDS")
     market = _load_market_settings(env, wallet)
     season_one = _enabled(env, "CIVITAS_SEASON_ONE")
-    if season_one and (market is None or market.arbiter_ids.isdisjoint(allowed_user_ids)):
-        raise ConfigurationError(
-            "Для первого сезона укажите в CIVITAS_MARKET_ARBITER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
-        )
+    if season_one and (market is None or not market.arbiter_ids):
+        raise ConfigurationError("Для первого сезона укажите хотя бы один ID в CIVITAS_MARKET_ARBITER_IDS.")
     jobs = _load_jobs_settings(env, wallet)
     if season_one:
-        if asset_issuer_ids.isdisjoint(allowed_user_ids):
+        if not asset_issuer_ids:
+            raise ConfigurationError("Для первого сезона укажите хотя бы один ID в CIVITAS_ASSET_ISSUER_IDS.")
+        if jobs is None:
+            raise ConfigurationError("Для первого сезона укажите проверяющих в CIVITAS_NPC_REVIEWER_IDS.")
+        if government is None:
             raise ConfigurationError(
-                "Для первого сезона укажите в CIVITAS_ASSET_ISSUER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
-            )
-        if jobs is None or jobs.reviewer_ids.isdisjoint(allowed_user_ids):
-            raise ConfigurationError(
-                "Для первого сезона укажите в CIVITAS_NPC_REVIEWER_IDS хотя бы один ID из CIVITAS_ALLOWED_USER_IDS."
-            )
-        if government is None or len(government.commissioner_ids & allowed_user_ids) < 2:
-            raise ConfigurationError(
-                "Для первого сезона укажите в CIVITAS_ELECTION_COMMISSIONER_IDS минимум два ID из CIVITAS_ALLOWED_USER_IDS."
+                "Для первого сезона укажите минимум два ID в CIVITAS_ELECTION_COMMISSIONER_IDS."
             )
     if treasury is not None and treasury.elected_authority and government is None:
         raise ConfigurationError("Для CIVITAS_ELECTED_TREASURY сначала настройте выборы.")

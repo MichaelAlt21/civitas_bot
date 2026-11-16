@@ -59,7 +59,8 @@ class CitizensService[Repository: CitizensRepository]:
         unit_of_work: Callable[[], AbstractAsyncContextManager[Repository]],
         *,
         guild_id: int,
-        allowed_user_ids: Iterable[int],
+        allowed_user_ids: Iterable[int] = (),
+        authorize_admission: Callable[[int | None, int], Awaitable[None]] | None = None,
         fund_verified: Callable[[Repository, Citizen], Awaitable[object]] | None = None,
     ) -> None:
         if not is_discord_id(guild_id):
@@ -70,16 +71,20 @@ class CitizensService[Repository: CitizensRepository]:
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
         self._allowed_user_ids = frozenset(allowed_ids)
+        self._authorize_admission = authorize_admission
         self._fund_verified = fund_verified
 
-    def authorize(self, guild_id: int | None, user_id: int) -> None:
+    async def authorize(self, guild_id: int | None, user_id: int) -> None:
+        if self._authorize_admission is not None:
+            await self._authorize_admission(guild_id, user_id)
+            return
         if not is_discord_id(guild_id) or guild_id != self._guild_id:
             raise CitizenshipAccessError(AccessDeniedReason.WRONG_GUILD)
         if not is_discord_id(user_id) or user_id not in self._allowed_user_ids:
             raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
 
     async def register(self, guild_id: int | None, user_id: int) -> RegistrationResult:
-        self.authorize(guild_id, user_id)
+        await self.authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             now = datetime.now(UTC)
             citizen, created = await repository.get_or_create_verified(self._guild_id, user_id, now)
@@ -137,6 +142,6 @@ class CitizensService[Repository: CitizensRepository]:
             return True
 
     async def get_profile(self, guild_id: int | None, user_id: int) -> Citizen | None:
-        self.authorize(guild_id, user_id)
+        await self.authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             return await repository.get_profile(self._guild_id, user_id)

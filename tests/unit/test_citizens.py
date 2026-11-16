@@ -102,7 +102,7 @@ async def test_rejects_unauthorized_access_before_opening_the_repository(
     reason: AccessDeniedReason,
 ) -> None:
     with pytest.raises(CitizenshipAccessError) as start_error:
-        service.authorize(guild_id, user_id)
+        await service.authorize(guild_id, user_id)
     with pytest.raises(CitizenshipAccessError) as register_error:
         await service.register(guild_id, user_id)
     with pytest.raises(CitizenshipAccessError) as profile_error:

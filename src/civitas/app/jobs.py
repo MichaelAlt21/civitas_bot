@@ -7,6 +7,7 @@ from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from enum import StrEnum
 from typing import Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import is_discord_id
 from civitas.app.wallet import WalletRepository
 from civitas.domain.citizens import Citizen, CitizenStatus
@@ -169,7 +170,7 @@ class JobService:
         unit_of_work: Callable[[], AbstractAsyncContextManager[JobsRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         staff_user_ids: Iterable[int],
         rules: JobsRules,
         clock: Callable[[], datetime] = _utcnow,
@@ -179,20 +180,20 @@ class JobService:
             raise ValueError("Staff IDs must be Discord snowflakes")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._staff_user_ids = frozenset(staff_ids)
         self._rules = rules
         self._clock = clock
 
     async def list_tasks(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[JobTask, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             await self._verified_citizen(repository, user_id)
             return await repository.list_available_tasks(self._guild_id, self._clock(), JOBS_PAGE_SIZE, offset=offset)
 
     async def get_task_details(self, guild_id: int | None, user_id: int, task_id: int) -> JobDetail:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             citizen = await self._verified_citizen(repository, user_id)
             task = await self._task(repository, task_id)
@@ -202,14 +203,14 @@ class JobService:
             return JobDetail(task, claim)
 
     async def list_submitted_task_ids(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[int, ...]:
-        self._authorize_staff(guild_id, user_id)
+        await self._authorize_staff(guild_id, user_id)
         offset = _page_offset(page)
         async with self._unit_of_work() as repository:
             await self._verified_citizen(repository, user_id)
             return await repository.list_submitted_task_ids(self._guild_id, JOBS_PAGE_SIZE, offset=offset)
 
     async def get_review(self, guild_id: int | None, user_id: int, task_id: int) -> JobDetail:
-        self._authorize_staff(guild_id, user_id)
+        await self._authorize_staff(guild_id, user_id)
         async with self._unit_of_work() as repository:
             await self._verified_citizen(repository, user_id)
             task = await self._task(repository, task_id)
@@ -226,7 +227,7 @@ class JobService:
         reward: int,
         expires_at: datetime,
     ) -> JobTask:
-        self._authorize_staff(guild_id, user_id)
+        await self._authorize_staff(guild_id, user_id)
         if not isinstance(category, JobCategory):
             raise JobError(JobErrorReason.INVALID_CATEGORY)
         if type(reward) is not int or not self._rules.reward_min <= reward <= self._rules.reward_max:
@@ -252,7 +253,7 @@ class JobService:
             )
 
     async def claim(self, guild_id: int | None, user_id: int, task_id: int) -> JobClaim:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             task = await self._task(repository, task_id, lock=True)
             existing = await repository.get_claim(task.id, lock=True)
@@ -278,7 +279,7 @@ class JobService:
     async def submit(
         self, guild_id: int | None, user_id: int, task_id: int, evidence: str
     ) -> JobClaim:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         evidence = _text(evidence, 500)
         async with self._unit_of_work() as repository:
             task = await self._task(repository, task_id, lock=True)
@@ -299,7 +300,7 @@ class JobService:
     async def review(
         self, guild_id: int | None, user_id: int, task_id: int, *, approve: bool, reason: str
     ) -> JobClaim:
-        self._authorize_staff(guild_id, user_id)
+        await self._authorize_staff(guild_id, user_id)
         reason = _text(reason, 200)
         async with self._unit_of_work() as repository:
             task = await self._task(repository, task_id, lock=True)
@@ -370,8 +371,8 @@ class JobService:
         await repository.record_budget_spend(period, task.reward)
         return replace(claim, payout_transaction_id=payout.transaction_id, budget_period_id=period.id)
 
-    def _authorize_staff(self, guild_id: int | None, user_id: int) -> None:
-        self._authorize(guild_id, user_id)
+    async def _authorize_staff(self, guild_id: int | None, user_id: int) -> None:
+        await self._authorize(guild_id, user_id)
         if user_id not in self._staff_user_ids:
             raise JobError(JobErrorReason.STAFF_REQUIRED)
 

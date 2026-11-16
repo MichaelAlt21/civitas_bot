@@ -11,13 +11,15 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from civitas.app.assets import AssetError, AssetErrorReason, AssetService
-from civitas.app.citizens import CitizensService
+from civitas.app.admission import AdmissionService
+from civitas.app.citizens import AccessDeniedReason, CitizenshipAccessError, CitizensService
 from civitas.app.market import MarketRules, MarketService
 from civitas.app.receipts import ReceiptService
 from civitas.app.reports import ReportService
 from civitas.app.wallet import WalletFunding, WalletService
 from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetResaleStatus, AssetStatus
 from civitas.domain.ledger import AccountKind, LedgerError, LedgerErrorReason, TransactionKind
+from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
 from civitas.infrastructure.db.asset_models import AssetRow, AssetTransferRow
 from civitas.infrastructure.db.assets import PostgresAssetUnitOfWork
 from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
@@ -329,3 +331,33 @@ async def test_cancelled_unauthorized_or_unfunded_resale_preserves_property(pg_e
     wallet = WalletService(uow, guild_id=GUILD, authorize=citizens.authorize, funding=funding)
     assert await wallet.balance(GUILD, BUYER) == 150
     assert await wallet.balance(GUILD, OTHER) == 250
+
+
+async def test_resale_checks_seller_against_current_admission_before_payment(pg_engine: AsyncEngine) -> None:
+    uow, _, _, funding = await _setup(pg_engine)
+    admission = AdmissionService(PostgresAdmissionUnitOfWork(pg_engine), guild_id=GUILD)
+    await admission.initialize((STAFF, BUYER, OTHER))
+    assets = AssetService(
+        uow, guild_id=GUILD, authorize=admission.authorize, staff_user_ids={STAFF}, funding=funding,
+        clock=lambda: NOW, resale_tax_bp=200, use_persisted_admission=True,
+    )
+    asset = await _issue(assets)
+    quote = await assets.quote_asset(GUILD, BUYER, asset.id)
+    await assets.buy_asset(GUILD, BUYER, quote, idempotency_key="primary")
+    offer = await assets.create_resale_offer(
+        GUILD, BUYER, asset_id=asset.id, buyer_user_id=OTHER, price=200, idempotency_key="admitted-resale",
+    )
+
+    assert await admission.set_allowed(
+        GUILD, STAFF, administrator=True, target_user_id=BUYER, allowed=False, reason="Revoked admission",
+    )
+    with pytest.raises(CitizenshipAccessError, match=AccessDeniedReason.NOT_ALLOWED):
+        await assets.buy_resale(GUILD, OTHER, offer.id)
+    wallet = WalletService(uow, guild_id=GUILD, authorize=admission.authorize, funding=funding)
+    assert await wallet.balance(GUILD, OTHER) == 250
+    assert await assets.get_resale_offer(GUILD, OTHER, offer.id) == offer
+
+    assert await admission.set_allowed(GUILD, STAFF, administrator=True, target_user_id=BUYER, allowed=True)
+    completed = await assets.buy_resale(GUILD, OTHER, offer.id)
+    assert completed.status == AssetResaleStatus.COMPLETED
+    assert await wallet.balance(GUILD, OTHER) == 50

@@ -95,12 +95,12 @@ async def test_start_links_registration_and_profile():
 
     await get_command(bot, "start").callback(interaction)
 
-    service.authorize.assert_called_once_with(GUILD_ID, USER_ID)
-    response = interaction.response.send_message.await_args
-    assert response.kwargs["ephemeral"] is True
+    service.authorize.assert_awaited_once_with(GUILD_ID, USER_ID)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    response = interaction.edit_original_response.await_args
     assert response.kwargs["view"].register_button.label == "Стать гражданином"
-    assert "/citizen register" in response.args[0]
-    assert "/profile" in response.args[0]
+    assert "/citizen register" in response.kwargs["content"]
+    assert "/profile" in response.kwargs["content"]
 
 
 @pytest.mark.asyncio
@@ -114,7 +114,7 @@ async def test_start_button_uses_same_registration_as_slash_command():
     bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
     opening = fake_interaction(locale=discord.Locale.american_english)
     await get_command(bot, "start").callback(opening)
-    view = opening.response.send_message.await_args.kwargs["view"]
+    view = opening.edit_original_response.await_args.kwargs["view"]
     assert view.register_button.label == "Become a citizen"
     service.register.assert_not_awaited()
 
@@ -139,7 +139,7 @@ async def test_start_button_refuses_other_users_and_guilds_and_disappears_on_tim
     bot = create_bot(citizens_service=service, guild_id=GUILD_ID)
     opening = fake_interaction()
     await get_command(bot, "start").callback(opening)
-    view = opening.response.send_message.await_args.kwargs["view"]
+    view = opening.edit_original_response.await_args.kwargs["view"]
     for click in (fake_interaction(user_id=USER_ID + 1), fake_interaction(guild_id=GUILD_ID + 1)):
         assert not await view.interaction_check(click)
         click.response.send_message.assert_awaited_once_with(
@@ -149,7 +149,7 @@ async def test_start_button_refuses_other_users_and_guilds_and_disappears_on_tim
 
     await view.on_timeout()
 
-    opening.edit_original_response.assert_awaited_once_with(view=None)
+    opening.edit_original_response.assert_awaited_with(view=None)
 
 
 @pytest.mark.asyncio
@@ -162,7 +162,7 @@ async def test_registration_explains_economy_pause_privately(route):
     if route == "button":
         opening = fake_interaction()
         await get_command(bot, "start").callback(opening)
-        view = opening.response.send_message.await_args.kwargs["view"]
+        view = opening.edit_original_response.await_args.kwargs["view"]
         assert await view.interaction_check(request)
         await view.register_button.callback(request)
     else:
@@ -260,7 +260,7 @@ async def test_profile_lists_office_company_and_asset_without_a_balance():
 
     response = interaction.followup.send.await_args
     assert response.kwargs == {"ephemeral": True}
-    assert "Public offices: Member of Parliament" in response.args[0]
+    assert "Public offices: Senator" in response.args[0]
     assert "Workshop" in response.args[0] and "Office" in response.args[0]
     assert "balance" not in response.args[0].lower()
 
@@ -318,12 +318,14 @@ async def test_wrong_guild_or_denied_user_receives_private_error(
 
     await get_command(bot, command_name).callback(interaction)
 
-    send = (
-        interaction.response.send_message if command_name == "start" else interaction.followup.send
-    )
-    send.assert_awaited_once()
-    assert expected in send.await_args.args[0]
-    assert send.await_args.kwargs == {"ephemeral": True}
+    if command_name == "start":
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.edit_original_response.assert_awaited_once()
+        assert expected in interaction.edit_original_response.await_args.kwargs["content"]
+    else:
+        interaction.followup.send.assert_awaited_once()
+        assert expected in interaction.followup.send.await_args.args[0]
+        assert interaction.followup.send.await_args.kwargs == {"ephemeral": True}
     unit_of_work.assert_not_called()
 
 

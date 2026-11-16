@@ -7,6 +7,7 @@ from datetime import UTC, datetime, tzinfo
 from enum import StrEnum
 from typing import Literal, Protocol
 
+from civitas.app.authorization import Authorizer, as_async_authorizer
 from civitas.app.citizens import CitizenshipAccessError, is_discord_id
 from civitas.app.jobs import JobError, JobErrorReason, JobsRepository, budget_week
 from civitas.app.market import MarketRepository
@@ -144,7 +145,7 @@ class TreasuryService:
         unit_of_work: Callable[[], AbstractAsyncContextManager[TreasuryRepository]],
         *,
         guild_id: int,
-        authorize: Callable[[int | None, int], None],
+        authorize: Authorizer,
         initiator_user_ids: Iterable[int],
         approver_user_ids: Iterable[int],
         rules: TreasuryRules,
@@ -156,7 +157,7 @@ class TreasuryService:
             raise ValueError("Treasury staff IDs must be Discord snowflakes")
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
-        self._authorize = authorize
+        self._authorize = as_async_authorizer(authorize)
         self._initiator_user_ids = frozenset(initiators)
         self._approver_user_ids = frozenset(approvers)
         self._rules = rules
@@ -164,14 +165,14 @@ class TreasuryService:
         self._elected_authority = elected_authority
 
     async def current_budget(self, guild_id: int | None, user_id: int) -> ContractBudget | None:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             citizen = await self._citizen(repository, user_id)
             return await repository.get_contract_budget(citizen.guild_id, self._clock())
 
     async def activate_budget(self, guild_id: int | None, user_id: int, *, reason: str) -> ContractBudget:
         async with self._audit_denial(guild_id, user_id, "budget.activate"):
-            self._authorize(guild_id, user_id)
+            await self._authorize(guild_id, user_id)
             if not self._elected_authority:
                 self._require_approver(user_id)
             reason = _text(reason, 200)
@@ -211,7 +212,7 @@ class TreasuryService:
         idempotency_key: str,
     ) -> StateContract:
         async with self._audit_denial(guild_id, user_id, "contract.propose"):
-            self._authorize(guild_id, user_id)
+            await self._authorize(guild_id, user_id)
             if not self._elected_authority and user_id not in self._initiator_user_ids:
                 raise TreasuryError(TreasuryErrorReason.INITIATOR_REQUIRED)
             if (recipient_user_id is None) == (recipient_company_id is None):
@@ -366,7 +367,7 @@ class TreasuryService:
             return cancelled
 
     async def get_contract(self, guild_id: int | None, user_id: int, contract_id: int) -> StateContract:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         async with self._unit_of_work() as repository:
             actor = await self._citizen(repository, user_id)
             contract = await self._contract(repository, actor.guild_id, contract_id)
@@ -383,7 +384,7 @@ class TreasuryService:
             return contract
 
     async def list_contracts(self, guild_id: int | None, user_id: int, *, page: int = 1) -> tuple[StateContract, ...]:
-        self._authorize(guild_id, user_id)
+        await self._authorize(guild_id, user_id)
         if type(page) is not int or not 1 <= page <= MAX_AMOUNT // CONTRACT_PAGE_SIZE + 1:
             raise TreasuryError(TreasuryErrorReason.INVALID_PAGE)
         offset = (page - 1) * CONTRACT_PAGE_SIZE
@@ -400,7 +401,7 @@ class TreasuryService:
         approver: bool = False, lock: bool = True,
     ) -> AsyncIterator[tuple[TreasuryRepository, Citizen, StateContract, Citizen | None]]:
         async with self._audit_denial(guild_id, user_id, action, contract_id):
-            self._authorize(guild_id, user_id)
+            await self._authorize(guild_id, user_id)
             if approver and not self._elected_authority:
                 self._require_approver(user_id)
             async with self._unit_of_work() as repository:

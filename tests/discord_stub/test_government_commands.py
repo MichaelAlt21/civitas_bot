@@ -107,6 +107,10 @@ async def test_localized_government_commands_are_guild_only(commands):
     cancel_reason = next(item for item in by_name["cancel"]["options"] if item["name"] == "reason")
     assert cancel_reason["description"] == "Reason shown to the public after confirmation"
     opening = next(option for option in commission["options"] if option["name"] == "open")
+    office = next(option for option in opening["options"] if option["name"] == "office")
+    senate = next(choice for choice in office["choices"] if choice["value"] == OfficeKind.PARLIAMENT.value)
+    assert senate["name"] == "Senate"
+    assert senate["name_localizations"] == {"ru": "Сенат"}
     retry = next(option for option in opening["options"] if option["name"] == "retry_of_id")
     assert retry["description_localizations"] == {"ru": "Номер несостоявшихся выборов для повторного голосования"}
     assert not retry["required"]

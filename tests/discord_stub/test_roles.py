@@ -2,13 +2,14 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import discord
 import pytest
 
-from civitas.bot import roles
+from civitas.bot import government, roles
 from civitas.domain.citizens import Citizen, CitizenStatus
+from civitas.domain.government import OfficeKind
 
 GUILD_ID = 100
 ROLE_ID = 200
@@ -195,3 +196,56 @@ async def test_worker_retries_after_a_database_failure(discord_server, monkeypat
     client.wait_until_ready.assert_awaited_once()
     repository.list_role_members.assert_awaited_with(GUILD_ID)
     member.add_roles.assert_awaited_with(role, reason="Civitas citizenship sync")
+
+
+@pytest.mark.asyncio
+async def test_citizen_worker_reads_current_role_at_each_tick(discord_server, monkeypatch):
+    client, _, _ = discord_server
+    unit_of_work = Mock()
+    cleared = asyncio.Event()
+    updates = iter((None, ROLE_ID, ROLE_ID + 1, None))
+
+    async def get_role_id():
+        role_id = next(updates)
+        if role_id is None and reconcile.await_count == 2:
+            cleared.set()
+        return role_id
+
+    reconcile = AsyncMock()
+    monkeypatch.setattr(roles, "_reconcile_once", reconcile)
+    monkeypatch.setattr(roles, "_SYNC_INTERVAL_SECONDS", 0)
+    client.is_closed.side_effect = (False, False, False, False, True)
+
+    async with roles.run_role_sync(client, unit_of_work, guild_id=GUILD_ID, get_role_id=get_role_id):
+        await asyncio.wait_for(cleared.wait(), timeout=1)
+
+    assert reconcile.await_args_list == [
+        call(client, unit_of_work, GUILD_ID, ROLE_ID), call(client, unit_of_work, GUILD_ID, ROLE_ID + 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_office_worker_reads_current_roles_at_each_tick(discord_server, monkeypatch):
+    client, _, _ = discord_server
+    service = Mock()
+    cleared = asyncio.Event()
+    updates = iter(((None, None), (ROLE_ID, ROLE_ID + 1), (None, ROLE_ID + 2), (None, None)))
+
+    async def get_role_ids():
+        role_ids = next(updates)
+        if role_ids == (None, None) and reconcile.await_count == 2:
+            cleared.set()
+        return role_ids
+
+    reconcile = AsyncMock()
+    monkeypatch.setattr(government, "_reconcile_office_roles", reconcile)
+    monkeypatch.setattr(government, "_SYNC_INTERVAL_SECONDS", 0)
+    client.is_closed.side_effect = (False, False, False, False, True)
+
+    async with government.run_office_role_sync(client, service, guild_id=GUILD_ID, get_role_ids=get_role_ids):
+        await asyncio.wait_for(cleared.wait(), timeout=1)
+
+    assert reconcile.await_args_list == [
+        call(client, service, GUILD_ID, {OfficeKind.PRESIDENT: ROLE_ID, OfficeKind.PARLIAMENT: ROLE_ID + 1}),
+        call(client, service, GUILD_ID, {OfficeKind.PARLIAMENT: ROLE_ID + 2}),
+    ]

@@ -103,17 +103,13 @@ def test_season_one_profile_loads_approved_values_and_elected_treasury(season_on
 
 @pytest.mark.parametrize(("key", "value"), [
     ("CIVITAS_MARKET_ARBITER_IDS", ""),
-    ("CIVITAS_MARKET_ARBITER_IDS", "56"),
     ("CIVITAS_ASSET_ISSUER_IDS", ""),
-    ("CIVITAS_ASSET_ISSUER_IDS", "56"),
     ("CIVITAS_NPC_REVIEWER_IDS", ""),
-    ("CIVITAS_NPC_REVIEWER_IDS", "56"),
     ("CIVITAS_ELECTION_COMMISSIONER_IDS", ""),
-    ("CIVITAS_ELECTION_COMMISSIONER_IDS", "56,78"),
-    ("CIVITAS_ELECTION_COMMISSIONER_IDS", "12,56"),
+    ("CIVITAS_ELECTION_COMMISSIONER_IDS", "12"),
 ])
 @pytest.mark.parametrize("args", [[], ["--check-config"]], ids=["startup", "config-check"])
-def test_season_one_checks_staff_admission_before_startup(season_one_env, monkeypatch, args, key, value) -> None:
+def test_season_one_checks_staff_configuration_before_startup(season_one_env, monkeypatch, args, key, value) -> None:
     season_one_env[key] = value
     monkeypatch.setattr(entrypoint.os, "environ", season_one_env)
 
@@ -124,6 +120,13 @@ def test_season_one_checks_staff_admission_before_startup(season_one_env, monkey
     monkeypatch.setattr(entrypoint, "create_db_engine", unexpected_startup)
     with pytest.raises(SystemExit, match=key):
         entrypoint.main(args)
+
+
+def test_season_one_can_start_with_no_legacy_admission_list(season_one_env):
+    del season_one_env["CIVITAS_ALLOWED_USER_IDS"]
+    settings = load_settings(season_one_env)
+    assert settings.allowed_user_ids == frozenset()
+    assert settings.government is not None
 
 
 def test_citizen_role_is_optional_and_accepts_a_snowflake(env: dict[str, str]) -> None:
