@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 async def _report_interaction_error(interaction: discord.Interaction, error: Exception) -> None:
-    if isinstance(error, LedgerError) and error.reason == LedgerErrorReason.ECONOMY_READ_ONLY:
-        reply = message(interaction.locale, "wallet.error.economy_read_only")
+    if isinstance(error, LedgerError) and error.reason in (LedgerErrorReason.ECONOMY_READ_ONLY, LedgerErrorReason.IN_CUSTODY):
+        reply = message(interaction.locale, f"wallet.error.{error.reason.value}")
     else:
         logger.error("Ошибка выполнения команды Civitas (%s)", type(error).__name__)
         reply = message(interaction.locale, "error.temporary")

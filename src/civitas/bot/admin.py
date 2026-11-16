@@ -28,6 +28,7 @@ _ROLE_BINDINGS = {
     "Citizen": PresentationBinding.CITIZEN_ROLE,
     "President": PresentationBinding.PRESIDENT_ROLE,
     "Senator": PresentationBinding.PARLIAMENT_ROLE,
+    "In Custody": PresentationBinding.CUSTODY_ROLE,
 }
 
 

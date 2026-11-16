@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from civitas.domain.citizens import Citizen
 from civitas.domain.ledger import (
@@ -21,6 +22,8 @@ from civitas.domain.ledger import (
 )
 
 from .citizens import PostgresCitizensRepository, _to_citizen
+from .court_appeal_models import CourtAppealConfirmationRow
+from .court_case_models import CourtActDecisionRow, CourtCaseRow
 from .jobs_models import BudgetPeriodRow
 from .ledger_models import FinancialAccountRow, FinancialTransactionRow, LedgerEntryRow
 from .models import CitizenRow, GuildRow
@@ -28,7 +31,32 @@ from .models import CitizenRow, GuildRow
 _MIN_BIGINT = -MAX_AMOUNT - 1
 
 
+def active_custody_at(at: datetime) -> ColumnElement[bool]:
+    overturned = select(CourtAppealConfirmationRow.case_id).where(
+        CourtAppealConfirmationRow.guild_id == CourtActDecisionRow.guild_id,
+        CourtAppealConfirmationRow.case_id == CourtActDecisionRow.case_id,
+        CourtAppealConfirmationRow.outcome == "OVERTURNED",
+        CourtAppealConfirmationRow.confirmed_at <= at,
+    ).exists()
+    return (
+        CourtActDecisionRow.custody_hours.is_not(None)
+        & (CourtActDecisionRow.decided_at <= at)
+        & (CourtActDecisionRow.decided_at + CourtActDecisionRow.custody_hours * text("interval '1 hour'") > at)
+        & ~overturned
+    )
+
+
 class PostgresLedgerRepository(PostgresCitizensRepository):
+    async def require_free(self, guild_id: int, citizen_id: int, *, at: datetime) -> None:
+        active = select(CourtActDecisionRow.case_id).join(
+            CourtCaseRow, CourtCaseRow.id == CourtActDecisionRow.case_id,
+        ).where(
+            CourtActDecisionRow.guild_id == guild_id, CourtCaseRow.respondent_citizen_id == citizen_id,
+            active_custody_at(at),
+        ).exists()
+        if await self._session.scalar(select(active)):
+            raise LedgerError(LedgerErrorReason.IN_CUSTODY)
+
     async def ensure_guild(self, guild_id: int) -> int:
         return await self._get_or_create_guild(guild_id, datetime.now(UTC))
 
@@ -63,6 +91,58 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
     async def ensure_private_job_escrow(self, guild_id: int, job_id: int) -> Account:
         return await self._ensure_account(guild_id, AccountKind.ESCROW, private_job_id=job_id)
 
+    async def hold_court_fine(self, guild_id: int, case_id: int) -> PostResult:
+        record = await self._court_fine(guild_id, case_id)
+        if record is None:
+            raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+        decision, respondent_id = record
+        overturned = await self._session.scalar(select(CourtAppealConfirmationRow.case_id).where(
+            CourtAppealConfirmationRow.guild_id == guild_id, CourtAppealConfirmationRow.case_id == case_id,
+            CourtAppealConfirmationRow.outcome == "OVERTURNED",
+        ))
+        if overturned is not None:
+            raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+        personal = await self.ensure_account(guild_id, AccountKind.PERSONAL, respondent_id)
+        escrow = await self._ensure_account(guild_id, AccountKind.ESCROW, court_case_id=case_id)
+        return await self.post(
+            guild_id, TransactionKind.COURT_FINE_HOLD, f"court_fine_hold:{case_id}",
+            {personal.id: -decision.fine_amount, escrow.id: decision.fine_amount},
+            actor_citizen_id=decision.judge_citizen_id, reason=decision.reason,
+        )
+
+    async def _court_fine(self, guild_id: int, case_id: int):
+        return (await self._session.execute(
+            select(CourtActDecisionRow, CourtCaseRow.respondent_citizen_id)
+            .join(CourtCaseRow, CourtCaseRow.id == CourtActDecisionRow.case_id)
+            .where(
+                CourtActDecisionRow.guild_id == guild_id, CourtActDecisionRow.case_id == case_id,
+                CourtActDecisionRow.fine_amount.is_not(None),
+            )
+            .with_for_update(of=CourtActDecisionRow, key_share=True),
+        )).one_or_none()
+
+    async def close_court_fine(
+        self, guild_id: int, case_id: int, *, refund: bool, confirmed_by: int | None, settled_at: datetime | None = None,
+    ) -> PostResult | None:
+        record = await self._court_fine(guild_id, case_id)
+        if record is None or await self.get_post(
+            guild_id, TransactionKind.COURT_FINE_HOLD, f"court_fine_hold:{case_id}",
+        ) is None:
+            return None
+        decision, respondent_id = record
+        escrow = await self._ensure_account(guild_id, AccountKind.ESCROW, court_case_id=case_id)
+        if refund:
+            destination = await self.ensure_account(guild_id, AccountKind.PERSONAL, respondent_id)
+            kind = TransactionKind.COURT_FINE_REFUND
+        else:
+            destination = await self.ensure_account(guild_id, AccountKind.TREASURY)
+            kind = TransactionKind.COURT_FINE_SETTLE
+        return await self.post(
+            guild_id, kind, f"{kind.value.lower()}:{case_id}",
+            {escrow.id: -decision.fine_amount, destination.id: decision.fine_amount},
+            actor_citizen_id=confirmed_by, reason=decision.reason, posted_at=settled_at,
+        )
+
     async def _ensure_account(
         self,
         guild_id: int,
@@ -72,12 +152,14 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
         company_id: int | None = None,
         order_id: int | None = None,
         private_job_id: int | None = None,
+        court_case_id: int | None = None,
     ) -> Account:
         row = await self._session.scalar(
             insert(FinancialAccountRow)
             .values(
                 guild_id=guild_id, kind=kind.value, citizen_id=citizen_id,
                 organization_id=company_id, order_id=order_id, private_job_id=private_job_id,
+                court_case_id=court_case_id,
             )
             .on_conflict_do_nothing(constraint="uq_financial_accounts_owner")
             .returning(FinancialAccountRow)
@@ -92,6 +174,7 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
                         FinancialAccountRow.organization_id == company_id,
                         FinancialAccountRow.order_id == order_id,
                         FinancialAccountRow.private_job_id == private_job_id,
+                        FinancialAccountRow.court_case_id == court_case_id,
                     )
                 )
             ).one()
@@ -99,6 +182,7 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
             id=row.id, guild_id=row.guild_id, kind=AccountKind(row.kind),
             citizen_id=row.citizen_id, company_id=row.organization_id, order_id=row.order_id,
             private_job_id=row.private_job_id,
+            court_case_id=row.court_case_id,
         )
 
     async def get_balance(self, account_id: int) -> int:
@@ -192,6 +276,7 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
         *,
         actor_citizen_id: int | None = None,
         reason: str,
+        posted_at: datetime | None = None,
     ) -> PostResult:
         entries = dict(entries)
         if (
@@ -224,7 +309,27 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
         if existing is not None:
             return await self._replay(existing, entries, actor_citizen_id, reason)
 
-        _validate_accounts(kind, key, accounts, entries)
+        if kind is TransactionKind.COURT_FINE_HOLD:
+            if len(accounts) != 2:
+                raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+            personal = next(account for account in accounts if entries[account.id] < 0)
+            escrow = next(account for account in accounts if entries[account.id] > 0)
+            if escrow.court_case_id is None or key != f"court_fine_hold:{escrow.court_case_id}":
+                raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+            record = await self._court_fine(guild_id, escrow.court_case_id)
+            if record is None:
+                raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+            decision, respondent_id = record
+            if (
+                personal.kind != AccountKind.PERSONAL or personal.citizen_id != respondent_id
+                or entries[escrow.id] != decision.fine_amount or actor_citizen_id != decision.judge_citizen_id
+                or reason != decision.reason
+            ):
+                raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+        elif kind not in (TransactionKind.COURT_FINE_REFUND, TransactionKind.COURT_FINE_SETTLE):
+            if any(account.court_case_id is not None for account in accounts):
+                raise LedgerError(LedgerErrorReason.INVALID_POSTING)
+            _validate_accounts(kind, key, accounts, entries)
         balances = await self._session.execute(
             select(LedgerEntryRow.account_id, func.sum(LedgerEntryRow.delta))
             .where(LedgerEntryRow.account_id.in_(account_ids))
@@ -253,6 +358,7 @@ class PostgresLedgerRepository(PostgresCitizensRepository):
                 entry_count=len(entries),
                 actor_citizen_id=actor_citizen_id,
                 reason=reason,
+                **({"created_at": posted_at} if posted_at is not None else {}),
             )
             .on_conflict_do_nothing(constraint="uq_financial_transactions_operation")
             .returning(FinancialTransactionRow.id)

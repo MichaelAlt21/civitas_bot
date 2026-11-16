@@ -236,6 +236,7 @@ class TreasuryService:
                 prior = await repository.get_contract_by_key(proposer.guild_id, idempotency_key)
                 if prior is None:
                     now = self._clock()
+                    await repository.require_free(proposer.guild_id, proposer.id, at=now)
                     if deadline <= now:
                         raise TreasuryError(TreasuryErrorReason.INVALID_DEADLINE)
                     recipient = await self._recipient(repository, proposer.guild_id, recipient_user_id, recipient_company_id)

@@ -1,5 +1,7 @@
 """Discord commands for public court appeals and commission certification."""
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -13,6 +15,31 @@ from .localization import command_description, message
 from .responses import send_private_lines
 
 _VOTER_PAGE_SIZE = 20
+_FINE_INTERVAL_SECONDS = 30
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def run_court_fines(client: discord.Client, service: CourtAppealService | None) -> AsyncIterator[None]:
+    if service is None:
+        yield
+        return
+
+    async def run() -> None:
+        await client.wait_until_ready()
+        while not client.is_closed():
+            try:
+                await service.reconcile_fines()
+            except Exception as error:
+                logger.warning("Ошибка обработки судебных штрафов (%s)", type(error).__name__)
+            await asyncio.sleep(_FINE_INTERVAL_SECONDS)
+
+    task = asyncio.create_task(run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @asynccontextmanager

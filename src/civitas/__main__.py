@@ -30,8 +30,8 @@ from civitas.app.wallet import WalletFunding, WalletService
 from civitas.bot import create_bot
 from civitas.bot.admin import add_admin_commands
 from civitas.bot.assets import add_asset_commands
-from civitas.bot.court import add_court_commands
-from civitas.bot.appeals import add_appeal_commands
+from civitas.bot.court import add_court_commands, run_custody_role_sync
+from civitas.bot.appeals import add_appeal_commands, run_court_fines
 from civitas.bot.government import add_government_commands, run_office_role_sync
 from civitas.bot.jobs import add_job_commands
 from civitas.bot.law import add_law_commands
@@ -76,6 +76,9 @@ async def run_bot(settings: Settings) -> None:
 
         async def citizen_role_id() -> int | None:
             return (await presentation.current()).citizen_role_id
+
+        async def custody_role_id() -> int | None:
+            return (await presentation.current()).custody_role_id
 
         async def office_role_ids() -> tuple[int | None, int | None]:
             current = await presentation.current()
@@ -233,6 +236,8 @@ async def run_bot(settings: Settings) -> None:
         )
         add_report_commands(bot.tree, guild_scope=bot.guild_scope, service=reports, currency_symbol=currency_symbol)
         government = None
+        court_appeals = None
+        court_cases = None
         if government_settings is not None:
             government = GovernmentService(
                 unit_of_work, guild_id=settings.guild_id, authorize=service.authorize,
@@ -246,20 +251,19 @@ async def run_bot(settings: Settings) -> None:
                 ),
             )
             add_government_commands(bot.tree, guild_scope=bot.guild_scope, government_service=government)
+            court_cases = CourtCaseService(PostgresCourtCaseUnitOfWork(engine), guild_id=settings.guild_id)
             add_court_commands(
                 bot.tree, guild_scope=bot.guild_scope,
                 service=CourtService(PostgresCourtUnitOfWork(engine), guild_id=settings.guild_id),
-                case_service=CourtCaseService(PostgresCourtCaseUnitOfWork(engine), guild_id=settings.guild_id),
+                case_service=court_cases,
             )
-            add_appeal_commands(
-                bot.tree, guild_scope=bot.guild_scope,
-                service=CourtAppealService(
-                    PostgresCourtAppealUnitOfWork(engine), guild_id=settings.guild_id,
-                    commissioner_user_ids=government_settings.commissioner_ids,
-                    quorum_bp=government_settings.quorum_bp, quorum_min=government_settings.quorum_min,
-                    poll_hosts=government_settings.poll_hosts,
-                ),
+            court_appeals = CourtAppealService(
+                PostgresCourtAppealUnitOfWork(engine), guild_id=settings.guild_id,
+                commissioner_user_ids=government_settings.commissioner_ids,
+                quorum_bp=government_settings.quorum_bp, quorum_min=government_settings.quorum_min,
+                poll_hosts=government_settings.poll_hosts,
             )
+            add_appeal_commands(bot.tree, guild_scope=bot.guild_scope, service=court_appeals)
             add_law_commands(
                 bot.tree, guild_scope=bot.guild_scope,
                 service=LawService(PostgresLawUnitOfWork(engine), guild_id=settings.guild_id),
@@ -277,6 +281,8 @@ async def run_bot(settings: Settings) -> None:
             run_role_sync(bot, unit_of_work, guild_id=settings.guild_id, get_role_id=citizen_role_id),
             run_membership_sync(bot, unit_of_work, service, guild_id=settings.guild_id, enabled=settings.track_membership),
             run_receipt_publisher(bot, receipts),
+            run_court_fines(bot, court_appeals),
+            run_custody_role_sync(bot, court_cases, guild_id=settings.guild_id, get_role_id=custody_role_id),
             run_report_publisher(
                 bot, reports,
                 guild_id=settings.guild_id, currency_symbol=currency_symbol,

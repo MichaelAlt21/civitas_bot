@@ -68,7 +68,7 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         assert {command.name for command in court.commands} >= {"nominate", "approve", "current", "case"}
         assert {command.name for command in court.get_command("case").commands} == {
             "civil", "charge", "challenge", "challenge_decree", "show", "list", "schedule",
-            "decide_challenge", "decision", "returns",
+            "decide_challenge", "decide_merits", "decision", "fine_status", "returns",
         }
         assert {command.name for command in court.get_command("appeal").commands} == {
             "file", "open", "voters", "record", "confirm", "show",

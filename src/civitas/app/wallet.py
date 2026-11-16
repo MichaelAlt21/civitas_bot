@@ -2,6 +2,7 @@
 
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -38,6 +39,8 @@ class WalletError(Exception):
 
 
 class WalletRepository(Protocol):
+    async def require_free(self, guild_id: int, citizen_id: int, *, at: datetime) -> None: ...
+
     async def get_citizens(
         self, guild_id: int, user_ids: tuple[int, ...], *, lock: bool = False
     ) -> tuple[Citizen, ...]: ...
@@ -117,6 +120,10 @@ class WalletFunding:
         return account
 
 
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
 class WalletService:
     def __init__(
         self,
@@ -125,11 +132,13 @@ class WalletService:
         guild_id: int,
         authorize: Authorizer,
         funding: WalletFunding,
+        clock: Callable[[], datetime] = _utcnow,
     ) -> None:
         self._unit_of_work = unit_of_work
         self._guild_id = guild_id
         self._authorize = as_async_authorizer(authorize)
         self._funding = funding
+        self._clock = clock
 
     async def initialize_guild(self) -> None:
         async with self._unit_of_work() as repository:
@@ -179,6 +188,7 @@ class WalletService:
         self._validate_transfer(user_id, recipient_user_id, amount)
         async with self._unit_of_work() as repository:
             source, _ = await self._transfer_accounts(repository, user_id, recipient_user_id)
+            await repository.require_free(source.guild_id, source.citizen_id, at=self._clock())
             if await repository.get_balance(source.id) < amount:
                 raise LedgerError(LedgerErrorReason.INSUFFICIENT_FUNDS)
 
@@ -202,6 +212,8 @@ class WalletService:
             raise WalletError(WalletErrorReason.INVALID_TRANSFER_KEY)
         async with self._unit_of_work() as repository:
             source, target = await self._transfer_accounts(repository, user_id, recipient_user_id)
+            if await repository.get_post(source.guild_id, TransactionKind.TRANSFER, idempotency_key) is None:
+                await repository.require_free(source.guild_id, source.citizen_id, at=self._clock())
             return await repository.post(
                 source.guild_id,
                 TransactionKind.TRANSFER,

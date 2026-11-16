@@ -23,7 +23,7 @@ class FinancialAccountRow(Base):
     __tablename__ = "financial_accounts"
     __table_args__ = (
         UniqueConstraint(
-            "guild_id", "kind", "citizen_id", "organization_id", "order_id", "private_job_id",
+            "guild_id", "kind", "citizen_id", "organization_id", "order_id", "private_job_id", "court_case_id",
             name="uq_financial_accounts_owner",
             postgresql_nulls_not_distinct=True,
         ),
@@ -48,13 +48,20 @@ class FinancialAccountRow(Base):
             ["guild_id", "private_job_id"], ["private_jobs.guild_id", "private_jobs.id"],
             name="fk_financial_accounts_private_job", use_alter=True,
         ),
+        ForeignKeyConstraint(
+            ["guild_id", "court_case_id"], ["court_act_decisions.guild_id", "court_act_decisions.case_id"],
+            name="fk_financial_accounts_court_case",
+        ),
         CheckConstraint(
-            "(private_job_id IS NULL AND ((kind = 'PERSONAL' AND citizen_id IS NOT NULL "
+            "(court_case_id IS NULL AND ((private_job_id IS NULL AND ((kind = 'PERSONAL' AND citizen_id IS NOT NULL "
             "AND organization_id IS NULL AND order_id IS NULL) OR (kind IN ('ISSUER', 'TREASURY') "
             "AND citizen_id IS NULL AND organization_id IS NULL AND order_id IS NULL) OR "
             "(kind = 'COMPANY' AND citizen_id IS NULL AND organization_id IS NOT NULL AND order_id IS NULL) OR "
             "(kind = 'ESCROW' AND citizen_id IS NULL AND organization_id IS NULL AND order_id IS NOT NULL))) OR "
-            "(kind = 'ESCROW' AND citizen_id IS NULL AND organization_id IS NULL AND order_id IS NULL AND private_job_id IS NOT NULL)",
+            "(kind = 'ESCROW' AND citizen_id IS NULL AND organization_id IS NULL AND order_id IS NULL "
+            "AND private_job_id IS NOT NULL))) OR "
+            "(kind = 'ESCROW' AND court_case_id IS NOT NULL AND citizen_id IS NULL "
+            "AND organization_id IS NULL AND order_id IS NULL AND private_job_id IS NULL)",
             name="ck_financial_accounts_kind_owner",
         ),
     )
@@ -66,6 +73,7 @@ class FinancialAccountRow(Base):
     organization_id: Mapped[int | None] = mapped_column(BigInteger)
     order_id: Mapped[int | None] = mapped_column(BigInteger)
     private_job_id: Mapped[int | None] = mapped_column(BigInteger)
+    court_case_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -84,7 +92,8 @@ class FinancialTransactionRow(Base):
         CheckConstraint(
             "kind IN ('GENESIS', 'STARTER_GRANT', 'TRANSFER', 'NPC_PAYOUT', "
             "'COMPANY_FEE', 'ORDER_FUND', 'ORDER_SETTLE', 'ORDER_REFUND', 'ASSET_PURCHASE', 'ASSET_RESALE', "
-            "'STATE_CONTRACT_PAYOUT', 'PRIVATE_JOB_FUND', 'PRIVATE_JOB_PAY', 'PRIVATE_JOB_REFUND')",
+            "'STATE_CONTRACT_PAYOUT', 'PRIVATE_JOB_FUND', 'PRIVATE_JOB_PAY', 'PRIVATE_JOB_REFUND', 'COURT_FINE_HOLD', "
+            "'COURT_FINE_REFUND', 'COURT_FINE_SETTLE')",
             name="ck_financial_transactions_kind",
         ),
         CheckConstraint("entry_count >= 2", name="ck_financial_transactions_entry_count"),

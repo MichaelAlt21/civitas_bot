@@ -51,6 +51,7 @@ def _report_embed(
         money_line("tax", report.sales_tax),
         money_line("assets", report.asset_sales),
         money_line("asset_resale_tax", report.asset_resale_tax),
+        money_line("court_fines", report.court_fines),
         money_line("treasury_issuance", report.treasury_issuance),
         money_line("other_income", report.other_income),
         f"**{money_line('expenses', report.total_expenses)}**",

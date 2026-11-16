@@ -11,7 +11,7 @@ from civitas.app.presentation import GuildPresentation, PresentationBinding, Pre
 
 from .presentation_models import GuildPresentationRow, PresentationAuditRow
 
-_ROLE_FIELDS = ("citizen_role_id", "president_role_id", "parliament_role_id")
+_ROLE_FIELDS = ("citizen_role_id", "president_role_id", "parliament_role_id", "custody_role_id")
 
 
 def _to_decimal(value: int | None) -> Decimal | None:
@@ -35,6 +35,7 @@ class PostgresPresentationRepository:
                 president_role_id=_to_decimal(initial.president_role_id),
                 parliament_role_id=_to_decimal(initial.parliament_role_id),
                 report_channel_id=_to_decimal(initial.report_channel_id),
+                custody_role_id=_to_decimal(initial.custody_role_id),
             )
             .on_conflict_do_nothing()
         )
@@ -48,6 +49,7 @@ class PostgresPresentationRepository:
             president_role_id=_to_int(row.president_role_id),
             parliament_role_id=_to_int(row.parliament_role_id),
             report_channel_id=_to_int(row.report_channel_id),
+            custody_role_id=_to_int(row.custody_role_id),
         )
 
     async def set_binding(

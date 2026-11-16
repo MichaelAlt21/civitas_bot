@@ -21,7 +21,7 @@ async def test_presentation_serializes_role_changes_and_does_not_restore_cleared
     with pytest.raises(AdmissionError, match="administrator_required"):
         await service.status(101, 401, administrator=False)
 
-    choices = (PresentationBinding.CITIZEN_ROLE, PresentationBinding.PRESIDENT_ROLE)
+    choices = (PresentationBinding.CITIZEN_ROLE, PresentationBinding.CUSTODY_ROLE)
     results = await asyncio.gather(*(set_role(binding) for binding in choices), return_exceptions=True)
     winner = choices[results.index(True)]
     failure = next(result for result in results if isinstance(result, PresentationError))

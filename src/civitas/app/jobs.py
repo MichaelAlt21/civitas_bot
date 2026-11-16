@@ -239,6 +239,7 @@ class JobService:
         async with self._unit_of_work() as repository:
             citizen = await self._verified_citizen(repository, user_id, lock=True)
             now = self._clock()
+            await repository.require_free(citizen.guild_id, citizen.id, at=now)
             if expires_at <= now:
                 raise JobError(JobErrorReason.INVALID_DEADLINE)
             return await repository.create_task(
@@ -263,6 +264,7 @@ class JobService:
                     return existing
                 raise JobError(JobErrorReason.TASK_ALREADY_CLAIMED)
             now = self._clock()
+            await repository.require_free(citizen.guild_id, citizen.id, at=now)
             self._check_deadline(task, now)
             if self._rules.claim_cooldown_minutes:
                 last = await repository.get_latest_claim_at(task.guild_id, citizen.id)

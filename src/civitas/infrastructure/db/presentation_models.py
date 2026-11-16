@@ -32,8 +32,13 @@ class GuildPresentationRow(Base):
         ),
         CheckConstraint(
             "citizen_role_id <> president_role_id AND citizen_role_id <> parliament_role_id "
-            "AND president_role_id <> parliament_role_id",
+            "AND president_role_id <> parliament_role_id AND custody_role_id <> citizen_role_id "
+            "AND custody_role_id <> president_role_id AND custody_role_id <> parliament_role_id",
             name="ck_guild_presentations_distinct_roles",
+        ),
+        CheckConstraint(
+            "custody_role_id BETWEEN 1 AND 18446744073709551615 AND custody_role_id <> discord_guild_id",
+            name="ck_guild_presentations_custody_role",
         ),
     )
 
@@ -42,6 +47,7 @@ class GuildPresentationRow(Base):
     president_role_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0))
     parliament_role_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0))
     report_channel_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0))
+    custody_role_id: Mapped[Decimal | None] = mapped_column(Numeric(20, 0))
 
 
 class PresentationAuditRow(Base):
@@ -52,7 +58,7 @@ class PresentationAuditRow(Base):
             name="ck_presentation_audit_actor",
         ),
         CheckConstraint(
-            "binding IN ('citizen_role_id', 'president_role_id', 'parliament_role_id', 'report_channel_id')",
+            "binding IN ('citizen_role_id', 'president_role_id', 'parliament_role_id', 'report_channel_id', 'custody_role_id')",
             name="ck_presentation_audit_binding",
         ),
         CheckConstraint(

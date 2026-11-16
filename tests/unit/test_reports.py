@@ -152,6 +152,10 @@ async def test_report_reads_persisted_period_boundaries_and_public_totals():
     with_resale_tax = replace(report, asset_resale_tax=4, closing_balance=report.closing_balance + 4)
     assert with_resale_tax.total_income == report.total_income + 4
     assert TreasuryReport.from_payload(json.loads(json.dumps(with_resale_tax.to_payload()))) == with_resale_tax
+    assert "court_fines" not in report.to_payload()
+    with_fines = replace(report, court_fines=35, closing_balance=report.closing_balance + 35)
+    assert with_fines.total_income == report.total_income + 35
+    assert TreasuryReport.from_payload(json.loads(json.dumps(with_fines.to_payload()))) == with_fines
 
 
 @pytest.mark.asyncio

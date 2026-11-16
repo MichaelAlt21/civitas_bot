@@ -225,6 +225,7 @@ class MarketService:
             prior = await repository.get_company_by_key(owner.guild_id, idempotency_key)
             if prior is not None:
                 return self._replay_company(prior, owner.id, name_key, activity, expected_fee)
+            await repository.require_free(owner.guild_id, owner.id, at=self._clock())
             fee = self.registration_fee
             if expected_fee is not None and expected_fee != fee:
                 raise MarketError(MarketErrorReason.QUOTE_CHANGED)
@@ -307,6 +308,7 @@ class MarketService:
             company = await self._owned_company(repository, owner, company_id)
             prior = await repository.get_offer_by_key(owner.guild_id, idempotency_key)
             if prior is None:
+                await repository.require_free(owner.guild_id, owner.id, at=self._clock())
                 offer = await repository.create_offer(
                     guild_id=owner.guild_id,
                     company_id=company.id,
@@ -370,6 +372,7 @@ class MarketService:
             prior = await repository.get_order_by_key(buyer.guild_id, idempotency_key)
             if prior is not None:
                 return self._replay_order(prior, buyer.id, quote)
+            await repository.require_free(buyer.guild_id, buyer.id, at=self._clock())
             offer, seller = await self._trade_parties(
                 repository, buyer, quote.offer.id, quote.buyer_company_id, lock=True,
             )

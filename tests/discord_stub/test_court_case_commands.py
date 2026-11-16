@@ -1,7 +1,7 @@
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, call
 
 import discord
 import pytest
@@ -20,10 +20,14 @@ from civitas.app.court_cases import (
     CourtCaseError,
     CourtCaseErrorReason,
     CourtCaseService,
+    CourtFineStatus,
+    MeritsDecision,
+    MeritsOutcome,
 )
 from civitas.app.law import ActKind
-from civitas.bot.court import add_court_commands
+from civitas.bot.court import _reconcile_custody_role, add_court_commands
 from civitas.bot.localization import CommandTranslator
+from civitas.domain.court_sanctions import CourtSentence, SanctionTerm
 
 
 GUILD_ID, ACTOR_ID, RESPONDENT_ID = (101_000_000_000_000_000 + offset for offset in range(1, 4))
@@ -92,6 +96,96 @@ def private_pages(request):
 
 
 @pytest.mark.asyncio
+async def test_custody_role_adds_current_and_removes_expired_and_manual_assignments(commands, monkeypatch):
+    service, _, _, _ = commands
+    service.custody_role_assignments.return_value = {11: True, 22: False}
+    role = SimpleNamespace(members=[SimpleNamespace(id=33)])
+    guild = SimpleNamespace(unavailable=False)
+    client = Mock(get_guild=Mock(return_value=guild))
+    setter = AsyncMock()
+    monkeypatch.setattr("civitas.bot.court.safe_assignable_role", Mock(return_value=role))
+    monkeypatch.setattr("civitas.bot.court.set_member_role", setter)
+    await _reconcile_custody_role(client, service, GUILD_ID, 99)
+    assert setter.await_args_list == [
+        call(guild, role, user_id, present=present, reason="Civitas in-game custody sync")
+        for user_id, present in ((11, True), (22, False), (33, False))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_decide_merits_passes_fine_and_shows_recorded_terms(commands):
+    service, _, _, cases = commands
+    request = interaction()
+    article = "7 § **б** @everyone"
+    sentence = CourtSentence(article, fine=SanctionTerm(35, 20, 120))
+    service.decide_merits.return_value = MeritsDecision(
+        1, CASE_ID, CaseKind.CRIMINAL, LAW_REVISION_ID, MeritsOutcome.GUILTY, REASON, 4, HEARING, sentence,
+    )
+    await cases.get_command("decide_merits").callback(
+        request, CASE_ID, app_commands.Choice(name="Guilty", value="GUILTY"), REASON,
+        article=article, fine=35, fine_min=20, fine_max=120,
+    )
+    service.decide_merits.assert_awaited_once_with(
+        GUILD_ID, ACTOR_ID, CASE_ID, outcome=MeritsOutcome.GUILTY, reason=REASON,
+        idempotency_key=str(INTERACTION_ID), sentence=sentence,
+    )
+    rendered = "\n".join(private_pages(request))
+    assert "Штраф 35 ₵" in rendered
+    assert "20–120 ₵" in rendered
+    assert "@everyone" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limits", [{}, {"fine_min": 40, "fine_max": 120}])
+async def test_decide_merits_rejects_missing_or_inconsistent_article_limits(commands, limits):
+    service, _, _, cases = commands
+    request = interaction(locale=discord.Locale.american_english)
+    await cases.get_command("decide_merits").callback(
+        request, CASE_ID, app_commands.Choice(name="Guilty", value="GUILTY"), REASON, article="7", fine=35, **limits,
+    )
+    service.decide_merits.assert_not_awaited()
+    assert "A sanction requires a guilty verdict" in private_pages(request)[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_fine", [False, True])
+async def test_decide_merits_records_custody_and_shows_scheduled_end(commands, with_fine):
+    service, _, _, cases = commands
+    request = interaction(locale=discord.Locale.american_english)
+    fine = SanctionTerm(35, 20, 120) if with_fine else None
+    fine_options = {"fine": 35, "fine_min": 20, "fine_max": 120} if with_fine else {}
+    sentence = CourtSentence("7", fine=fine, custody=SanctionTerm(4, 2, 8))
+    service.decide_merits.return_value = MeritsDecision(
+        1, CASE_ID, CaseKind.CRIMINAL, LAW_REVISION_ID, MeritsOutcome.GUILTY, REASON, 4, HEARING, sentence,
+    )
+    await cases.get_command("decide_merits").callback(
+        request, CASE_ID, app_commands.Choice(name="Guilty", value="GUILTY"), REASON,
+        article="7", custody_hours=4, custody_min=2, custody_max=8, **fine_options,
+    )
+    service.decide_merits.assert_awaited_once_with(
+        GUILD_ID, ACTOR_ID, CASE_ID, outcome=MeritsOutcome.GUILTY, reason=REASON,
+        idempotency_key=str(INTERACTION_ID), sentence=sentence,
+    )
+    rendered = "\n".join(private_pages(request))
+    assert "Custody 4 h" in rendered
+    assert "Article limits 2–8 h" in rendered
+    assert discord.utils.format_dt(HEARING + timedelta(hours=4), style="f") in rendered
+    assert ("Fine 35 ₵" in rendered) == with_fine
+
+
+@pytest.mark.asyncio
+async def test_decide_merits_rejects_partial_custody_even_with_complete_fine(commands):
+    service, _, _, cases = commands
+    request = interaction()
+    await cases.get_command("decide_merits").callback(
+        request, CASE_ID, app_commands.Choice(name="Guilty", value="GUILTY"), REASON,
+        article="7", fine=35, fine_min=20, fine_max=120, custody_min=2,
+    )
+    service.decide_merits.assert_not_awaited()
+    assert "оба предела" in private_pages(request)[0]
+
+
+@pytest.mark.asyncio
 async def test_docket_commands_are_guild_scoped_and_localized(commands):
     _, tree, court, _ = commands
     assert not tree.get_commands()
@@ -101,8 +195,8 @@ async def test_docket_commands_are_guild_scoped_and_localized(commands):
     assert case_group["type"] == discord.AppCommandOptionType.subcommand_group.value
     entries = {entry["name"]: entry for entry in case_group["options"]}
     assert set(entries) == {
-        "charge", "challenge", "challenge_decree", "civil", "decide_challenge", "decision", "list", "returns",
-        "schedule", "show",
+        "charge", "challenge", "challenge_decree", "civil", "decide_challenge", "decide_merits", "decision", "list", "returns",
+        "fine_status", "schedule", "show",
     }
     assert entries["civil"]["description"] == "File a civil claim"
     assert entries["civil"]["description_localizations"]["ru"] == "Подать гражданский иск"
@@ -118,9 +212,23 @@ async def test_docket_commands_are_guild_scoped_and_localized(commands):
     outcomes = {choice["value"]: choice for choice in seal["outcome"]["choices"]}
     assert outcomes["GRANTED"]["name_localizations"]["ru"] == "Удовлетворить жалобу"
     assert outcomes["DENIED"]["name"] == "Deny challenge"
+    merits = {option["name"]: option for option in entries["decide_merits"]["options"]}
+    assert merits["fine"]["min_value"] == 10 and merits["fine"]["max_value"] == 100
+    assert merits["custody_hours"]["min_value"] == 1 and merits["custody_hours"]["max_value"] == 24
+    assert merits["article"]["description_localizations"]["ru"].startswith("Статья опубликованного закона")
     returns = {choice["value"]: choice for choice in entries["returns"]["options"][0]["choices"]}
     assert returns["LAW"]["name"] == "Senate laws"
     assert returns["DECREE"]["name_localizations"]["ru"] == "Указы президента"
+
+
+@pytest.mark.asyncio
+async def test_fine_status_receives_caller_id_and_replies_privately(commands):
+    service, _, _, cases = commands
+    request = interaction()
+    service.fine_status.return_value = CourtFineStatus.REFUND_PENDING
+    await cases.get_command("fine_status").callback(request, CASE_ID)
+    service.fine_status.assert_awaited_once_with(GUILD_ID, ACTOR_ID, CASE_ID)
+    assert private_pages(request) == ["Решение отменено. Ваш штраф ожидает возврата."]
 
 
 @pytest.mark.asyncio
@@ -304,7 +412,7 @@ async def test_decide_challenge_rejects_invalid_outcome_and_localizes_a_hearing_
     service.decide_challenge.assert_not_awaited()
     await decide(premature, CASE_ID, chosen, REASON)
 
-    assert "Choose whether to grant or deny" in private_pages(invalid)[0]
+    assert "Choose an outcome that applies" in private_pages(invalid)[0]
     assert "сервер" in private_pages(foreign)[0]
     assert "времени заседания" in private_pages(premature)[0]
 
@@ -326,7 +434,7 @@ async def test_decision_and_docket_draw_the_outcome_without_revealing_case_mater
     await decision(decided, CASE_ID)
     await cases.get_command("show").callback(docket, CASE_ID)
 
-    assert "No administrative decision" in private_pages(undecided)[0]
+    assert "No decision" in private_pages(undecided)[0]
     reply = "\n".join(private_pages(decided))
     assert "Challenge denied" in reply and f"Decree revision #{LAW_REVISION_ID}" in reply
     assert "returned" not in reply and "Private facts" not in reply

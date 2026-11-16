@@ -1,10 +1,13 @@
 import asyncio
+import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import insert
+from test_postgres_restore import restore_database
 
 from civitas.app.admission import AdmissionService
 from civitas.app.citizens import CitizensService
@@ -17,18 +20,33 @@ from civitas.app.court_cases import (
     CourtCaseError,
     CourtCaseErrorReason,
     CourtCaseService,
+    CourtFineStatus,
+    MeritsDecision,
+    MeritsOutcome,
 )
 from civitas.app.government import ElectionRules, GovernmentService
 from civitas.app.law import ActKind, LawError, LawErrorReason, LawService
+from civitas.app.presentation import GuildPresentation, PresentationBinding, PresentationService
+from civitas.app.receipts import ReceiptService
 from civitas.app.prosecutor import ProsecutorAction, ProsecutorError, ProsecutorErrorReason, ProsecutorService
+from civitas.app.wallet import WalletFunding, WalletService
 from civitas.domain.government import OfficeKind
+from civitas.domain.court_sanctions import CourtSentence, SanctionTerm
+from civitas.domain.ledger import AccountKind, LedgerError, LedgerErrorReason, TransactionKind
+from civitas.domain.reports import ReportWindow
 from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
 from civitas.infrastructure.db.court import PostgresCourtUnitOfWork
 from civitas.infrastructure.db.court_appeals import PostgresCourtAppealUnitOfWork
 from civitas.infrastructure.db.court_cases import PostgresCourtCaseUnitOfWork
 from civitas.infrastructure.db.government import PostgresGovernmentUnitOfWork
 from civitas.infrastructure.db.law import PostgresLawUnitOfWork
+from civitas.infrastructure.db.ledger import PostgresLedgerUnitOfWork
+from civitas.infrastructure.db.ledger_models import FinancialAccountRow
+from civitas.infrastructure.db.maintenance import PostgresMaintenanceUnitOfWork
+from civitas.infrastructure.db.reports import PostgresReportUnitOfWork
 from civitas.infrastructure.db.prosecutor import PostgresProsecutorUnitOfWork
+from civitas.infrastructure.db.presentation import PostgresPresentationUnitOfWork
+from civitas.infrastructure.db.receipts import PostgresReceiptUnitOfWork
 
 pytestmark = pytest.mark.asyncio
 
@@ -621,6 +639,420 @@ async def appeal_docket(pg_engine, court_docket):
     current = await _register_law(laws, number=2, effective_at=clock.now)
     current = await laws.confirm(GUILD, DEPUTY_2, current.id)
     return cases, appeals, laws, clock, original, current
+
+
+@pytest.mark.parametrize("criminal", [False, True])
+async def test_merits_decision_can_be_overturned_without_suspending_law(appeal_docket, criminal):
+    cases, appeals, laws, clock, _, current = appeal_docket
+    if criminal:
+        case = await cases.file_charge(
+            GUILD, RECORDER, respondent_user_id=PRESIDENT, law_revision_id=current.id,
+            occurred_at=clock.now.isoformat(), statement="Filed charge", idempotency_key="merits-case",
+        )
+    else:
+        case = await cases.file_civil(
+            GUILD, PRESIDENT, respondent_user_id=DEPUTY_1, statement="Filed claim",
+            idempotency_key="merits-case",
+        )
+    clock.now += timedelta(minutes=1)
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, case.id, hearing_at=hearing.isoformat(), idempotency_key="merits-hearing",
+    )
+    clock.now = hearing
+    payload = dict(
+        outcome=MeritsOutcome.GUILTY if criminal else MeritsOutcome.GRANTED,
+        reason="Public reasons following hearing", idempotency_key="merits-decision",
+    )
+    decision = await cases.decide_merits(GUILD, NOMINEE, case.id, **payload)
+    assert await cases.decide_merits(GUILD, NOMINEE, case.id, **payload) == decision
+    assert await cases.decision(GUILD, case.id) == decision
+    assert (await cases.case(GUILD, PRESIDENT, case.id))[0].merits_outcome == payload["outcome"]
+    challenge = await cases.file_challenge(
+        GUILD, PRESIDENT, law_revision_id=current.id, statement="Challenged the published rule",
+        idempotency_key="related-challenge",
+    )
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, challenge.id, hearing_at=hearing.isoformat(), idempotency_key="related-hearing",
+    )
+    clock.now = hearing
+    with pytest.raises(CourtCaseError, match="^invalid_request$"):
+        await cases.decide_challenge(
+            GUILD, NOMINEE, challenge.id, outcome=AdministrativeOutcome.DENIED,
+            reason="Dismiss challenge", idempotency_key=payload["idempotency_key"],
+        )
+    await cases.decide_challenge(
+        GUILD, NOMINEE, challenge.id, outcome=AdministrativeOutcome.DENIED,
+        reason="Dismiss challenge", idempotency_key="related-decision",
+    )
+    with pytest.raises(CourtCaseError, match="^invalid_request$"):
+        await cases.decide_merits(GUILD, NOMINEE, case.id, **(payload | {"idempotency_key": "related-decision"}))
+    await appeals.file(GUILD, PRESIDENT, case.id)
+    opened = await appeals.open(GUILD, CERTIFIER, case.id, source_url="https://poll.example.test/merits")
+    clock.now = opened.closes_at
+    await appeals.record(GUILD, CERTIFIER, case.id, round_number=1, participants=4, votes_to_cancel=3)
+    result = await appeals.confirm(GUILD, OBSERVER, case.id, round_number=1)
+    assert result.outcome is AppealOutcome.OVERTURNED
+    assert (await laws.show(GUILD, current.code)).id == current.id
+
+
+@pytest.mark.parametrize(
+    "funded,appeal_outcome,pause",
+    [(False, AppealOutcome.OVERTURNED, False), (True, AppealOutcome.OVERTURNED, False),
+     (True, AppealOutcome.UPHELD, False), (True, AppealOutcome.NO_QUORUM, False), (False, None, False),
+     (True, AppealOutcome.OVERTURNED, True), (True, AppealOutcome.UPHELD, True)],
+)
+async def test_sentence_persists_with_guilty_verdict(pg_engine, appeal_docket, funded, appeal_outcome, pause):
+    cases, appeals, _, clock, _, current = appeal_docket
+    case = await cases.file_charge(
+        GUILD, RECORDER, respondent_user_id=PRESIDENT, law_revision_id=current.id,
+        occurred_at=clock.now.isoformat(), statement="Filed charge", idempotency_key="sentence-case",
+    )
+    hearing = clock.now + timedelta(hours=1)
+    heard = await cases.schedule_hearing(
+        GUILD, NOMINEE, case.id, hearing_at=hearing.isoformat(), idempotency_key="sentence-hearing",
+    )
+    clock.now = hearing
+    sentence = CourtSentence("Article 7", SanctionTerm(35, 15, 125))
+    decision = MeritsDecision(
+        case.guild_id, case.id, CaseKind.CRIMINAL, current.id, MeritsOutcome.GUILTY,
+        "Public reasons", heard.scheduled_by_citizen_id, clock.now, sentence,
+    )
+    unit_of_work = PostgresCourtCaseUnitOfWork(pg_engine)
+    with pytest.raises(IntegrityError, match="ck_court_act_decisions_sentence"):
+        async with unit_of_work() as repository:
+            await repository.add_merits_decision(replace(decision, outcome=MeritsOutcome.ACQUITTED), "sentence")
+    ledger = PostgresLedgerUnitOfWork(pg_engine)
+    receipts = ReceiptService(PostgresReceiptUnitOfWork(pg_engine), guild_id=GUILD, authorize=lambda *_: None)
+
+    async def set_pause(enabled):
+        async with PostgresMaintenanceUnitOfWork(pg_engine)() as repository:
+            await repository.set_economy_read_only(
+                GUILD, enabled, actor_discord_user_id=901, reason="Test maintenance", at=clock.now,
+            )
+
+    async def credit():
+        async with ledger() as repository:
+            personal = await repository.ensure_account(case.guild_id, AccountKind.PERSONAL, case.respondent_citizen_id)
+            issuer = await repository.ensure_account(case.guild_id, AccountKind.ISSUER)
+            await repository.post(
+                case.guild_id, TransactionKind.STARTER_GRANT, f"starter_grant:{case.respondent_citizen_id}",
+                {issuer.id: -70, personal.id: 70}, reason="Test starter funds",
+            )
+            return personal
+
+    if funded:
+        personal = await credit()
+        await receipts.set_preference(GUILD, PRESIDENT, locale="ru")
+    if pause:
+        await set_pause(True)
+    payload = dict(outcome=decision.outcome, reason=decision.reason, idempotency_key="sentence")
+    with pytest.raises(CourtCaseError, match="^invalid_sentence$"):
+        await cases.decide_merits(
+            GUILD, NOMINEE, case.id, **(payload | {"outcome": MeritsOutcome.ACQUITTED}), sentence=sentence,
+        )
+    assert await cases.decide_merits(GUILD, NOMINEE, case.id, **payload, sentence=sentence) == decision
+    assert await cases.decide_merits(GUILD, NOMINEE, case.id, **payload, sentence=sentence) == decision
+    with pytest.raises(CourtCaseError, match="^invalid_request$"):
+        await cases.decide_merits(
+            GUILD, NOMINEE, case.id, **payload, sentence=replace(sentence, fine=SanctionTerm(36, 15, 125)),
+        )
+    assert await cases.decision(GUILD, case.id) == decision
+    with pytest.raises(CourtCaseError, match="^invalid_request$"):
+        await cases.decide_merits(
+            GUILD, NOMINEE, case.id, outcome=decision.outcome, reason=decision.reason, idempotency_key="sentence",
+        )
+
+    async with ledger() as repository:
+        personal = await repository.ensure_account(case.guild_id, AccountKind.PERSONAL, case.respondent_citizen_id)
+        initial_receipt = await repository.get_post(case.guild_id, TransactionKind.COURT_FINE_HOLD, f"court_fine_hold:{case.id}")
+        assert (initial_receipt is not None) == (funded and not pause)
+        assert await repository.get_balance(personal.id) == (70 if pause else 35 if funded else 0)
+        if not funded:
+            with pytest.raises(LedgerError, match=LedgerErrorReason.INSUFFICIENT_FUNDS.value):
+                await repository.hold_court_fine(case.guild_id, case.id)
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id) is (
+        CourtFineStatus.HELD if funded and not pause else CourtFineStatus.PENDING
+    )
+    assert await cases.fine_status(GUILD, NOMINEE, case.id) is None
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id + 999) is None
+    if not funded:
+        await credit()
+        await appeals.reconcile_fines()
+    if pause:
+        await appeals.reconcile_fines()
+        await set_pause(False)
+        await appeals.reconcile_fines()
+
+    async def hold():
+        async with ledger() as repository:
+            return await repository.hold_court_fine(case.guild_id, case.id)
+
+    first, second = await asyncio.gather(hold(), hold())
+    assert first.transaction_id == second.transaction_id
+    assert not first.created and not second.created
+
+    async def check_private_receipt(transaction_id, *, kind, delta):
+        receipt = await receipts.get_receipt(GUILD, PRESIDENT, transaction_id)
+        assert receipt is not None and (receipt.kind, receipt.delta) == (kind, delta)
+        for other_user in (NOMINEE, OBSERVER):
+            assert await receipts.get_receipt(GUILD, other_user, transaction_id) is None
+
+    await check_private_receipt(first.transaction_id, kind=TransactionKind.COURT_FINE_HOLD, delta=-35)
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id) is CourtFineStatus.HELD
+    async with ledger() as repository:
+        assert await repository.get_balance(personal.id) == 35
+        history = await repository.get_history(personal.id, 5)
+        assert [(entry.kind, entry.delta) for entry in history][:1] == [(TransactionKind.COURT_FINE_HOLD, -35)]
+
+    async def check_fine_report(expected, as_of):
+        # The test clock controls court procedure while the ledger normally uses PostgreSQL time.
+        beginning = min(datetime.now(UTC), decision.decided_at) - timedelta(days=7)
+        async with PostgresReportUnitOfWork(pg_engine)() as repository:
+            report = await repository.read_report(GUILD, ReportWindow(beginning.date(), beginning, as_of), as_of=as_of)
+        assert (report.court_fines, report.other_income, report.total_income, report.closing_balance) == (
+            expected, 0, expected, expected,
+        )
+
+    await check_fine_report(0, max(clock.now, datetime.now(UTC)) + timedelta(seconds=1))
+    if appeal_outcome is None:
+        clock.now = decision.decided_at + timedelta(hours=24)
+        await appeals.reconcile_fines()
+        async with ledger() as repository:
+            treasury = await repository.ensure_account(case.guild_id, AccountKind.TREASURY)
+            assert await repository.get_balance(treasury.id) == 0
+        clock.now += timedelta(seconds=1)
+        await asyncio.gather(appeals.reconcile_fines(), appeals.reconcile_fines())
+        assert await cases.fine_status(GUILD, PRESIDENT, case.id) is CourtFineStatus.SETTLED
+        await check_fine_report(0, clock.now)
+        await check_fine_report(35, clock.now + timedelta(seconds=1))
+        async with ledger() as repository:
+            assert await repository.get_balance(treasury.id) == 35
+            assert await repository.get_balance(personal.id) == 35
+        return
+
+    await appeals.file(GUILD, PRESIDENT, case.id)
+    opened = await appeals.open(GUILD, CERTIFIER, case.id, source_url="https://poll.example.test/fine")
+    clock.now = opened.closes_at
+    await appeals.reconcile_fines()
+    async with ledger() as repository:
+        treasury = await repository.ensure_account(case.guild_id, AccountKind.TREASURY)
+        assert await repository.get_balance(treasury.id) == 0
+    overturned = appeal_outcome is AppealOutcome.OVERTURNED
+    participants, votes = (2, 2) if appeal_outcome is AppealOutcome.NO_QUORUM else (4, 3 if overturned else 2)
+    await appeals.record(
+        GUILD, CERTIFIER, case.id, round_number=1, participants=participants, votes_to_cancel=votes,
+    )
+    if pause:
+        await set_pause(True)
+    result = await appeals.confirm(GUILD, OBSERVER, case.id, round_number=1)
+    round_number = 1
+    if appeal_outcome is AppealOutcome.NO_QUORUM:
+        assert result.round_number == 2 and result.outcome is None
+        async with ledger() as repository:
+            treasury = await repository.ensure_account(case.guild_id, AccountKind.TREASURY)
+            assert await repository.get_balance(treasury.id) == 0
+        clock.now = result.closes_at
+        round_number = 2
+        await appeals.record(
+            GUILD, CERTIFIER, case.id, round_number=2, participants=participants, votes_to_cancel=votes,
+        )
+        result = await appeals.confirm(GUILD, OBSERVER, case.id, round_number=2)
+    assert result.outcome is appeal_outcome
+    assert await appeals.confirm(GUILD, OBSERVER, case.id, round_number=round_number) == result
+    if pause:
+        await appeals.reconcile_fines()
+        assert await cases.fine_status(GUILD, PRESIDENT, case.id) is (
+            CourtFineStatus.REFUND_PENDING if overturned else CourtFineStatus.HELD
+        )
+        await check_fine_report(0, max(clock.now, datetime.now(UTC)) + timedelta(seconds=1))
+        async with ledger() as repository:
+            assert await repository.get_balance(personal.id) == 35
+        await set_pause(False)
+        await asyncio.gather(appeals.reconcile_fines(), appeals.reconcile_fines())
+    await check_fine_report(0 if overturned else 35, max(clock.now, datetime.now(UTC)) + timedelta(seconds=1))
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id) is (
+        CourtFineStatus.REFUNDED if overturned else CourtFineStatus.SETTLED
+    )
+    async with ledger() as repository:
+        treasury = await repository.ensure_account(case.guild_id, AccountKind.TREASURY)
+        assert await repository.get_balance(personal.id) == (70 if overturned else 35)
+        assert await repository.get_balance(treasury.id) == (0 if overturned else 35)
+        kind = TransactionKind.COURT_FINE_REFUND if overturned else TransactionKind.COURT_FINE_SETTLE
+        closing = await repository.get_post(case.guild_id, kind, f"{kind.value.lower()}:{case.id}")
+    assert closing is not None
+    if overturned:
+        await check_private_receipt(closing.transaction_id, kind=kind, delta=35)
+    else:
+        assert await receipts.get_receipt(GUILD, PRESIDENT, closing.transaction_id) is None
+    if funded:
+        delivered = []
+
+        async def send(notification):
+            delivered.append((notification.recipient_discord_user_id, notification.transaction_id, notification.locale))
+            return 901 + len(delivered)
+
+        expected = [(PRESIDENT, first.transaction_id, "ru")]
+        if overturned:
+            expected.append((PRESIDENT, closing.transaction_id, "ru"))
+        for _ in expected:
+            assert await receipts.run_due(send)
+        assert not await receipts.run_due(send)
+        assert delivered == expected
+    if overturned:
+        with pytest.raises(LedgerError, match=LedgerErrorReason.INVALID_POSTING.value):
+            await hold()
+
+
+async def test_overturned_uncollected_fine_cannot_be_held_after_top_up(pg_engine, appeal_docket):
+    cases, appeals, _, clock, _, law = appeal_docket
+    case = await cases.file_charge(
+        GUILD, RECORDER, respondent_user_id=PRESIDENT, law_revision_id=law.id,
+        occurred_at=clock.now.isoformat(), statement="Fixture charge", idempotency_key="cancelled-fine-case",
+    )
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, case.id, hearing_at=hearing.isoformat(), idempotency_key="cancelled-fine-hearing",
+    )
+    clock.now = hearing
+    decision = await cases.decide_merits(
+        GUILD, NOMINEE, case.id, outcome=MeritsOutcome.GUILTY, reason="Fixture judgment",
+        idempotency_key="cancelled-fine-judgment", sentence=CourtSentence("7", fine=SanctionTerm(25, 10, 50)),
+    )
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id) is CourtFineStatus.PENDING
+    await appeals.file(GUILD, PRESIDENT, case.id)
+    poll = await appeals.open(GUILD, CERTIFIER, case.id, source_url="https://poll.example.test/cancel-fine")
+    clock.now = poll.closes_at
+    await appeals.record(GUILD, CERTIFIER, case.id, round_number=1, participants=4, votes_to_cancel=3)
+    assert (await appeals.confirm(GUILD, OBSERVER, case.id, round_number=1)).outcome is AppealOutcome.OVERTURNED
+
+    ledger = PostgresLedgerUnitOfWork(pg_engine)
+    wallet = WalletService(
+        ledger, guild_id=GUILD, authorize=lambda *_: None,
+        funding=WalletFunding(starter_grant=100, treasury_genesis=0), clock=clock,
+    )
+    await wallet.fund_citizen(GUILD, DEPUTY_1)
+    await wallet.transfer(GUILD, DEPUTY_1, PRESIDENT, 30, idempotency_key="top-up-after-overturn")
+    await asyncio.gather(appeals.reconcile_fines(), appeals.reconcile_fines())
+    assert await cases.fine_status(GUILD, PRESIDENT, case.id) is CourtFineStatus.CANCELLED
+
+    async with pg_engine.begin() as connection:
+        escrow_id = await connection.scalar(insert(FinancialAccountRow).values(
+            guild_id=case.guild_id, kind=AccountKind.ESCROW.value, court_case_id=case.id,
+        ).returning(FinancialAccountRow.id))
+    with pytest.raises(IntegrityError, match="Cannot hold an overturned court fine"):
+        async with ledger() as repository:
+            account = await repository.ensure_account(case.guild_id, AccountKind.PERSONAL, case.respondent_citizen_id)
+            await repository.post(
+                case.guild_id, TransactionKind.COURT_FINE_HOLD, f"court_fine_hold:{case.id}",
+                {account.id: -25, escrow_id: 25}, actor_citizen_id=decision.judge_citizen_id, reason=decision.reason,
+            )
+    async with ledger() as repository:
+        assert await repository.get_balance(account.id) == 30
+        assert await repository.get_balance(escrow_id) == 0
+
+
+@pytest.mark.parametrize("overturned", [False, True])
+async def test_custody_restricts_new_transfers_and_allows_appeal(pg_engine, appeal_docket, overturned):
+    cases, appeals, _, clock, _, current = appeal_docket
+    wallet = WalletService(
+        PostgresLedgerUnitOfWork(pg_engine), guild_id=GUILD, authorize=lambda *_: None,
+        funding=WalletFunding(starter_grant=100, treasury_genesis=0), clock=clock,
+    )
+    case = await cases.file_charge(
+        GUILD, RECORDER, respondent_user_id=PRESIDENT, law_revision_id=current.id,
+        occurred_at=clock.now.isoformat(), statement="Filed charge", idempotency_key="custody-case",
+    )
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(GUILD, NOMINEE, case.id, hearing_at=hearing.isoformat(), idempotency_key="custody-hearing")
+    old = await wallet.transfer(GUILD, PRESIDENT, DEPUTY_1, 10, idempotency_key="before-custody")
+    clock.now = hearing
+    fine = SanctionTerm(25, 10, 30) if overturned else None
+    decision = await cases.decide_merits(
+        GUILD, NOMINEE, case.id, outcome=MeritsOutcome.GUILTY,
+        reason="Public reasons", idempotency_key="custody",
+        sentence=CourtSentence("7", fine=fine, custody=SanctionTerm(2, 1, 4)),
+    )
+    assert decision.sentence.custody.value == 2
+    assert await cases.custody_role_assignments() == {PRESIDENT: True}
+    with pytest.raises(LedgerError, match=LedgerErrorReason.IN_CUSTODY.value):
+        await wallet.prepare_transfer(GUILD, PRESIDENT, DEPUTY_1, 10)
+    with pytest.raises(LedgerError, match=LedgerErrorReason.IN_CUSTODY.value):
+        await wallet.transfer(GUILD, PRESIDENT, DEPUTY_1, 10, idempotency_key="after-custody")
+    replay = await wallet.transfer(GUILD, PRESIDENT, DEPUTY_1, 10, idempotency_key="before-custody")
+    assert old.transaction_id == replay.transaction_id and not replay.created
+    await wallet.transfer(GUILD, DEPUTY_1, PRESIDENT, 10, idempotency_key="incoming-custody")
+    assert await wallet.balance(GUILD, PRESIDENT) == (75 if overturned else 100)
+    if overturned:
+        await appeals.file(GUILD, PRESIDENT, case.id)
+        opened = await appeals.open(GUILD, CERTIFIER, case.id, source_url="https://poll.example.test/custody")
+        clock.now = opened.closes_at
+        await appeals.record(GUILD, CERTIFIER, case.id, round_number=1, participants=4, votes_to_cancel=3)
+        result = await appeals.confirm(GUILD, OBSERVER, case.id, round_number=1)
+        assert result.outcome is AppealOutcome.OVERTURNED
+        assert await wallet.balance(GUILD, PRESIDENT) == 100
+    else:
+        clock.now = hearing + timedelta(hours=2)
+    assert await cases.custody_role_assignments() == {PRESIDENT: False}
+    assert (await wallet.transfer(GUILD, PRESIDENT, DEPUTY_1, 10, idempotency_key="after-custody")).created
+
+
+async def test_custody_and_held_fine_remain_enforceable_after_restore(pg_engine, appeal_docket, tmp_path):
+    if not os.getenv("CIVITAS_TEST_PG_BIN"):
+        pytest.skip("Set CIVITAS_TEST_PG_BIN to verify backup and restore with PostgreSQL client tools")
+    cases, _, _, clock, _, law = appeal_docket
+    presentation = PresentationService(PostgresPresentationUnitOfWork(pg_engine), guild_id=GUILD)
+    await presentation.initialize(GuildPresentation())
+    assert await presentation.set_binding(
+        GUILD, 901, administrator=True, binding=PresentationBinding.CUSTODY_ROLE, value=902,
+    )
+    funding = WalletFunding(starter_grant=100, treasury_genesis=0)
+    wallet = WalletService(
+        PostgresLedgerUnitOfWork(pg_engine), guild_id=GUILD, authorize=lambda *_: None, funding=funding, clock=clock,
+    )
+    await wallet.fund_citizen(GUILD, PRESIDENT)
+    case = await cases.file_charge(
+        GUILD, RECORDER, respondent_user_id=PRESIDENT, law_revision_id=law.id,
+        occurred_at=clock.now.isoformat(), statement="Fixture charge", idempotency_key="restore-court-case",
+    )
+    hearing_at = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, case.id, hearing_at=hearing_at.isoformat(), idempotency_key="restore-court-hearing",
+    )
+    clock.now = hearing_at
+    decision = await cases.decide_merits(
+        GUILD, NOMINEE, case.id, outcome=MeritsOutcome.GUILTY, reason="Fixture judgment",
+        idempotency_key="restore-court-judgment",
+        sentence=CourtSentence("7", fine=SanctionTerm(25, 10, 50), custody=SanctionTerm(2, 1, 4)),
+    )
+    assert await wallet.balance(GUILD, PRESIDENT) == 75
+    async with restore_database(pg_engine, tmp_path) as restored:
+        restored_cases = CourtCaseService(PostgresCourtCaseUnitOfWork(restored), guild_id=GUILD, clock=clock)
+        restored_presentation = PresentationService(PostgresPresentationUnitOfWork(restored), guild_id=GUILD)
+        assert await restored_presentation.current() == GuildPresentation(custody_role_id=902)
+        assert await restored_cases.decision(GUILD, case.id) == decision
+        assert await restored_cases.custody_role_assignments() == {PRESIDENT: True}
+        ledger = PostgresLedgerUnitOfWork(restored)
+        async with ledger() as repository:
+            receipt = await repository.hold_court_fine(case.guild_id, case.id)
+            assert not receipt.created
+        restored_wallet = WalletService(ledger, guild_id=GUILD, authorize=lambda *_: None, funding=funding, clock=clock)
+        with pytest.raises(LedgerError, match=LedgerErrorReason.IN_CUSTODY.value):
+            await restored_wallet.prepare_transfer(GUILD, PRESIDENT, DEPUTY_1, 1)
+        clock.now += timedelta(hours=25)
+        restored_appeals = CourtAppealService(
+            PostgresCourtAppealUnitOfWork(restored), guild_id=GUILD, clock=clock,
+            commissioner_user_ids=(CERTIFIER, OBSERVER), quorum_bp=4000, quorum_min=3,
+            poll_hosts={"poll.example.test"},
+        )
+        await restored_appeals.reconcile_fines()
+        await restored_appeals.reconcile_fines()
+        assert await restored_cases.custody_role_assignments() == {PRESIDENT: False}
+        assert await restored_wallet.balance(GUILD, PRESIDENT) == 75
+        async with ledger() as repository:
+            treasury = await repository.ensure_account(case.guild_id, AccountKind.TREASURY)
+            assert await repository.get_balance(treasury.id) == 25
 
 
 async def _grant_appealable_challenge(cases, clock, revision_id, *, key):

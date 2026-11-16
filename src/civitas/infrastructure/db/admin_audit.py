@@ -88,7 +88,9 @@ _AUDIT = text("""
         SELECT guild_id, judge_citizen_id, scheduled_at, 'court.hearing', 'court_case', case_id, 'success', id
           FROM court_hearings WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
-        SELECT guild_id, judge_citizen_id, decided_at, 'court.act_decision', 'court_case', case_id, 'success', case_id
+        SELECT guild_id, judge_citizen_id, decided_at,
+               CASE WHEN case_kind = 'ADMINISTRATIVE' THEN 'court.act_decision' ELSE 'court.merits_decision' END,
+               'court_case', case_id, 'success', case_id
           FROM court_act_decisions WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
         SELECT guild_id, appellant_citizen_id, filed_at, 'court.appeal.file', 'court_case', case_id, 'success', case_id

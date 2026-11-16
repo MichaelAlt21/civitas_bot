@@ -132,6 +132,7 @@ class PrivateJobService:
             existing = await repository.get_private_job_by_key(owner.guild_id, idempotency_key)
             if existing is None:
                 now = self._clock()
+                await repository.require_free(owner.guild_id, owner.id, at=now)
                 if deadline <= now:
                     raise PrivateJobError(PrivateJobErrorReason.INVALID_DEADLINE)
                 job = await repository.create_private_job(
@@ -198,6 +199,7 @@ class PrivateJobService:
                 raise PrivateJobError(PrivateJobErrorReason.JOB_ALREADY_CLAIMED)
             self._require_status(job, PrivateJobStatus.OPEN)
             now = self._before_deadline(job)
+            await repository.require_free(actor.guild_id, actor.id, at=now)
             claimed = replace(
                 job, status=PrivateJobStatus.CLAIMED, worker_citizen_id=actor.id,
                 worker_discord_user_id=actor.discord_user_id, claimed_at=now,

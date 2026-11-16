@@ -1,6 +1,7 @@
 import asyncio
 import os
 import subprocess
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -33,6 +34,50 @@ async def _run_postgres_tool(tool: Path, arguments: list[str], environment: dict
         subprocess.run, [str(tool), *arguments], env=environment, capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 0, result.stderr
+
+
+@asynccontextmanager
+async def restore_database(engine, tmp_path):
+    bin_path = os.getenv("CIVITAS_TEST_PG_BIN")
+    if not bin_path:
+        pytest.skip("Set CIVITAS_TEST_PG_BIN to verify backup and restore with PostgreSQL client tools")
+    suffix = ".exe" if os.name == "nt" else ""
+    pg_dump = Path(bin_path) / f"pg_dump{suffix}"
+    pg_restore = Path(bin_path) / f"pg_restore{suffix}"
+    assert pg_dump.is_file() and pg_restore.is_file()
+
+    async with engine.connect() as connection:
+        schema = await connection.scalar(text("SELECT current_schema()"))
+    database = f"civitas_restore_{uuid4().hex}"
+    url = engine.url
+    credentials = dict(os.environ)
+    credentials.pop("PGOPTIONS", None)
+    if url.password is not None:
+        credentials["PGPASSWORD"] = url.password
+    options = ["--no-password"]
+    for flag, value in (("--host", url.host), ("--port", url.port), ("--username", url.username)):
+        if value is not None:
+            options.extend((flag, str(value)))
+    archive = tmp_path / "civitas.dump"
+    await _run_postgres_tool(pg_dump, [
+        *options, "--format=custom", "--file", str(archive), "--schema", schema, "--dbname", url.database,
+    ], credentials)
+
+    async with engine.connect() as connection:
+        admin = await connection.execution_options(isolation_level="AUTOCOMMIT")
+        await admin.execute(text(f"CREATE DATABASE {database}"))
+        try:
+            await _run_postgres_tool(pg_restore, [
+                *options, "--single-transaction", "--exit-on-error", "--no-owner", "--no-privileges",
+                "--dbname", database, str(archive),
+            ], credentials)
+            restored = create_db_engine(url.set(database=database))
+            try:
+                yield restored
+            finally:
+                await restored.dispose()
+        finally:
+            await admin.execute(text(f"DROP DATABASE {database}"))
 
 
 async def _snapshot(engine) -> dict[str, list[tuple]]:
@@ -110,13 +155,8 @@ async def _snapshot(engine) -> dict[str, list[tuple]]:
 
 @pytest.mark.asyncio
 async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_transactions(pg_engine, tmp_path):
-    bin_path = os.getenv("CIVITAS_TEST_PG_BIN")
-    if not bin_path:
+    if not os.getenv("CIVITAS_TEST_PG_BIN"):
         pytest.skip("Set CIVITAS_TEST_PG_BIN to verify backup and restore with PostgreSQL client tools")
-    suffix = ".exe" if os.name == "nt" else ""
-    pg_dump = Path(bin_path) / f"pg_dump{suffix}"
-    pg_restore = Path(bin_path) / f"pg_restore{suffix}"
-    assert pg_dump.is_file() and pg_restore.is_file()
 
     uow = PostgresPrivateJobUnitOfWork(pg_engine)
     admission = AdmissionService(PostgresAdmissionUnitOfWork(pg_engine), guild_id=101)
@@ -304,115 +344,85 @@ async def test_postgres_dump_restore_preserves_citizens_ledger_and_settled_trans
     assert [(row.code, row.spent, row.reserved) for row in expected["budget_articles"]] == [
         ("npc_work", 30, 0), ("state_contracts", 50, 30),
     ]
-    async with pg_engine.connect() as connection:
-        schema = await connection.scalar(text("SELECT current_schema()"))
-    database = f"civitas_restore_{uuid4().hex}"
-    url = pg_engine.url
-    credentials = dict(os.environ)
-    credentials.pop("PGOPTIONS", None)
-    if url.password is not None:
-        credentials["PGPASSWORD"] = url.password
-    options = ["--no-password"]
-    for flag, value in (("--host", url.host), ("--port", url.port), ("--username", url.username)):
-        if value is not None:
-            options.extend((flag, str(value)))
-    archive = tmp_path / "civitas.dump"
-    await _run_postgres_tool(pg_dump, [
-        *options, "--format=custom", "--file", str(archive), "--schema", schema, "--dbname", url.database,
-    ], credentials)
-
-    async with pg_engine.connect() as connection:
-        admin = await connection.execution_options(isolation_level="AUTOCOMMIT")
-        await admin.execute(text(f"CREATE DATABASE {database}"))
-        try:
-            await _run_postgres_tool(pg_restore, [
-                *options, "--single-transaction", "--exit-on-error", "--no-owner", "--no-privileges",
-                "--dbname", database, str(archive),
-            ], credentials)
-            restored = create_db_engine(url.set(database=database))
-            try:
-                assert await _snapshot(restored) == expected
-                restored_admission = AdmissionService(PostgresAdmissionUnitOfWork(restored), guild_id=101)
-                await restored_admission.initialize((201, 202, 203, 204))
-                assert await restored_admission.list_allowed(101, 901, administrator=True) == (201, 202, 203)
-                restored_politics = government(restored)
-                restored_impeachment = await restored_politics.get_public_impeachment(101, 201, ballot.id)
-                assert restored_impeachment.confirmed_at == impeachment.confirmed_at
-                assert await restored_politics.confirm_impeachment(
-                    101, 203, ballot.id, reason="Verified confidence vote",
-                ) == impeachment
-                assert await restored_politics.get_public_result(101, 201, president.id) == certified
-                (term,) = await restored_politics.list_offices(101, 201)
-                assert (term.election_id, term.holder_discord_user_id) == (president.id, 201)
-                async with PostgresGovernmentUnitOfWork(restored)() as repository:
-                    assert await repository.has_active_office(
-                        president.guild_id, term.holder_citizen_id, OfficeKind.PRESIDENT, election_now,
-                    )
-                assert (await restored_politics.get_election(101, 202, parliament.id)).cancellation == cancellation
-                with pytest.raises(GovernmentError, match=GovernmentErrorReason.REPLACEMENT_REQUIRED):
-                    await restored_politics.open_election(
-                        101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
-                        reason="Unlinked replacement", idempotency_key="restore-unlinked-parliament",
-                    )
-                replacement = await restored_politics.open_election(
-                    101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
-                    reason="Linked replacement", idempotency_key="restore-replacement-parliament",
-                    replacement_of_id=parliament.id,
-                )
-                election_now = replacement.closes_at
-                with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_SOURCE):
-                    await restored_politics.record_protocol(
-                        101, 202, replacement.id, source_url=cancelled_source, participants=2,
-                        tallies={201: 2}, reason="Try previously used source",
-                    )
-                async with PostgresMaintenanceUnitOfWork(restored)() as repository:
-                    assert await repository.get_economy_read_only(101)
-                    assert await repository.set_economy_read_only(
-                        101, False, actor_discord_user_id=901, reason="Recovered fixture", at=now + timedelta(days=7),
-                    )
-                restored_market = MarketService(
-                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
-                    arbiter_user_ids=(), rules=market_rules, funding=funding,
-                )
-                with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
-                    await restored_market.quote_order(101, 202, offer.id)
-                assert await restored_market.accept_order(101, 202, sale.id) == sale
-                restored_assets = AssetService(
-                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
-                    staff_user_ids={202}, funding=funding, resale_tax_bp=200,
-                )
-                assert [
-                    item.id for item in await restored_assets.list_owned_assets(101, 201, company_id=company.id)
-                ] == [asset.id]
-                assert [item.id for item in await restored_assets.list_owned_assets(101, 203)] == [personal_asset.id]
-                assert await restored_assets.buy_resale(101, 203, resale.id) == completed_resale
-                restored_treasury = TreasuryService(
-                    PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
-                    initiator_user_ids={202}, approver_user_ids={203},
-                    rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
-                    clock=lambda: now + timedelta(days=7),
-                )
-                paid, reserved = expected["state_contracts"]
-                await restored_treasury.pay_contract(101, 203, paid.id, reason="Accepted fixture result")
-                await restored_treasury.cancel_contract(101, 203, reserved.id, reason="Released after restore")
-                recovered = await _snapshot(restored)
-                assert recovered["transactions"] == expected["transactions"]
-                assert recovered["entries"] == expected["entries"]
-                assert [(row.status, row.amount) for row in recovered["state_contracts"]] == [
-                    ("PAID", 50), ("CANCELLED", 30),
-                ]
-                assert [row.reserved_total for row in recovered["budget"]] == [0]
-                restored_jobs = PrivateJobService(
-                    PostgresPrivateJobUnitOfWork(restored), guild_id=101,
-                    authorize=citizens.authorize, arbiter_user_ids={203}, clock=lambda: now + timedelta(days=7),
-                )
-                await restored_jobs.accept_job(101, 201, paid_job.id, reason="Inspection accepted")
-                await restored_jobs.cancel_job(101, 201, open_job.id, reason="Cancelled after restore")
-                final = await _snapshot(restored)
-                assert [(row.status, row.amount) for row in final["private_jobs"]] == [("PAID", 40), ("CANCELLED", 20)]
-                assert final["transactions"][:-1] == expected["transactions"]
-                assert final["transactions"][-1].kind == "PRIVATE_JOB_REFUND"
-            finally:
-                await restored.dispose()
-        finally:
-            await admin.execute(text(f"DROP DATABASE {database}"))
+    async with restore_database(pg_engine, tmp_path) as restored:
+        assert await _snapshot(restored) == expected
+        restored_admission = AdmissionService(PostgresAdmissionUnitOfWork(restored), guild_id=101)
+        await restored_admission.initialize((201, 202, 203, 204))
+        assert await restored_admission.list_allowed(101, 901, administrator=True) == (201, 202, 203)
+        restored_politics = government(restored)
+        restored_impeachment = await restored_politics.get_public_impeachment(101, 201, ballot.id)
+        assert restored_impeachment.confirmed_at == impeachment.confirmed_at
+        assert await restored_politics.confirm_impeachment(
+            101, 203, ballot.id, reason="Verified confidence vote",
+        ) == impeachment
+        assert await restored_politics.get_public_result(101, 201, president.id) == certified
+        (term,) = await restored_politics.list_offices(101, 201)
+        assert (term.election_id, term.holder_discord_user_id) == (president.id, 201)
+        async with PostgresGovernmentUnitOfWork(restored)() as repository:
+            assert await repository.has_active_office(
+                president.guild_id, term.holder_citizen_id, OfficeKind.PRESIDENT, election_now,
+            )
+        assert (await restored_politics.get_election(101, 202, parliament.id)).cancellation == cancellation
+        with pytest.raises(GovernmentError, match=GovernmentErrorReason.REPLACEMENT_REQUIRED):
+            await restored_politics.open_election(
+                101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
+                reason="Unlinked replacement", idempotency_key="restore-unlinked-parliament",
+            )
+        replacement = await restored_politics.open_election(
+            101, 202, office=OfficeKind.PARLIAMENT, candidate_user_ids=(201,),
+            reason="Linked replacement", idempotency_key="restore-replacement-parliament",
+            replacement_of_id=parliament.id,
+        )
+        election_now = replacement.closes_at
+        with pytest.raises(GovernmentError, match=GovernmentErrorReason.INVALID_SOURCE):
+            await restored_politics.record_protocol(
+                101, 202, replacement.id, source_url=cancelled_source, participants=2,
+                tallies={201: 2}, reason="Try previously used source",
+            )
+        async with PostgresMaintenanceUnitOfWork(restored)() as repository:
+            assert await repository.get_economy_read_only(101)
+            assert await repository.set_economy_read_only(
+                101, False, actor_discord_user_id=901, reason="Recovered fixture", at=now + timedelta(days=7),
+            )
+        restored_market = MarketService(
+            PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+            arbiter_user_ids=(), rules=market_rules, funding=funding,
+        )
+        with pytest.raises(MarketError, match=MarketErrorReason.OFFER_WITHDRAWN):
+            await restored_market.quote_order(101, 202, offer.id)
+        assert await restored_market.accept_order(101, 202, sale.id) == sale
+        restored_assets = AssetService(
+            PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+            staff_user_ids={202}, funding=funding, resale_tax_bp=200,
+        )
+        assert [
+            item.id for item in await restored_assets.list_owned_assets(101, 201, company_id=company.id)
+        ] == [asset.id]
+        assert [item.id for item in await restored_assets.list_owned_assets(101, 203)] == [personal_asset.id]
+        assert await restored_assets.buy_resale(101, 203, resale.id) == completed_resale
+        restored_treasury = TreasuryService(
+            PostgresPrivateJobUnitOfWork(restored), guild_id=101, authorize=citizens.authorize,
+            initiator_user_ids={202}, approver_user_ids={203},
+            rules=TreasuryRules(caps=BudgetCaps(800, 300, 100), contracts_weekly_limit=250),
+            clock=lambda: now + timedelta(days=7),
+        )
+        paid, reserved = expected["state_contracts"]
+        await restored_treasury.pay_contract(101, 203, paid.id, reason="Accepted fixture result")
+        await restored_treasury.cancel_contract(101, 203, reserved.id, reason="Released after restore")
+        recovered = await _snapshot(restored)
+        assert recovered["transactions"] == expected["transactions"]
+        assert recovered["entries"] == expected["entries"]
+        assert [(row.status, row.amount) for row in recovered["state_contracts"]] == [
+            ("PAID", 50), ("CANCELLED", 30),
+        ]
+        assert [row.reserved_total for row in recovered["budget"]] == [0]
+        restored_jobs = PrivateJobService(
+            PostgresPrivateJobUnitOfWork(restored), guild_id=101,
+            authorize=citizens.authorize, arbiter_user_ids={203}, clock=lambda: now + timedelta(days=7),
+        )
+        await restored_jobs.accept_job(101, 201, paid_job.id, reason="Inspection accepted")
+        await restored_jobs.cancel_job(101, 201, open_job.id, reason="Cancelled after restore")
+        final = await _snapshot(restored)
+        assert [(row.status, row.amount) for row in final["private_jobs"]] == [("PAID", 40), ("CANCELLED", 20)]
+        assert final["transactions"][:-1] == expected["transactions"]
+        assert final["transactions"][-1].kind == "PRIVATE_JOB_REFUND"

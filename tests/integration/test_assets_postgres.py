@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -17,11 +17,12 @@ from civitas.app.market import MarketRules, MarketService
 from civitas.app.receipts import ReceiptService
 from civitas.app.reports import ReportService
 from civitas.app.wallet import WalletFunding, WalletService
-from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetResaleStatus, AssetStatus
+from civitas.domain.assets import Asset, AssetKind, AssetPurchase, AssetQuote, AssetResaleStatus, AssetStatus
 from civitas.domain.ledger import AccountKind, LedgerError, LedgerErrorReason, TransactionKind
 from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
 from civitas.infrastructure.db.asset_models import AssetRow, AssetTransferRow
 from civitas.infrastructure.db.assets import PostgresAssetUnitOfWork
+from civitas.infrastructure.db.citizens import PostgresCitizenUnitOfWork
 from civitas.infrastructure.db.ledger_models import FinancialTransactionRow
 from civitas.infrastructure.db.receipts import PostgresReceiptUnitOfWork
 from civitas.infrastructure.db.reports import PostgresReportUnitOfWork
@@ -234,12 +235,68 @@ async def test_directed_resale_is_atomic_private_and_replayable_across_rate_chan
     # Exercise resale of property already purchased before this feature shipped.
     async with pg_engine.begin() as connection:
         await connection.run_sync(migrate, upgrade=False)
-    uow, citizens, assets, funding = await _setup(pg_engine, resale_tax_bp=200)
-    issued = await _issue(assets)
-    original_quote = await assets.quote_asset(GUILD, BUYER, issued.id)
-    original_purchase = await assets.buy_asset(GUILD, BUYER, original_quote, idempotency_key="original")
+    registration = CitizensService(
+        PostgresCitizenUnitOfWork(pg_engine), guild_id=GUILD, allowed_user_ids={STAFF, BUYER, OTHER},
+    )
+    staff = (await registration.register(GUILD, STAFF)).citizen
+    buyer = (await registration.register(GUILD, BUYER)).citizen
+    params = {"guild": buyer.guild_id, "staff": staff.id, "buyer": buyer.id, "now": NOW}
+    async with pg_engine.begin() as connection:
+        async def scalar(sql, **values):
+            return await connection.scalar(text(sql), params | values)
+
+        async def execute(sql, **values):
+            await connection.execute(text(sql), params | values)
+
+        accounts = {}
+        for kind in ("ISSUER", "TREASURY", "PERSONAL"):
+            accounts[kind] = await scalar(
+                "INSERT INTO financial_accounts (guild_id, kind, citizen_id) VALUES (:guild, :kind, :owner) RETURNING id",
+                kind=kind, owner=buyer.id if kind == "PERSONAL" else None,
+            )
+        asset_id = await scalar(
+            "INSERT INTO assets (guild_id, kind, name, purpose, price, status, issued_by_citizen_id, issue_reason, "
+            "issue_key, created_at) VALUES (:guild, 'office', 'Office 14', 'Meeting space', 100, 'FOR_SALE', "
+            ":staff, 'Catalog addition', 'issue-1', :now) RETURNING id",
+        )
+        params["asset"] = asset_id
+        await execute(
+            "INSERT INTO asset_transfers (guild_id, asset_id, kind, actor_citizen_id, request_key, reason, created_at) "
+            "VALUES (:guild, :asset, 'ISSUE', :staff, 'issue-1', 'Catalog addition', :now)",
+        )
+        for kind, key, debit, credit, amount in (
+            ("GENESIS", "genesis", "ISSUER", "TREASURY", 8000),
+            ("STARTER_GRANT", f"starter_grant:{buyer.id}", "ISSUER", "PERSONAL", 250),
+            ("ASSET_PURCHASE", f"asset_purchase:{asset_id}", "PERSONAL", "TREASURY", 100),
+        ):
+            posting = await scalar(
+                "INSERT INTO financial_transactions (guild_id, kind, idempotency_key, reason, actor_citizen_id, "
+                "entry_count) VALUES (:guild, :kind, :key, :reason, :buyer, 2) RETURNING id",
+                kind=kind, key=key, reason="primary_asset_purchase" if kind == "ASSET_PURCHASE" else "historical fixture",
+            )
+            await execute(
+                "INSERT INTO ledger_entries (guild_id, transaction_id, account_id, delta) "
+                "VALUES (:guild, :posting, :source, :debit), (:guild, :posting, :target, :credit)",
+                posting=posting, source=accounts[debit], debit=-amount, target=accounts[credit], credit=amount,
+            )
+        purchase_id = await scalar(
+            "INSERT INTO asset_transfers (guild_id, asset_id, kind, actor_citizen_id, buyer_account_id, "
+            "price, request_key, transaction_id, reason, created_at) VALUES (:guild, :asset, 'PURCHASE', :buyer, "
+            ":personal, 100, 'original', :posting, 'primary_asset_purchase', :now) RETURNING id",
+            personal=accounts["PERSONAL"], posting=posting,
+        )
+        await execute("UPDATE assets SET status = 'SOLD', owner_citizen_id = :buyer WHERE id = :asset")
+    issued = Asset(
+        asset_id, buyer.guild_id, AssetKind.OFFICE, "Office 14", "Meeting space", 100, AssetStatus.FOR_SALE,
+        staff.id, "Catalog addition", "issue-1", NOW,
+    )
+    original_quote = AssetQuote(issued, None)
+    original_purchase = AssetPurchase(
+        purchase_id, buyer.guild_id, asset_id, buyer.id, None, accounts["PERSONAL"], 100, "original", posting, NOW,
+    )
     async with pg_engine.begin() as connection:
         await connection.run_sync(migrate, upgrade=True)
+    uow, citizens, assets, funding = await _setup(pg_engine, resale_tax_bp=200)
 
     listing = dict(asset_id=issued.id, buyer_user_id=OTHER, price=200, idempotency_key="resale-1")
     offer = await assets.create_resale_offer(GUILD, BUYER, **listing)

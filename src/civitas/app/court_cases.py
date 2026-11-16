@@ -8,6 +8,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from civitas.domain.citizens import Citizen, CitizenStatus
+from civitas.domain.court_sanctions import CourtSentence
 from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH
 
 from .citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
@@ -30,6 +31,35 @@ class CaseKind(StrEnum):
 class AdministrativeOutcome(StrEnum):
     GRANTED = "GRANTED"
     DENIED = "DENIED"
+
+
+class MeritsOutcome(StrEnum):
+    GRANTED = "GRANTED"
+    DENIED = "DENIED"
+    GUILTY = "GUILTY"
+    ACQUITTED = "ACQUITTED"
+
+
+class CourtFineStatus(StrEnum):
+    PENDING = "pending"
+    HELD = "held"
+    REFUND_PENDING = "refund_pending"
+    REFUNDED = "refunded"
+    SETTLED = "settled"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class MeritsDecision:
+    guild_id: int
+    case_id: int
+    kind: CaseKind
+    revision_id: int | None
+    outcome: MeritsOutcome
+    reason: str
+    judge_citizen_id: int
+    decided_at: datetime
+    sentence: CourtSentence | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +93,7 @@ class CourtCase:
     scheduled_by_citizen_id: int | None = None
     act_kind: ActKind | None = None
     administrative_outcome: AdministrativeOutcome | None = None
+    merits_outcome: MeritsOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +105,7 @@ class CaseSummary:
     hearing_at: datetime | None
     act_kind: ActKind | None = None
     administrative_outcome: AdministrativeOutcome | None = None
+    merits_outcome: MeritsOutcome | None = None
 
 
 class CourtCaseErrorReason(StrEnum):
@@ -88,6 +120,7 @@ class CourtCaseErrorReason(StrEnum):
     JUDGE_REQUIRED = "judge_required"
     CONFLICT_OF_INTEREST = "conflict_of_interest"
     INVALID_OUTCOME = "invalid_outcome"
+    INVALID_SENTENCE = "invalid_sentence"
     INVALID_REASON = "invalid_reason"
     ADMINISTRATIVE_REQUIRED = "administrative_required"
     HEARING_REQUIRED = "hearing_required"
@@ -101,6 +134,8 @@ class CourtCaseError(Exception):
 
 
 class CourtCaseRepository(Protocol):
+    async def get_fine_status(self, guild_id: int, case_id: int, respondent_id: int) -> CourtFineStatus | None: ...
+    async def custody_role_assignments(self, guild_id: int, *, at: datetime) -> dict[int, bool]: ...
     async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None: ...
     async def is_allowed(self, guild_id: int, user_id: int) -> bool: ...
     async def lock_election_cycle(self, guild_id: int) -> None: ...
@@ -121,6 +156,9 @@ class CourtCaseRepository(Protocol):
     async def get_act_decision(self, discord_guild_id: int, case_id: int) -> AdministrativeDecision | None: ...
     async def find_act_decision(self, guild_id: int, request_key: str) -> AdministrativeDecision | None: ...
     async def add_act_decision(self, decision: AdministrativeDecision, request_key: str) -> AdministrativeDecision: ...
+    async def get_merits_decision(self, discord_guild_id: int, case_id: int) -> MeritsDecision | None: ...
+    async def find_merits_decision(self, guild_id: int, request_key: str) -> MeritsDecision | None: ...
+    async def add_merits_decision(self, decision: MeritsDecision, request_key: str) -> MeritsDecision: ...
     async def list_returned_acts(
         self, discord_guild_id: int, act_kind: ActKind, *, limit: int, offset: int,
     ) -> tuple[AdministrativeDecision, ...]: ...
@@ -166,7 +204,7 @@ def _check_number(value: int, reason: CourtCaseErrorReason) -> None:
 def _summary(case: CourtCase) -> CaseSummary:
     return CaseSummary(
         case.id, case.kind, case.law_revision_id, case.filed_at, case.hearing_at, case.act_kind,
-        case.administrative_outcome,
+        case.administrative_outcome, case.merits_outcome,
     )
 
 
@@ -346,6 +384,8 @@ class CourtCaseService:
                 ):
                     raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
                 return existing
+            if await repository.find_merits_decision(actor.guild_id, idempotency_key) is not None:
+                raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
 
             if case.kind is not CaseKind.ADMINISTRATIVE or case.law_revision_id is None or case.act_kind is None:
                 raise CourtCaseError(CourtCaseErrorReason.ADMINISTRATIVE_REQUIRED)
@@ -358,12 +398,71 @@ class CourtCaseService:
                 outcome=outcome, reason=reason, judge_citizen_id=actor.id, decided_at=now,
             ), idempotency_key)
 
-    async def decision(self, guild_id: int | None, case_id: int) -> AdministrativeDecision | None:
+    async def decide_merits(
+        self, guild_id: int | None, user_id: int, case_id: int, *, outcome: MeritsOutcome,
+        reason: str, idempotency_key: str, sentence: CourtSentence | None = None,
+    ) -> MeritsDecision:
+        self._require_guild(guild_id)
+        _check_number(case_id, CourtCaseErrorReason.NOT_FOUND)
+        _check_request_key(idempotency_key)
+        reason = _public_reason(reason)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            now = self._now()
+            case = await self._case_for_judge(repository, actor, case_id, now)
+            allowed = {
+                CaseKind.CIVIL: (MeritsOutcome.GRANTED, MeritsOutcome.DENIED),
+                CaseKind.CRIMINAL: (MeritsOutcome.GUILTY, MeritsOutcome.ACQUITTED),
+            }.get(case.kind, ())
+            if not isinstance(outcome, MeritsOutcome) or outcome not in allowed:
+                raise CourtCaseError(CourtCaseErrorReason.INVALID_OUTCOME)
+            if sentence is not None and (
+                not isinstance(sentence, CourtSentence)
+                or outcome is not MeritsOutcome.GUILTY
+            ):
+                raise CourtCaseError(CourtCaseErrorReason.INVALID_SENTENCE)
+            existing = await repository.find_merits_decision(actor.guild_id, idempotency_key)
+            if existing is not None:
+                if (
+                    existing.case_id, existing.judge_citizen_id, existing.outcome, existing.reason, existing.sentence,
+                ) != (
+                    case_id, actor.id, outcome, reason, sentence,
+                ):
+                    raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
+                return existing
+            if await repository.find_act_decision(actor.guild_id, idempotency_key) is not None:
+                raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
+            if case.merits_outcome is not None:
+                raise CourtCaseError(CourtCaseErrorReason.ALREADY_DECIDED)
+            if case.hearing_at is None or case.hearing_at > now:
+                raise CourtCaseError(CourtCaseErrorReason.HEARING_REQUIRED)
+            return await repository.add_merits_decision(MeritsDecision(
+                actor.guild_id, case_id, case.kind, case.law_revision_id, outcome, reason, actor.id, now, sentence,
+            ), idempotency_key)
+
+    async def custody_role_assignments(self) -> dict[int, bool]:
+        async with self._unit_of_work() as repository:
+            return await repository.custody_role_assignments(self._guild_id, at=self._now())
+
+    async def fine_status(self, guild_id: int | None, user_id: int, case_id: int) -> CourtFineStatus | None:
+        self._require_guild(guild_id)
+        _check_number(case_id, CourtCaseErrorReason.NOT_FOUND)
+        if not is_discord_id(user_id):
+            raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+        async with self._unit_of_work() as repository:
+            actor = await self._eligible_citizen(repository, user_id)
+            if actor is None:
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+            return await repository.get_fine_status(actor.guild_id, case_id, actor.id)
+
+    async def decision(self, guild_id: int | None, case_id: int) -> AdministrativeDecision | MeritsDecision | None:
         self._require_guild(guild_id)
         _check_number(case_id, CourtCaseErrorReason.NOT_FOUND)
         async with self._unit_of_work() as repository:
-            await self._require_case(repository, case_id)
-            return await repository.get_act_decision(self._guild_id, case_id)
+            case = await self._require_case(repository, case_id)
+            if case.kind is CaseKind.ADMINISTRATIVE:
+                return await repository.get_act_decision(self._guild_id, case_id)
+            return await repository.get_merits_decision(self._guild_id, case_id)
 
     async def list_returns(
         self, guild_id: int | None, act_kind: ActKind, *, page: int = 1,

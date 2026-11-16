@@ -353,8 +353,10 @@ async def test_setup_uses_localized_role_and_text_channel_pickers(setup_commands
     subcommands = {command["name"]: command for command in setup["options"]}
     assert set(subcommands) == {"status", "role", "report_channel"}
     kind, role = subcommands["role"]["options"]
-    assert [option["value"] for option in kind["choices"]] == ["citizen_role_id", "president_role_id", "parliament_role_id"]
-    assert kind["choices"][-1]["name"] == "Senator"
+    assert [option["value"] for option in kind["choices"]] == [
+        "citizen_role_id", "president_role_id", "parliament_role_id", "custody_role_id",
+    ]
+    assert [option["name"] for option in kind["choices"]][-2:] == ["Senator", "In Custody"]
     assert role["type"] == discord.AppCommandOptionType.role.value
     assert role["required"] is False
     channel, = subcommands["report_channel"]["options"]

@@ -1,7 +1,10 @@
 """Discord commands for the Chief Justice and court docket."""
 
-from collections.abc import AsyncIterator
+import asyncio
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 import discord
 from discord import app_commands
@@ -20,11 +23,66 @@ from civitas.app.court_cases import (
     CourtCaseError,
     CourtCaseErrorReason,
     CourtCaseService,
+    MeritsDecision,
+    MeritsOutcome,
 )
 from civitas.app.law import ActKind
+from civitas.domain.court_sanctions import ARTICLE_MAX_LENGTH, CUSTODY_RANGE, FINE_RANGE, CourtSentence, SanctionTerm
 
 from .localization import command_description, message
 from .responses import send_private_lines
+from .roles import safe_assignable_role, set_member_role
+
+logger = logging.getLogger(__name__)
+_CUSTODY_ROLE_INTERVAL_SECONDS = 30
+
+
+async def _reconcile_custody_role(
+    client: discord.Client, service: CourtCaseService, guild_id: int, role_id: int,
+) -> None:
+    guild = client.get_guild(guild_id)
+    if guild is None or guild.unavailable:
+        return
+    role = safe_assignable_role(guild, role_id)
+    if role is None:
+        logger.warning("Проверьте иерархию и права роли игрового заключения")
+        return
+    assignments = await service.custody_role_assignments()
+    for member in role.members:
+        assignments.setdefault(member.id, False)
+    for user_id, present in assignments.items():
+        try:
+            await set_member_role(guild, role, user_id, present=present, reason="Civitas in-game custody sync")
+        except discord.HTTPException as error:
+            logger.warning("Не удалось синхронизировать роль игрового заключения (HTTP %s)", error.status)
+
+
+@asynccontextmanager
+async def run_custody_role_sync(
+    client: discord.Client, service: CourtCaseService | None, *,
+    guild_id: int, get_role_id: Callable[[], Awaitable[int | None]],
+) -> AsyncIterator[None]:
+    if service is None:
+        yield
+        return
+
+    async def run() -> None:
+        await client.wait_until_ready()
+        while not client.is_closed():
+            try:
+                role_id = await get_role_id()
+                if role_id is not None:
+                    await _reconcile_custody_role(client, service, guild_id, role_id)
+            except Exception as error:
+                logger.warning("Сверка роли игрового заключения завершилась ошибкой (%s)", type(error).__name__)
+            await asyncio.sleep(_CUSTODY_ROLE_INTERVAL_SECONDS)
+
+    task = asyncio.create_task(run())
+    try:
+        yield
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @asynccontextmanager
@@ -76,6 +134,8 @@ def _case_summary(locale: discord.Locale, record: CourtCase | CaseSummary) -> st
         parts.append(_revision_number(locale, record.act_kind, record.law_revision_id))
     if record.administrative_outcome is not None:
         parts.append(message(locale, f"court.case.outcome.{record.administrative_outcome.value.lower()}"))
+    if record.merits_outcome is not None:
+        parts.append(message(locale, f"court.case.merits.{record.merits_outcome.value.lower()}"))
     if record.hearing_at is not None:
         parts.append(message(locale, "court.case.hearing", date=discord.utils.format_dt(record.hearing_at, style="f")))
     else:
@@ -99,7 +159,35 @@ def _decision_row(locale: discord.Locale, decision: AdministrativeDecision) -> s
     )
 
 
-def _decision_details(locale: discord.Locale, decision: AdministrativeDecision) -> list[str]:
+def _decision_details(locale: discord.Locale, decision: AdministrativeDecision | MeritsDecision) -> list[str]:
+    if isinstance(decision, MeritsDecision):
+        parts = [
+            message(locale, "court.case.summary", id=str(decision.case_id),
+                    kind=message(locale, f"court.case.kind.{decision.kind.value.lower()}")),
+            message(locale, f"court.case.merits.{decision.outcome.value.lower()}"),
+        ]
+        if decision.revision_id is not None:
+            parts.append(_revision_number(locale, ActKind.LAW, decision.revision_id))
+        if decision.sentence is not None:
+            sentence = decision.sentence
+            article = _escaped_text_parts(sentence.article)[0]
+            if sentence.fine is not None:
+                fine = sentence.fine
+                parts.append(message(
+                    locale, "court.case.decision.fine", amount=str(fine.value), article=article,
+                    minimum=str(fine.article_minimum), maximum=str(fine.article_maximum),
+                ))
+            if sentence.custody is not None:
+                custody = sentence.custody
+                until = decision.decided_at + timedelta(hours=custody.value)
+                parts.append(message(
+                    locale, "court.case.decision.custody", hours=str(custody.value), article=article,
+                    minimum=str(custody.article_minimum), maximum=str(custody.article_maximum),
+                    until=discord.utils.format_dt(until, style="f"),
+                ))
+        parts.append(message(locale, "court.case.decision.reason"))
+        parts.extend(_escaped_text_parts(decision.reason))
+        return parts
     parts = [
         _decision_row(locale, decision),
         message(locale, f"court.case.outcome.{decision.outcome.value.lower()}"),
@@ -113,6 +201,14 @@ def _decision_details(locale: discord.Locale, decision: AdministrativeDecision) 
 
 def _choice(key: str, value: str) -> app_commands.Choice[str]:
     return app_commands.Choice(name=app_commands.locale_str(message(None, key), key=key), value=value)
+
+
+def _sanction_term(value: int | None, minimum: int | None, maximum: int | None) -> SanctionTerm | None:
+    if value is None and minimum is None and maximum is None:
+        return None
+    if value is None or minimum is None or maximum is None:
+        raise CourtCaseError(CourtCaseErrorReason.INVALID_SENTENCE)
+    return SanctionTerm(value, minimum, maximum)
 
 
 def _respondent_id(member: discord.Member, guild_scope: discord.Object) -> int:
@@ -257,6 +353,55 @@ def _add_case_commands(court: app_commands.Group, guild_scope: discord.Object, s
             )
             await send_private_lines(interaction, *_decision_details(interaction.locale, result))
 
+    @cases.command(name="decide_merits", description=command_description("court.case.decide_merits"))
+    @app_commands.describe(
+        case_id=command_description("court.case.id"),
+        outcome=command_description("court.case.outcome"),
+        reason=command_description("court.case.public_reason"),
+        article=command_description("court.case.sentence.article"),
+        fine=command_description("court.case.sentence.fine"),
+        fine_min=command_description("court.case.sentence.fine_min"),
+        fine_max=command_description("court.case.sentence.fine_max"),
+        custody_hours=command_description("court.case.sentence.custody_hours"),
+        custody_min=command_description("court.case.sentence.custody_min"),
+        custody_max=command_description("court.case.sentence.custody_max"),
+    )
+    @app_commands.choices(outcome=[
+        _choice(f"court.case.merits.{item.value.lower()}", item.value) for item in MeritsOutcome
+    ])
+    async def decide_merits(
+        interaction: discord.Interaction, case_id: app_commands.Range[int, 1], outcome: app_commands.Choice[str],
+        reason: app_commands.Range[str, 1, ACT_DECISION_REASON_MAX_LENGTH],
+        article: app_commands.Range[str, 1, ARTICLE_MAX_LENGTH] | None = None,
+        fine: app_commands.Range[int, FINE_RANGE[0], FINE_RANGE[1]] | None = None,
+        fine_min: app_commands.Range[int, 0] | None = None,
+        fine_max: app_commands.Range[int, 0] | None = None,
+        custody_hours: app_commands.Range[int, CUSTODY_RANGE[0], CUSTODY_RANGE[1]] | None = None,
+        custody_min: app_commands.Range[int, 0] | None = None,
+        custody_max: app_commands.Range[int, 0] | None = None,
+    ) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            try:
+                selected = MeritsOutcome(outcome.value)
+            except ValueError:
+                raise CourtCaseError(CourtCaseErrorReason.INVALID_OUTCOME) from None
+            sentence = None
+            fine_term = _sanction_term(fine, fine_min, fine_max)
+            custody_term = _sanction_term(custody_hours, custody_min, custody_max)
+            if article is not None or fine_term is not None or custody_term is not None:
+                if article is None:
+                    raise CourtCaseError(CourtCaseErrorReason.INVALID_SENTENCE)
+                try:
+                    sentence = CourtSentence(article, fine=fine_term, custody=custody_term)
+                except ValueError:
+                    raise CourtCaseError(CourtCaseErrorReason.INVALID_SENTENCE) from None
+            result = await service.decide_merits(
+                interaction.guild_id, interaction.user.id, case_id, outcome=selected, reason=reason,
+                idempotency_key=str(interaction.id), sentence=sentence,
+            )
+            await send_private_lines(interaction, *_decision_details(interaction.locale, result))
+
     @cases.command(name="decision", description=command_description("court.case.decision"))
     @app_commands.describe(case_id=command_description("court.case.id"))
     async def decision(interaction: discord.Interaction, case_id: app_commands.Range[int, 1]) -> None:
@@ -267,6 +412,15 @@ def _add_case_commands(court: app_commands.Group, guild_scope: discord.Object, s
                 await send_private_lines(interaction, message(interaction.locale, "court.case.decision.pending"))
                 return
             await send_private_lines(interaction, *_decision_details(interaction.locale, result))
+
+    @cases.command(name="fine_status", description=command_description("court.case.fine_status"))
+    @app_commands.describe(case_id=command_description("court.case.id"))
+    async def fine_status(interaction: discord.Interaction, case_id: app_commands.Range[int, 1]) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            status = await service.fine_status(interaction.guild_id, interaction.user.id, case_id)
+            key = status.value if status is not None else "not_found"
+            await send_private_lines(interaction, message(interaction.locale, f"court.case.fine_status.{key}"))
 
     @cases.command(name="returns", description=command_description("court.case.returns"))
     @app_commands.describe(

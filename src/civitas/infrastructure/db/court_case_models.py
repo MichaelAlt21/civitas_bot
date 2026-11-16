@@ -12,6 +12,7 @@ from .models import Base
 class CourtCaseRow(Base):
     __tablename__ = "court_cases"
     __table_args__ = (
+        UniqueConstraint("guild_id", "id", "kind", name="uq_court_cases_guild_kind"),
         UniqueConstraint("guild_id", "id", "filed_at", name="uq_court_cases_guild_filing"),
         UniqueConstraint("guild_id", "id", "kind", "law_revision_id", name="uq_court_cases_administrative_target"),
         UniqueConstraint("guild_id", "request_key", name="uq_court_cases_request"),
@@ -91,6 +92,10 @@ class CourtActDecisionRow(Base):
         UniqueConstraint("guild_id", "case_id", name="uq_court_act_decisions_guild_case"),
         UniqueConstraint("guild_id", "request_key", name="uq_court_act_decisions_request"),
         ForeignKeyConstraint(
+            ["guild_id", "case_id", "case_kind"], ["court_cases.guild_id", "court_cases.id", "court_cases.kind"],
+            name="fk_court_act_decisions_case_kind",
+        ),
+        ForeignKeyConstraint(
             ["guild_id", "case_id", "case_kind", "revision_id"],
             ["court_cases.guild_id", "court_cases.id", "court_cases.kind", "court_cases.law_revision_id"],
             name="fk_court_act_decisions_case",
@@ -100,8 +105,28 @@ class CourtActDecisionRow(Base):
             name="fk_court_act_decisions_judge",
         ),
         CheckConstraint(
-            "case_kind = 'ADMINISTRATIVE' AND outcome IN ('GRANTED', 'DENIED')",
+            "(case_kind = 'ADMINISTRATIVE' AND revision_id IS NOT NULL AND outcome IN ('GRANTED', 'DENIED')) OR "
+            "(case_kind = 'CRIMINAL' AND revision_id IS NOT NULL AND outcome IN ('GUILTY', 'ACQUITTED')) OR "
+            "(case_kind = 'CIVIL' AND revision_id IS NULL AND outcome IN ('GRANTED', 'DENIED'))",
             name="ck_court_act_decisions_outcome",
+        ),
+        CheckConstraint(
+            "(sanction_article IS NULL AND fine_amount IS NULL AND custody_hours IS NULL) OR (sanction_article IS NOT NULL "
+            "AND char_length(btrim(sanction_article)) > 0 AND case_kind = 'CRIMINAL' AND outcome = 'GUILTY' AND "
+            "(fine_amount IS NOT NULL OR custody_hours IS NOT NULL))",
+            name="ck_court_act_decisions_sentence",
+        ),
+        CheckConstraint(
+            "(fine_amount IS NULL AND fine_min IS NULL AND fine_max IS NULL) OR (fine_amount IS NOT NULL AND fine_min IS "
+            "NOT NULL AND fine_max IS NOT NULL AND fine_amount BETWEEN 10 AND 100 AND fine_min >= 0 AND fine_amount BETWEEN "
+            "fine_min AND fine_max)",
+            name="ck_court_act_decisions_fine",
+        ),
+        CheckConstraint(
+            "(custody_hours IS NULL AND custody_min IS NULL AND custody_max IS NULL) OR (custody_hours IS NOT NULL AND "
+            "custody_min IS NOT NULL AND custody_max IS NOT NULL AND custody_hours BETWEEN 1 AND 24 AND custody_min >= 0 "
+            "AND custody_hours BETWEEN custody_min AND custody_max)",
+            name="ck_court_act_decisions_custody",
         ),
         CheckConstraint(
             "char_length(reason) <= 1000 AND char_length(btrim(reason)) > 0 AND char_length(btrim(request_key)) > 0",
@@ -115,10 +140,17 @@ class CourtActDecisionRow(Base):
 
     case_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
     guild_id: Mapped[int] = mapped_column(BigInteger)
-    revision_id: Mapped[int] = mapped_column(BigInteger)
+    revision_id: Mapped[int | None] = mapped_column(BigInteger)
     case_kind: Mapped[str] = mapped_column(String(20), server_default=text("'ADMINISTRATIVE'"))
     outcome: Mapped[str] = mapped_column(String(20))
     reason: Mapped[str] = mapped_column(Text)
     judge_citizen_id: Mapped[int] = mapped_column(BigInteger)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     request_key: Mapped[str] = mapped_column(String(128))
+    sanction_article: Mapped[str | None] = mapped_column(String(120))
+    fine_amount: Mapped[int | None] = mapped_column(BigInteger)
+    fine_min: Mapped[int | None] = mapped_column(BigInteger)
+    fine_max: Mapped[int | None] = mapped_column(BigInteger)
+    custody_hours: Mapped[int | None] = mapped_column(BigInteger)
+    custody_min: Mapped[int | None] = mapped_column(BigInteger)
+    custody_max: Mapped[int | None] = mapped_column(BigInteger)

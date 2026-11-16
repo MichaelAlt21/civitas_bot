@@ -31,6 +31,9 @@ class TransactionKind(StrEnum):
     PRIVATE_JOB_FUND = "PRIVATE_JOB_FUND"
     PRIVATE_JOB_PAY = "PRIVATE_JOB_PAY"
     PRIVATE_JOB_REFUND = "PRIVATE_JOB_REFUND"
+    COURT_FINE_HOLD = "COURT_FINE_HOLD"
+    COURT_FINE_REFUND = "COURT_FINE_REFUND"
+    COURT_FINE_SETTLE = "COURT_FINE_SETTLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +45,7 @@ class Account:
     company_id: int | None = None
     order_id: int | None = None
     private_job_id: int | None = None
+    court_case_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,7 @@ class PostResult:
 
 class LedgerErrorReason(StrEnum):
     ECONOMY_READ_ONLY = "economy_read_only"
+    IN_CUSTODY = "in_custody"
     INSUFFICIENT_FUNDS = "insufficient_funds"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
     BALANCE_OVERFLOW = "balance_overflow"

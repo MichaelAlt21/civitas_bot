@@ -44,6 +44,7 @@ class TreasuryReport:
     budget_limit: int | None
     budget_articles: tuple[BudgetArticleReport, ...]
     asset_resale_tax: int = 0
+    court_fines: int = 0
 
     @property
     def available_cash(self) -> int:
@@ -53,7 +54,7 @@ class TreasuryReport:
     def total_income(self) -> int:
         return (
             self.company_fees + self.sales_tax + self.asset_sales + self.asset_resale_tax
-            + self.treasury_issuance + self.other_income
+            + self.court_fines + self.treasury_issuance + self.other_income
         )
 
     @property
@@ -64,6 +65,8 @@ class TreasuryReport:
         payload = asdict(self)
         if self.asset_resale_tax == 0:
             del payload["asset_resale_tax"]
+        if self.court_fines == 0:
+            del payload["court_fines"]
         payload["version"] = 1
         payload["window"] = {
             "week_start": self.window.week_start.isoformat(),

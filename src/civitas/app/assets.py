@@ -283,6 +283,7 @@ class AssetService:
                     raise AssetError(AssetErrorReason.INVALID_REQUEST_KEY)
                 return prior
 
+            await repository.require_free(buyer.guild_id, buyer.id, at=self._clock())
             asset = await self._available_asset(repository, buyer.guild_id, quote.asset.id, lock=True)
             if asset != quote.asset:
                 raise AssetError(AssetErrorReason.QUOTE_CHANGED)
@@ -343,6 +344,7 @@ class AssetService:
             seller, buyer = verified[user_id], verified[buyer_user_id]
             prior = await repository.get_resale_offer_by_key(seller.guild_id, idempotency_key)
             if prior is None:
+                await repository.require_free(seller.guild_id, seller.id, at=self._clock())
                 await self._lock_personal_asset(repository, seller, asset_id)
                 created = await repository.create_resale_offer(
                     guild_id=seller.guild_id, asset_id=asset_id, seller_citizen_id=seller.id,
@@ -425,6 +427,7 @@ class AssetService:
             if asset is None or asset.owner_citizen_id != seller.id:
                 raise AssetError(AssetErrorReason.ASSET_NOT_OWNED)
 
+            await repository.require_free(buyer.guild_id, buyer.id, at=self._clock())
             debit = await self._funding.fund_registered_citizen(repository, verified[buyer.id])
             credit = await self._funding.fund_registered_citizen(repository, seller)
             tax = offer.tax

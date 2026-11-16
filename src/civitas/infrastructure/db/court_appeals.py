@@ -1,20 +1,24 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import func, insert, or_, select
+from sqlalchemy import String, cast, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from civitas.app.court_appeals import AppealConfirmation, AppealOutcome, AppealTally, CourtAppeal
+from civitas.domain.ledger import LedgerError, LedgerErrorReason, TransactionKind
 
 from .court_appeal_models import (
     CourtAppealConfirmationRow, CourtAppealOpeningRow, CourtAppealRow, CourtAppealTallyRow,
 )
 from .court_cases import PostgresCourtCaseRepository
+from .court_case_models import CourtActDecisionRow
 from .government_models import ElectionPollSourceRow, ImpeachmentProtocolRow
+from .ledger import PostgresLedgerRepository
+from .ledger_models import FinancialTransactionRow
 from .models import GuildRow
 
 
@@ -86,6 +90,55 @@ def _utc(dt: datetime | None) -> datetime | None:
 
 
 class PostgresCourtAppealRepository(PostgresCourtCaseRepository):
+    async def reconcile_court_fines(
+        self, discord_guild_id: int, *, now: datetime, filing_period: timedelta,
+    ) -> None:
+        guild_id = await self._session.scalar(
+            select(GuildRow.id).where(GuildRow.discord_guild_id == Decimal(discord_guild_id)),
+        )
+        if guild_id is None:
+            return
+        await self.lock_election_cycle(guild_id)
+        case_key = cast(CourtActDecisionRow.case_id, String)
+        closed = select(FinancialTransactionRow.id).where(
+            FinancialTransactionRow.guild_id == guild_id,
+            FinancialTransactionRow.kind.in_((TransactionKind.COURT_FINE_SETTLE.value, TransactionKind.COURT_FINE_REFUND.value)),
+            FinancialTransactionRow.idempotency_key == (func.lower(FinancialTransactionRow.kind) + ":" + case_key),
+        ).exists()
+        held = select(FinancialTransactionRow.id).where(
+            FinancialTransactionRow.guild_id == guild_id,
+            FinancialTransactionRow.kind == TransactionKind.COURT_FINE_HOLD.value,
+            FinancialTransactionRow.idempotency_key == ("court_fine_hold:" + case_key),
+        ).exists()
+        cases = (await self._session.execute(
+            select(CourtActDecisionRow.case_id, CourtActDecisionRow.decided_at, CourtAppealRow.case_id,
+                   CourtAppealConfirmationRow.confirmed_by_citizen_id, CourtAppealConfirmationRow.outcome)
+            .outerjoin(CourtAppealRow, CourtAppealRow.case_id == CourtActDecisionRow.case_id)
+            .outerjoin(CourtAppealConfirmationRow,
+                       (CourtAppealConfirmationRow.case_id == CourtActDecisionRow.case_id)
+                       & (CourtAppealConfirmationRow.outcome != AppealOutcome.EXTENDED.value))
+            .where(
+                CourtActDecisionRow.guild_id == guild_id, CourtActDecisionRow.fine_amount.is_not(None), ~closed,
+                or_(CourtAppealConfirmationRow.outcome.is_distinct_from(AppealOutcome.OVERTURNED.value), held),
+            )
+            .order_by(CourtActDecisionRow.decided_at, CourtActDecisionRow.case_id),
+        )).all()
+        for case_id, decided_at, filed_case_id, confirmed_by, outcome in cases:
+            if outcome == AppealOutcome.OVERTURNED:
+                await self.close_court_fine(guild_id, case_id, refund=True, confirmed_by=confirmed_by)
+                continue
+            try:
+                await self.hold_court_fine(guild_id, case_id)
+            except LedgerError as error:
+                if error.reason is LedgerErrorReason.INSUFFICIENT_FUNDS:
+                    continue
+                raise
+            if confirmed_by is not None or (filed_case_id is None and now > decided_at + filing_period):
+                await self.close_court_fine(
+                    guild_id, case_id, refund=False, confirmed_by=confirmed_by,
+                    settled_at=now if confirmed_by is None else None,
+                )
+
     async def get_court_appeal(self, discord_guild_id: int, case_id: int) -> CourtAppeal | None:
         row = (await self._session.execute(_appeal_query(
             GuildRow.discord_guild_id == Decimal(discord_guild_id), CourtAppealRow.case_id == case_id,
@@ -144,6 +197,17 @@ class PostgresCourtAppealRepository(PostgresCourtCaseRepository):
             confirmed_by_citizen_id=confirmation.confirmed_by_citizen_id, confirmed_at=confirmation.confirmed_at,
             outcome=confirmation.outcome.value, extended_until=confirmation.extended_until,
         ))
+        if confirmation.outcome is not AppealOutcome.EXTENDED:
+            try:
+                async with self._session.begin_nested():
+                    await PostgresLedgerRepository(self._session).close_court_fine(
+                        confirmation.guild_id, confirmation.case_id,
+                        refund=confirmation.outcome is AppealOutcome.OVERTURNED,
+                        confirmed_by=confirmation.confirmed_by_citizen_id,
+                    )
+            except LedgerError as error:
+                if error.reason is not LedgerErrorReason.ECONOMY_READ_ONLY:
+                    raise
         return await self._require_appeal(confirmation.guild_id, confirmation.case_id)
 
     async def appeal_source_in_use(self, local_guild_id: int, source_url: str) -> bool:

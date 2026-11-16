@@ -8,10 +8,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from civitas.domain.citizens import Citizen, CitizenStatus
-from civitas.domain.ledger import MAX_AMOUNT
+from civitas.domain.ledger import MAX_AMOUNT, LedgerError, LedgerErrorReason
 
 from .citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
-from .court_cases import AdministrativeDecision, CourtCase
+from .court_cases import AdministrativeDecision, CaseKind, CourtCase, MeritsDecision
 from .government import GovernmentError, poll_quorum, public_poll_source
 from .law import LawRevision
 from .prosecutor import ProsecutorMotion
@@ -106,6 +106,7 @@ class CourtAppealRepository(Protocol):
     async def get_active_prosecutor(self, discord_guild_id: int) -> ProsecutorMotion | None: ...
     async def get_case(self, discord_guild_id: int, case_id: int) -> CourtCase | None: ...
     async def get_act_decision(self, discord_guild_id: int, case_id: int) -> AdministrativeDecision | None: ...
+    async def get_merits_decision(self, discord_guild_id: int, case_id: int) -> MeritsDecision | None: ...
     async def get_law_revision(self, discord_guild_id: int, revision_id: int) -> LawRevision | None: ...
 
     async def get_court_appeal(self, discord_guild_id: int, case_id: int) -> CourtAppeal | None: ...
@@ -118,6 +119,9 @@ class CourtAppealRepository(Protocol):
         self, guild_id: int, case_id: int, round_number: int,
     ) -> AppealConfirmation | None: ...
     async def add_appeal_confirmation(self, confirmation: AppealConfirmation) -> CourtAppeal: ...
+    async def reconcile_court_fines(
+        self, discord_guild_id: int, *, now: datetime, filing_period: timedelta,
+    ) -> None: ...
 
 
 def _utcnow() -> datetime:
@@ -163,6 +167,14 @@ class CourtAppealService:
         self._quorum_min = quorum_min
         self._poll_hosts = frozenset(host.lower() for host in poll_hosts)
         self._clock = clock
+
+    async def reconcile_fines(self) -> None:
+        try:
+            async with self._unit_of_work() as repository:
+                await repository.reconcile_court_fines(self._guild_id, now=self._now(), filing_period=_FILING_PERIOD)
+        except LedgerError as error:
+            if error.reason is not LedgerErrorReason.ECONOMY_READ_ONLY:
+                raise
 
     async def file(self, guild_id: int | None, user_id: int, case_id: int) -> CourtAppeal:
         self._require_scope(guild_id, case_id)
@@ -285,7 +297,10 @@ class CourtAppealService:
         case, decision = await self._case_and_decision(repository, case_id)
         appeal = await self._appeal(repository, case_id)
         excluded = {case.filer_citizen_id, decision.judge_citizen_id, appeal.appellant_citizen_id}
-        revision = await repository.get_law_revision(self._guild_id, decision.revision_id)
+        revision = (
+            await repository.get_law_revision(self._guild_id, decision.revision_id)
+            if isinstance(decision, AdministrativeDecision) else None
+        )
         if revision is not None:
             excluded.add(revision.proposer_citizen_id)
             if revision.confirmed_by_citizen_id is not None:
@@ -303,10 +318,15 @@ class CourtAppealService:
 
     async def _case_and_decision(
         self, repository: CourtAppealRepository, case_id: int,
-    ) -> tuple[CourtCase, AdministrativeDecision]:
+    ) -> tuple[CourtCase, AdministrativeDecision | MeritsDecision]:
         case = await repository.get_case(self._guild_id, case_id)
-        decision = await repository.get_act_decision(self._guild_id, case_id)
-        if case is None or decision is None:
+        if case is None:
+            raise CourtAppealError(CourtAppealErrorReason.NOT_FOUND)
+        if case.kind is CaseKind.ADMINISTRATIVE:
+            decision = await repository.get_act_decision(self._guild_id, case_id)
+        else:
+            decision = await repository.get_merits_decision(self._guild_id, case_id)
+        if decision is None:
             raise CourtAppealError(CourtAppealErrorReason.NOT_FOUND)
         return case, decision
 

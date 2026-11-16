@@ -15,6 +15,7 @@ class PresentationBinding(StrEnum):
     PRESIDENT_ROLE = "president_role_id"
     PARLIAMENT_ROLE = "parliament_role_id"
     REPORT_CHANNEL = "report_channel_id"
+    CUSTODY_ROLE = "custody_role_id"
 
 
 class PresentationErrorReason(StrEnum):
@@ -35,6 +36,7 @@ class GuildPresentation:
     president_role_id: int | None = None
     parliament_role_id: int | None = None
     report_channel_id: int | None = None
+    custody_role_id: int | None = None
 
 
 class PresentationRepository(Protocol):
