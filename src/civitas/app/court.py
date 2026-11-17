@@ -31,9 +31,26 @@ class CourtNomination:
     approval_count: int = 0
     starts_at: datetime | None = None
     ends_at: datetime | None = None
+    removed_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CourtRemoval:
+    id: int
+    guild_id: int
+    nomination_id: int
+    president_term_id: int
+    proposer_id: int
+    reason: str
+    proposed_at: datetime
+    first_senator_id: int | None = None
+    second_senator_id: int | None = None
+    second_signed_at: datetime | None = None
 
 
 class CourtErrorReason(StrEnum):
+    REMOVAL_NOT_FOUND = "removal_not_found"
+    REMOVAL_EXPIRED = "removal_expired"
     PRESIDENT_REQUIRED = "president_required"
     DEPUTY_REQUIRED = "deputy_required"
     INVALID_CANDIDATE = "invalid_candidate"
@@ -52,6 +69,10 @@ class CourtError(Exception):
 
 
 class CourtRepository(Protocol):
+    async def find_removal(self, guild_id: int, key: str) -> CourtRemoval | None: ...
+    async def get_removal(self, guild_id: int, proposal_id: int) -> CourtRemoval | None: ...
+    async def add_removal(self, removal: CourtRemoval, key: str) -> CourtRemoval: ...
+    async def sign_removal(self, removal: CourtRemoval, senator_id: int, at: datetime) -> CourtRemoval: ...
     async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None: ...
 
     async def lock_election_cycle(self, guild_id: int) -> None: ...
@@ -117,6 +138,80 @@ class CourtService:
         self._require_guild(guild_id)
         async with self._unit_of_work() as repository:
             return await repository.get_active_court_nomination(self._guild_id, self._now())
+
+    async def propose_removal(
+        self, guild_id: int | None, user_id: int, *, reason: str, idempotency_key: str,
+    ) -> CourtRemoval:
+        self._require_guild(guild_id)
+        reason = _validate_reason(reason)
+        if (
+            not isinstance(idempotency_key, str) or not idempotency_key.strip()
+            or len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH or not idempotency_key.isprintable()
+        ):
+            raise CourtError(CourtErrorReason.INVALID_REQUEST)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            prior = await repository.find_removal(actor.guild_id, idempotency_key)
+            if prior is not None:
+                if (prior.proposer_id, prior.reason) != (actor.id, reason):
+                    raise CourtError(CourtErrorReason.INVALID_REQUEST)
+                return prior
+            now = self._now()
+            president = await repository.get_current_presidential_term(actor.guild_id, now)
+            if president is None or president[1].holder_citizen_id != actor.id:
+                raise CourtError(CourtErrorReason.PRESIDENT_REQUIRED)
+            judge = await repository.get_active_court_nomination(self._guild_id, now)
+            if judge is None:
+                raise CourtError(CourtErrorReason.REMOVAL_EXPIRED)
+            return await repository.add_removal(
+                CourtRemoval(0, actor.guild_id, judge.id, president[0], actor.id, reason, now), idempotency_key,
+            )
+
+    async def approve_removal(self, guild_id: int | None, user_id: int, proposal_id: int) -> CourtRemoval:
+        self._require_guild(guild_id)
+        if type(proposal_id) is not int or not 1 <= proposal_id <= MAX_AMOUNT:
+            raise CourtError(CourtErrorReason.REMOVAL_NOT_FOUND)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            now = self._now()
+            if not await repository.has_active_office(actor.guild_id, actor.id, OfficeKind.PARLIAMENT, now):
+                raise CourtError(CourtErrorReason.DEPUTY_REQUIRED)
+            proposal = await repository.get_removal(actor.guild_id, proposal_id)
+            if proposal is None:
+                raise CourtError(CourtErrorReason.REMOVAL_NOT_FOUND)
+            if actor.id == proposal.proposer_id:
+                raise CourtError(CourtErrorReason.CONFLICT_OF_INTEREST)
+            if actor.id in (proposal.first_senator_id, proposal.second_senator_id):
+                return proposal
+            president = await repository.get_current_presidential_term(actor.guild_id, now)
+            judge = await repository.get_active_court_nomination(self._guild_id, now)
+            if (
+                president is None or president[0] != proposal.president_term_id
+                or judge is None or judge.id != proposal.nomination_id
+            ):
+                raise CourtError(CourtErrorReason.REMOVAL_EXPIRED)
+            if actor.id == judge.candidate_citizen_id:
+                raise CourtError(CourtErrorReason.CONFLICT_OF_INTEREST)
+            return await repository.sign_removal(proposal, actor.id, now)
+
+    async def removal_details(self, guild_id: int | None, user_id: int, proposal_id: int) -> CourtRemoval:
+        self._require_guild(guild_id)
+        if type(proposal_id) is not int or not 1 <= proposal_id <= MAX_AMOUNT:
+            raise CourtError(CourtErrorReason.REMOVAL_NOT_FOUND)
+        if not is_discord_id(user_id):
+            raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+        async with self._unit_of_work() as repository:
+            actor = await self._get_eligible_citizen(repository, user_id)
+            if actor is None:
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+            proposal = await repository.get_removal(actor.guild_id, proposal_id)
+            if proposal is None:
+                raise CourtError(CourtErrorReason.REMOVAL_NOT_FOUND)
+            if actor.id != proposal.proposer_id and not await repository.has_active_office(
+                actor.guild_id, actor.id, OfficeKind.PARLIAMENT, self._now(),
+            ):
+                raise CourtError(CourtErrorReason.DEPUTY_REQUIRED)
+            return proposal
 
     async def get_nomination(self, guild_id: int | None, nomination_id: int) -> CourtNomination:
         self._require_guild(guild_id)

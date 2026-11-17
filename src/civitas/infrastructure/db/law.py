@@ -25,6 +25,7 @@ def _to_law(row: LawRevisionRow, confirmation: LawConfirmationRow | None) -> Law
         confirmed_by_citizen_id=confirmation.confirmed_by_citizen_id if confirmation else None,
         confirmed_at=confirmation.confirmed_at.astimezone(UTC) if confirmation else None,
         act_kind=ActKind(row.act_kind),
+        correction_case_id=row.correction_case_id,
     )
 
 
@@ -65,6 +66,29 @@ def _revision_in_force(at: datetime) -> ColumnElement[bool]:
 
 
 class PostgresLawRepository(PostgresGovernmentRepository):
+    async def required_correction_cases(self, revision: LawRevision, *, at: datetime) -> set[int]:
+        predecessor = (
+            select(LawConfirmationRow.revision_id)
+            .where(
+                LawConfirmationRow.guild_id == revision.guild_id,
+                LawConfirmationRow.code == revision.code,
+                LawConfirmationRow.act_kind == revision.act_kind.value,
+                LawConfirmationRow.effective_at < revision.effective_at,
+            )
+            .order_by(LawConfirmationRow.effective_at.desc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        suspended = select(CourtActDecisionRow.case_id).where(
+            CourtActDecisionRow.guild_id == revision.guild_id,
+            CourtActDecisionRow.revision_id == predecessor,
+            CourtActDecisionRow.case_kind == "ADMINISTRATIVE",
+            CourtActDecisionRow.outcome == "GRANTED",
+            CourtActDecisionRow.decided_at <= at,
+            ~appeal_overturned(at),
+        )
+        return set(await self._session.scalars(suspended))
+
     async def find_law_revision(self, guild_id: int, request_key: str) -> LawRevision | None:
         result = (await self._session.execute(_law_query(
             LawRevisionRow.guild_id == guild_id, LawRevisionRow.request_key == request_key,
@@ -79,6 +103,7 @@ class PostgresLawRepository(PostgresGovernmentRepository):
                 source_url=revision.source_url, effective_at=revision.effective_at,
                 proposer_citizen_id=revision.proposer_citizen_id, proposed_at=revision.proposed_at,
                 request_key=request_key, act_kind=revision.act_kind.value,
+                correction_case_id=revision.correction_case_id,
             )
             .returning(LawRevisionRow)
         )).one()

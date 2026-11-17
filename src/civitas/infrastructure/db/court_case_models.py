@@ -58,6 +58,76 @@ class CourtCaseRow(Base):
     request_key: Mapped[str] = mapped_column(String(128))
 
 
+class CourtCaseRecusalRow(Base):
+    __tablename__ = "court_case_recusals"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["guild_id", "case_id", "case_kind"], ["court_cases.guild_id", "court_cases.id", "court_cases.kind"],
+            name="fk_case_recusals_case",
+        ),
+        ForeignKeyConstraint(["guild_id", "actor_id"], ["citizens.guild_id", "citizens.id"], name="fk_case_recusals_actor"),
+        CheckConstraint("role IN ('JUDGE', 'PROSECUTOR')", name="ck_case_recusals_role"),
+    )
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16), primary_key=True)
+    actor_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    case_kind: Mapped[str] = mapped_column(String(20))
+    recused_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class CourtCaseSubstituteRow(Base):
+    __tablename__ = "court_case_substitutes"
+    __table_args__ = (
+        UniqueConstraint("guild_id", "request_key", name="uq_case_substitutes_request"),
+        ForeignKeyConstraint(
+            ["guild_id", "case_id", "case_kind"], ["court_cases.guild_id", "court_cases.id", "court_cases.kind"],
+            name="fk_case_substitutes_case",
+        ),
+        ForeignKeyConstraint(["guild_id", "candidate_id"], ["citizens.guild_id", "citizens.id"],
+                             name="fk_case_substitutes_candidate_id"),
+        ForeignKeyConstraint(["guild_id", "proposer_id"], ["citizens.guild_id", "citizens.id"],
+                             name="fk_case_substitutes_proposer_id"),
+        ForeignKeyConstraint(["guild_id", "first_senator_id"], ["citizens.guild_id", "citizens.id"],
+                             name="fk_case_substitutes_first_senator_id"),
+        ForeignKeyConstraint(["guild_id", "second_senator_id"], ["citizens.guild_id", "citizens.id"],
+                             name="fk_case_substitutes_second_senator_id"),
+        CheckConstraint("role IN ('JUDGE', 'PROSECUTOR')", name="ck_case_substitutes_role"),
+        CheckConstraint(
+            "(first_senator_id IS NULL) = (first_signed_at IS NULL) "
+            "AND (second_senator_id IS NULL) = (second_signed_at IS NULL) "
+            "AND (first_signed_at IS NULL OR first_signed_at >= proposed_at) "
+            "AND (second_signed_at IS NULL OR (first_signed_at IS NOT NULL AND second_signed_at >= first_signed_at))",
+            name="ck_case_substitutes_signatures",
+        ),
+        CheckConstraint(
+            "candidate_id <> proposer_id AND first_senator_id <> proposer_id AND first_senator_id <> candidate_id "
+            "AND second_senator_id <> proposer_id AND second_senator_id <> candidate_id "
+            "AND first_senator_id <> second_senator_id",
+            name="ck_case_substitutes_independence",
+        ),
+        Index(
+            "uq_case_substitutes_confirmed", "guild_id", "case_id", "role",
+            unique=True, postgresql_where=text("second_signed_at IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    guild_id: Mapped[int] = mapped_column(BigInteger)
+    case_id: Mapped[int] = mapped_column(BigInteger)
+    case_kind: Mapped[str] = mapped_column(String(20))
+    role: Mapped[str] = mapped_column(String(16))
+    candidate_id: Mapped[int] = mapped_column(BigInteger)
+    proposer_id: Mapped[int] = mapped_column(BigInteger)
+    proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    request_key: Mapped[str] = mapped_column(String(128))
+    first_senator_id: Mapped[int | None] = mapped_column(BigInteger)
+    first_signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    second_senator_id: Mapped[int | None] = mapped_column(BigInteger)
+    second_signed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class CourtHearingRow(Base):
     __tablename__ = "court_hearings"
     __table_args__ = (

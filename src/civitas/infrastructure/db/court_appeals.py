@@ -15,7 +15,7 @@ from .court_appeal_models import (
     CourtAppealConfirmationRow, CourtAppealOpeningRow, CourtAppealRow, CourtAppealTallyRow,
 )
 from .court_cases import PostgresCourtCaseRepository
-from .court_case_models import CourtActDecisionRow
+from .court_case_models import CourtActDecisionRow, CourtHearingRow
 from .government_models import ElectionPollSourceRow, ImpeachmentProtocolRow
 from .ledger import PostgresLedgerRepository
 from .ledger_models import FinancialTransactionRow
@@ -90,6 +90,14 @@ def _utc(dt: datetime | None) -> datetime | None:
 
 
 class PostgresCourtAppealRepository(PostgresCourtCaseRepository):
+    async def hearing_judge_ids(self, guild_id: int, case_id: int) -> set[int]:
+        judges = await self._session.scalars(
+            select(CourtHearingRow.judge_citizen_id).where(
+                CourtHearingRow.guild_id == guild_id, CourtHearingRow.case_id == case_id,
+            ).distinct(),
+        )
+        return set(judges)
+
     async def reconcile_court_fines(
         self, discord_guild_id: int, *, now: datetime, filing_period: timedelta,
     ) -> None:

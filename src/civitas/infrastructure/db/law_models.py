@@ -18,6 +18,10 @@ class LawRevisionRow(Base):
             ["guild_id", "proposer_citizen_id"], ["citizens.guild_id", "citizens.id"],
             name="fk_law_revisions_proposer",
         ),
+        ForeignKeyConstraint(
+            ["guild_id", "correction_case_id"], ["court_act_decisions.guild_id", "court_act_decisions.case_id"],
+            name="fk_law_revisions_correction", use_alter=True,
+        ),
         CheckConstraint(
             "length(btrim(code)) > 0 AND length(btrim(title)) > 0 AND length(btrim(text)) > 0 "
             "AND length(btrim(source_url)) > 0 AND length(btrim(request_key)) > 0",
@@ -37,6 +41,7 @@ class LawRevisionRow(Base):
     proposed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     request_key: Mapped[str] = mapped_column(String(128))
     act_kind: Mapped[str] = mapped_column(Text, server_default="LAW")
+    correction_case_id: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class LawConfirmationRow(Base):

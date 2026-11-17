@@ -43,6 +43,7 @@ class LawRevision:
     confirmed_by_citizen_id: int | None = None
     confirmed_at: datetime | None = None
     act_kind: ActKind = ActKind.LAW
+    correction_case_id: int | None = None
 
 
 class LawErrorReason(StrEnum):
@@ -54,6 +55,7 @@ class LawErrorReason(StrEnum):
     INVALID_SOURCE = "invalid_source"
     INVALID_EFFECTIVE_AT = "invalid_effective_at"
     INVALID_REQUEST = "invalid_request"
+    CORRECTION_CASE_REQUIRED = "correction_case_required"
     REVISION_NOT_FOUND = "revision_not_found"
     INDEPENDENT_CONFIRMATION = "independent_confirmation"
     OCCUPIED_EFFECTIVE_AT = "occupied_effective_at"
@@ -66,6 +68,7 @@ class LawError(Exception):
 
 
 class LawRepository(Protocol):
+    async def required_correction_cases(self, revision: LawRevision, *, at: datetime) -> set[int]: ...
     async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None: ...
     async def lock_election_cycle(self, guild_id: int) -> None: ...
     async def is_allowed(self, discord_guild_id: int, user_id: int) -> bool: ...
@@ -140,7 +143,7 @@ class LawService:
 
     async def register(
         self, guild_id: int | None, user_id: int, *, code: str, title: str, text: str, source_url: str,
-        effective_at: str, idempotency_key: str,
+        effective_at: str, idempotency_key: str, correction_case_id: int | None = None,
     ) -> LawRevision:
         self._require_guild(guild_id)
         code = _law_code(code)
@@ -148,6 +151,8 @@ class LawService:
         text = _law_text(text, limit=LAW_TEXT_MAX_LENGTH, reason=LawErrorReason.INVALID_TEXT, multiline=True)
         source = self._source(source_url)
         effective = _timestamp(effective_at)
+        if correction_case_id is not None:
+            self._validate_revision_id(correction_case_id)
         if (not isinstance(idempotency_key, str) or not idempotency_key.strip()
                 or len(idempotency_key) > MAX_IDEMPOTENCY_KEY_LENGTH or not idempotency_key.isprintable()):
             raise LawError(LawErrorReason.INVALID_REQUEST)
@@ -156,17 +161,24 @@ class LawService:
             actor, now = await self._lock_for_office(repository, user_id, self._proposing_office)
             existing = await repository.find_law_revision(actor.guild_id, idempotency_key)
             if existing is not None:
-                expected = (self._act_kind, actor.id, code, title, text, source, effective)
+                expected = (self._act_kind, actor.id, code, title, text, source, effective, correction_case_id)
                 if (existing.act_kind, existing.proposer_citizen_id, existing.code, existing.title, existing.text,
-                        existing.source_url, existing.effective_at) != expected:
+                        existing.source_url, existing.effective_at, existing.correction_case_id) != expected:
                     raise LawError(LawErrorReason.INVALID_REQUEST)
                 return existing
             if await repository.has_confirmed_law_slot(actor.guild_id, code, effective, act_kind=self._act_kind):
                 raise LawError(LawErrorReason.OCCUPIED_EFFECTIVE_AT)
-            return await repository.add_law_revision(LawRevision(
+            draft = LawRevision(
                 id=0, guild_id=actor.guild_id, code=code, title=title, text=text, source_url=source,
                 effective_at=effective, proposer_citizen_id=actor.id, proposed_at=now, act_kind=self._act_kind,
-            ), idempotency_key)
+                correction_case_id=correction_case_id,
+            )
+            required_cases = await repository.required_correction_cases(draft, at=now)
+            if correction_case_id is not None and correction_case_id not in required_cases:
+                raise LawError(LawErrorReason.INVALID_REQUEST)
+            if correction_case_id is None and required_cases:
+                raise LawError(LawErrorReason.CORRECTION_CASE_REQUIRED)
+            return await repository.add_law_revision(draft, idempotency_key)
 
     async def confirm(self, guild_id: int | None, user_id: int, revision_id: int) -> LawRevision:
         self._require_guild(guild_id)
@@ -178,6 +190,9 @@ class LawService:
                 raise LawError(LawErrorReason.INDEPENDENT_CONFIRMATION)
             if revision.confirmed_at is not None:
                 return revision
+            required_cases = await repository.required_correction_cases(revision, at=now)
+            if required_cases and revision.correction_case_id not in required_cases:
+                raise LawError(LawErrorReason.CORRECTION_CASE_REQUIRED)
             if await repository.has_confirmed_law_slot(
                 revision.guild_id, revision.code, revision.effective_at, act_kind=self._act_kind,
             ):

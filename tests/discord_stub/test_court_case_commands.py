@@ -196,7 +196,7 @@ async def test_docket_commands_are_guild_scoped_and_localized(commands):
     entries = {entry["name"]: entry for entry in case_group["options"]}
     assert set(entries) == {
         "charge", "challenge", "challenge_decree", "civil", "decide_challenge", "decide_merits", "decision", "list", "returns",
-        "fine_status", "schedule", "show",
+        "fine_status", "schedule", "show", "nominate_judge", "approve_judge", "nominate_prosecutor", "approve_prosecutor", "recuse", "substitute",
     }
     assert entries["civil"]["description"] == "File a civil claim"
     assert entries["civil"]["description_localizations"]["ru"] == "Подать гражданский иск"
@@ -219,6 +219,23 @@ async def test_docket_commands_are_guild_scoped_and_localized(commands):
     returns = {choice["value"]: choice for choice in entries["returns"]["options"][0]["choices"]}
     assert returns["LAW"]["name"] == "Senate laws"
     assert returns["DECREE"]["name_localizations"]["ru"] == "Указы президента"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("role", "label"), [
+    ("JUDGE", "Кандидат во временные судьи"),
+    ("PROSECUTOR", "Кандидат в представители государства"),
+])
+async def test_substitute_details_are_private_and_do_not_ping(commands, role, label):
+    service, _, _, cases = commands
+    request = interaction()
+    service.substitute_details.return_value = (CASE_ID, RESPONDENT_ID, 1)
+    await cases.get_command("substitute").callback(
+        request, 12, app_commands.Choice(name=role, value=role),
+    )
+    service.substitute_details.assert_awaited_once_with(GUILD_ID, ACTOR_ID, 12, role=role)
+    result = "\n".join(private_pages(request))
+    assert label in result and f"<@{RESPONDENT_ID}>" in result and "1 из 2" in result
 
 
 @pytest.mark.asyncio

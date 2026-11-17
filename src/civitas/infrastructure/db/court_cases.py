@@ -19,7 +19,7 @@ from civitas.domain.ledger import LedgerError, LedgerErrorReason, TransactionKin
 
 from .court import PostgresCourtRepository
 from .court_appeal_models import CourtAppealConfirmationRow
-from .court_case_models import CourtActDecisionRow, CourtCaseRow, CourtHearingRow
+from .court_case_models import CourtActDecisionRow, CourtCaseRecusalRow, CourtCaseRow, CourtCaseSubstituteRow, CourtHearingRow
 from .law import PostgresLawRepository, appeal_overturned
 from .law_models import LawRevisionRow
 from .ledger import PostgresLedgerRepository, active_custody_at
@@ -125,6 +125,75 @@ def _to_decision(row: CourtActDecisionRow, act_kind: str) -> AdministrativeDecis
 
 
 class PostgresCourtCaseRepository(PostgresCourtRepository, PostgresLawRepository, PostgresProsecutorRepository):
+    async def is_recused(self, case: CourtCase, role: str, actor_id: int) -> bool:
+        return await self._session.get(CourtCaseRecusalRow, (case.guild_id, case.id, role, actor_id)) is not None
+
+    async def add_recusal(self, case: CourtCase, role: str, actor_id: int, now: datetime) -> None:
+        await self._session.execute(pg_insert(CourtCaseRecusalRow).values(
+            guild_id=case.guild_id, case_id=case.id, case_kind=case.kind.value,
+            role=role, actor_id=actor_id, recused_at=now,
+        ).on_conflict_do_nothing())
+    async def propose_substitute(self, case: CourtCase, actor_id: int, candidate_id: int, now: datetime, key: str, role: str) -> int:
+        table = CourtCaseSubstituteRow
+        created = await self._session.scalar(
+            pg_insert(table).values(
+                guild_id=case.guild_id, case_id=case.id, case_kind=case.kind.value, role=role,
+                candidate_id=candidate_id, proposer_id=actor_id, proposed_at=now, request_key=key,
+            ).on_conflict_do_nothing(constraint="uq_case_substitutes_request").returning(table.id),
+        )
+        if created is not None:
+            return created
+        replay = await self.find_substitute_request(case, actor_id, candidate_id, key, role)
+        if replay is None:
+            raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
+        return replay
+
+    async def find_substitute_request(
+        self, case: CourtCase, actor_id: int, candidate_id: int, key: str, role: str,
+    ) -> int | None:
+        table = CourtCaseSubstituteRow
+        replay = await self._session.scalar(select(table).where(table.guild_id == case.guild_id, table.request_key == key))
+        if replay is None:
+            return None
+        if (replay.case_id, replay.role, replay.candidate_id, replay.proposer_id) != (
+            case.id, role, candidate_id, actor_id,
+        ):
+            raise CourtCaseError(CourtCaseErrorReason.INVALID_REQUEST)
+        return replay.id
+
+    async def get_substitute_proposal(
+        self, guild_id: int, proposal_id: int, role: str,
+    ) -> tuple[int, int, int, int | None, int | None] | None:
+        table = CourtCaseSubstituteRow
+        row = (await self._session.execute(
+            select(table.case_id, table.proposer_id, CitizenRow.discord_user_id,
+                   table.first_senator_id, table.second_senator_id)
+            .join(CitizenRow, CitizenRow.id == table.candidate_id)
+            .where(table.guild_id == guild_id, table.id == proposal_id, table.role == role),
+        )).one_or_none()
+        if row is None:
+            return None
+        return row.case_id, row.proposer_id, int(row.discord_user_id), row.first_senator_id, row.second_senator_id
+
+    async def sign_substitute(self, guild_id: int, proposal_id: int, senator_id: int, now: datetime, role: str) -> bool:
+        table = CourtCaseSubstituteRow
+        row = (await self._session.scalars(select(table).where(
+            table.guild_id == guild_id, table.id == proposal_id, table.role == role,
+        ).with_for_update())).one()
+        if row.first_senator_id is None:
+            row.first_senator_id, row.first_signed_at = senator_id, now
+            return False
+        if row.first_senator_id == senator_id:
+            return False
+        row.second_senator_id, row.second_signed_at = senator_id, now
+        return True
+
+    async def get_substitute(self, guild_id: int, case_id: int, role: str = "JUDGE") -> int | None:
+        table = CourtCaseSubstituteRow
+        return await self._session.scalar(select(table.candidate_id).where(
+            table.guild_id == guild_id, table.case_id == case_id, table.role == role,
+            table.second_signed_at.is_not(None),
+        ))
     async def get_fine_status(self, guild_id: int, case_id: int, respondent_id: int) -> CourtFineStatus | None:
         def posted(kind: TransactionKind) -> ColumnElement[bool]:
             return select(FinancialTransactionRow.id).where(

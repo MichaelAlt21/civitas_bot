@@ -65,10 +65,13 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         admin = bot.tree.get_command("admin", guild=bot.guild_scope)
         assert {command.name for command in admin.commands} == {"admission", "audit", "maintenance", "setup"}
         court = bot.tree.get_command("court", guild=bot.guild_scope)
-        assert {command.name for command in court.commands} >= {"nominate", "approve", "current", "case"}
+        assert {command.name for command in court.commands} >= {
+            "nominate", "approve", "current", "case", "propose_removal", "approve_removal",
+        }
         assert {command.name for command in court.get_command("case").commands} == {
             "civil", "charge", "challenge", "challenge_decree", "show", "list", "schedule",
-            "decide_challenge", "decide_merits", "decision", "fine_status", "returns",
+            "decide_challenge", "decide_merits", "decision", "fine_status", "returns", "nominate_judge", "approve_judge",
+            "nominate_prosecutor", "approve_prosecutor", "recuse", "substitute",
         }
         assert {command.name for command in court.get_command("appeal").commands} == {
             "file", "open", "voters", "record", "confirm", "show",

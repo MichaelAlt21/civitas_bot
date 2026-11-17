@@ -101,6 +101,24 @@ def test_season_one_profile_loads_approved_values_and_elected_treasury(season_on
     assert (government.voting_hours, government.quorum_bp, government.quorum_min, government.extension_hours) == (48, 4000, 4, 24)
 
 
+def test_court_rehearsal_profile_overrides_elections_and_preserves_economy(season_one_env):
+    season = load_settings(season_one_env)
+    profile = Path(__file__).resolve().parents[1] / "config" / "rehearsal-court.env"
+    season_one_env.update(line.split("=", 1) for line in profile.read_text(encoding="utf-8").splitlines() if "=" in line)
+    rehearsal = load_settings(season_one_env)
+
+    assert rehearsal.track_membership
+    assert rehearsal.wallet == season.wallet
+    assert rehearsal.jobs == season.jobs
+    assert rehearsal.market == season.market
+    assert rehearsal.treasury == season.treasury
+    government = rehearsal.government
+    assert government is not None
+    assert (government.min_eligible, government.parliament_seats) == (7, 2)
+    assert (government.voting_hours, government.extension_hours) == (1, 1)
+    assert (government.quorum_bp, government.quorum_min, government.term_days) == (4000, 2, 28)
+
+
 @pytest.mark.parametrize(("key", "value"), [
     ("CIVITAS_MARKET_ARBITER_IDS", ""),
     ("CIVITAS_ASSET_ISSUER_IDS", ""),

@@ -43,6 +43,7 @@ def nomination(approvals):
     return SimpleNamespace(
         id=NOMINATION_ID, candidate_user_id=CANDIDATE_ID, approval_count=approvals,
         starts_at=NOW if approvals == 2 else None, ends_at=NOW + timedelta(days=28) if approvals == 2 else None,
+        removed_at=None,
         reason="Internal reason @everyone **example**",
     )
 
@@ -65,11 +66,25 @@ async def test_court_commands_are_guild_scoped_and_localized(commands):
     assert not tree.get_commands(guild=discord.Object(id=GUILD_ID + 1))
     payload = await court.get_translated_payload(tree, CommandTranslator())
     entries = {item["name"]: item for item in payload["options"]}
-    assert set(entries) == {"approve", "current", "nominate", "nomination"}
+    assert set(entries) == {"approve", "current", "nominate", "nomination", "propose_removal", "approve_removal", "removal"}
     assert "действующего верховного судью" in entries["current"]["description_localizations"]["ru"]
     member, reason = entries["nominate"]["options"]
     assert member["type"] == discord.AppCommandOptionType.user.value
     assert reason["max_length"] == COURT_REASON_MAX_LENGTH
+
+
+@pytest.mark.asyncio
+async def test_removed_nomination_shows_actual_end(commands):
+    service, _, court = commands
+    record = nomination(2)
+    record.removed_at = NOW + timedelta(days=2)
+    service.get_nomination.return_value = record
+    request = interaction()
+    await court.get_command("nomination").callback(request, NOMINATION_ID)
+    reply = private_reply(request)
+    assert "Мандат прекращён досрочно." in reply
+    assert discord.utils.format_dt(record.removed_at, style="f") in reply
+    assert discord.utils.format_dt(record.ends_at, style="f") not in reply
 
 
 @pytest.mark.asyncio

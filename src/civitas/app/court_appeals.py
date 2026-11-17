@@ -99,11 +99,14 @@ class CourtAppealError(Exception):
 
 
 class CourtAppealRepository(Protocol):
+    async def is_recused(self, case: CourtCase, role: str, actor_id: int) -> bool: ...
+    async def hearing_judge_ids(self, guild_id: int, case_id: int) -> set[int]: ...
     async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None: ...
     async def is_allowed(self, discord_guild_id: int, user_id: int) -> bool: ...
     async def lock_election_cycle(self, guild_id: int) -> None: ...
     async def list_verified_admitted_citizens(self, guild_id: int) -> tuple[Citizen, ...]: ...
     async def get_active_prosecutor(self, discord_guild_id: int) -> ProsecutorMotion | None: ...
+    async def get_substitute(self, guild_id: int, case_id: int, role: str) -> int | None: ...
     async def get_case(self, discord_guild_id: int, case_id: int) -> CourtCase | None: ...
     async def get_act_decision(self, discord_guild_id: int, case_id: int) -> AdministrativeDecision | None: ...
     async def get_merits_decision(self, discord_guild_id: int, case_id: int) -> MeritsDecision | None: ...
@@ -305,8 +308,7 @@ class CourtAppealService:
             excluded.add(revision.proposer_citizen_id)
             if revision.confirmed_by_citizen_id is not None:
                 excluded.add(revision.confirmed_by_citizen_id)
-        if case.scheduled_by_citizen_id is not None:
-            excluded.add(case.scheduled_by_citizen_id)
+        excluded.update(await repository.hearing_judge_ids(case.guild_id, case.id))
         state_representative = await self._state_representative(repository, case)
         if state_representative is not None:
             excluded.add(state_representative)
@@ -339,8 +341,16 @@ class CourtAppealService:
     async def _state_representative(self, repository: CourtAppealRepository, case: CourtCase) -> int | None:
         if not (case.for_state or case.against_state):
             return None
+        substitute = await repository.get_substitute(case.guild_id, case.id, "PROSECUTOR")
+        if substitute is not None:
+            return substitute
         prosecutor = await repository.get_active_prosecutor(self._guild_id)
-        return prosecutor.subject_citizen_id if prosecutor is not None else None
+        if (
+            prosecutor is not None and prosecutor.subject_citizen_id != case.respondent_citizen_id
+            and not await repository.is_recused(case, "PROSECUTOR", prosecutor.subject_citizen_id)
+        ):
+            return prosecutor.subject_citizen_id
+        return None
 
     async def _write_actor(self, repository: CourtAppealRepository, user_id: int) -> Citizen:
         if not is_discord_id(user_id):

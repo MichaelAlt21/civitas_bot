@@ -117,8 +117,10 @@ def _nomination_details(locale: discord.Locale, nomination: CourtNomination) -> 
     if nomination.starts_at is not None and nomination.ends_at is not None:
         lines.append(message(
             locale, "court.term", start=discord.utils.format_dt(nomination.starts_at, style="f"),
-            end=discord.utils.format_dt(nomination.ends_at, style="f"),
+            end=discord.utils.format_dt(nomination.removed_at or nomination.ends_at, style="f"),
         ))
+    if nomination.removed_at is not None:
+        lines.append(message(locale, "court.term.ended_early"))
     return lines
 
 
@@ -318,6 +320,77 @@ def _add_case_commands(court: app_commands.Group, guild_scope: discord.Object, s
                 parts.append(message(locale, "court.case.list.next", page=str(page + 1)))
             await send_private_lines(interaction, *parts)
 
+    def add_substitute_commands(role: str) -> None:
+        role_name = role.lower()
+        @cases.command(name=f"nominate_{role_name}", description=command_description(f"court.case.nominate_{role_name}"))
+        @app_commands.describe(
+            case_id=command_description("court.case.id"), candidate=command_description("court.candidate"),
+        )
+        async def nominate_substitute(
+            interaction: discord.Interaction, case_id: app_commands.Range[int, 1], candidate: discord.Member,
+        ) -> None:
+            async with _court_response(interaction):
+                _require_guild(interaction, guild_scope)
+                proposal_id = await service.propose_case_substitute(
+                    interaction.guild_id, interaction.user.id, case_id, _respondent_id(candidate, guild_scope),
+                    idempotency_key=str(interaction.id), role=role,
+                )
+                await send_private_lines(interaction, message(
+                    interaction.locale, "court.case.substitute.proposed", proposal_id=str(proposal_id),
+                ))
+
+        @cases.command(name=f"approve_{role_name}", description=command_description(f"court.case.approve_{role_name}"))
+        @app_commands.describe(proposal_id=command_description("court.case.substitute.proposal_id"))
+        async def approve_substitute(interaction: discord.Interaction, proposal_id: app_commands.Range[int, 1]) -> None:
+            async with _court_response(interaction):
+                _require_guild(interaction, guild_scope)
+                confirmed = await service.approve_case_substitute(
+                    interaction.guild_id, interaction.user.id, proposal_id, role=role,
+                )
+                key = f"{role_name}_confirmed" if confirmed else "one_signature"
+                await send_private_lines(interaction, message(interaction.locale, f"court.case.substitute.{key}"))
+
+    add_substitute_commands("JUDGE")
+    add_substitute_commands("PROSECUTOR")
+
+    @cases.command(name="substitute", description=command_description("court.case.substitute"))
+    @app_commands.describe(
+        proposal_id=command_description("court.case.substitute.proposal_id"),
+        role=command_description("court.case.substitute.role"),
+    )
+    @app_commands.choices(role=[
+        app_commands.Choice(name="Substitute Judge", value="JUDGE"),
+        app_commands.Choice(name="State Representative", value="PROSECUTOR"),
+    ])
+    async def substitute_details(
+        interaction: discord.Interaction, proposal_id: app_commands.Range[int, 1], role: app_commands.Choice[str],
+    ) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            case_id, candidate_id, count = await service.substitute_details(
+                interaction.guild_id, interaction.user.id, proposal_id, role=role.value,
+            )
+            await send_private_lines(
+                interaction,
+                message(interaction.locale, f"court.case.substitute.details.{role.value.lower()}",
+                        case_id=str(case_id), candidate=f"<@{candidate_id}>"),
+                message(interaction.locale, "court.approvals", count=str(count)),
+            )
+
+    @cases.command(name="recuse", description=command_description("court.case.recuse"))
+    @app_commands.describe(case_id=command_description("court.case.id"), role=command_description("court.case.recuse_role"))
+    @app_commands.choices(role=[
+        app_commands.Choice(name="Chief Justice", value="JUDGE"),
+        app_commands.Choice(name="Prosecutor", value="PROSECUTOR"),
+    ])
+    async def recuse(
+        interaction: discord.Interaction, case_id: app_commands.Range[int, 1], role: app_commands.Choice[str],
+    ) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            await service.recuse(interaction.guild_id, interaction.user.id, case_id, role=role.value)
+            await send_private_lines(interaction, message(interaction.locale, "court.case.recused"))
+
     @cases.command(name="schedule", description=command_description("court.case.schedule"))
     @app_commands.describe(case_id=command_description("court.case.id"), hearing_at=command_description("court.case.hearing_at"))
     async def schedule(interaction: discord.Interaction, case_id: app_commands.Range[int, 1], hearing_at: str) -> None:
@@ -484,6 +557,53 @@ def add_court_commands(
             _require_guild(interaction, guild_scope)
             nomination = await service.approve(interaction.guild_id, interaction.user.id, nomination_id, reason=reason)
             await send_private_lines(interaction, *_nomination_details(interaction.locale, nomination))
+
+    @court.command(name="propose_removal", description=command_description("court.propose_removal"))
+    @app_commands.describe(reason=command_description("court.reason"))
+    async def propose_removal(
+        interaction: discord.Interaction, reason: app_commands.Range[str, 1, COURT_REASON_MAX_LENGTH],
+    ) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            proposal = await service.propose_removal(
+                interaction.guild_id, interaction.user.id, reason=reason, idempotency_key=str(interaction.id),
+            )
+            await send_private_lines(interaction, message(
+                interaction.locale, "court.removal.proposal", proposal_id=str(proposal.id),
+                nomination_id=str(proposal.nomination_id),
+            ))
+
+    @court.command(name="approve_removal", description=command_description("court.approve_removal"))
+    @app_commands.describe(proposal_id=command_description("court.removal.proposal_id"))
+    async def approve_removal(interaction: discord.Interaction, proposal_id: app_commands.Range[int, 1]) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            proposal = await service.approve_removal(interaction.guild_id, interaction.user.id, proposal_id)
+            locale = interaction.locale
+            if proposal.second_signed_at is None:
+                await send_private_lines(interaction, message(locale, "court.case.substitute.one_signature"))
+                return
+            await send_private_lines(interaction, message(
+                locale, "court.removal.confirmed", at=discord.utils.format_dt(proposal.second_signed_at, style="f"),
+            ))
+
+    @court.command(name="removal", description=command_description("court.removal"))
+    @app_commands.describe(proposal_id=command_description("court.removal.proposal_id"))
+    async def removal_details(interaction: discord.Interaction, proposal_id: app_commands.Range[int, 1]) -> None:
+        async with _court_response(interaction):
+            _require_guild(interaction, guild_scope)
+            proposal = await service.removal_details(interaction.guild_id, interaction.user.id, proposal_id)
+            locale = interaction.locale
+            count = sum(signer is not None for signer in (proposal.first_senator_id, proposal.second_senator_id))
+            await send_private_lines(
+                interaction,
+                message(
+                    locale, "court.removal.details", proposal_id=str(proposal.id), nomination_id=str(proposal.nomination_id),
+                ),
+                message(locale, "court.approvals", count=str(count)),
+                message(locale, "court.removal.reason"),
+                *_escaped_text_parts(proposal.reason),
+            )
 
     @court.command(name="current", description=command_description("court.current"))
     async def current(interaction: discord.Interaction) -> None:

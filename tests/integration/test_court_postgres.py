@@ -2,15 +2,19 @@ import asyncio
 import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from alembic import command
+from alembic.config import Config
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import insert
+from sqlalchemy import text
 from test_postgres_restore import restore_database
 
 from civitas.app.admission import AdmissionService
-from civitas.app.citizens import CitizensService
+from civitas.app.citizens import CitizensService, CitizenshipAccessError
 from civitas.app.court import CourtError, CourtErrorReason, CourtService
 from civitas.app.court_appeals import AppealOutcome, CourtAppealError, CourtAppealService
 from civitas.app.court_cases import (
@@ -35,6 +39,7 @@ from civitas.domain.court_sanctions import CourtSentence, SanctionTerm
 from civitas.domain.ledger import AccountKind, LedgerError, LedgerErrorReason, TransactionKind
 from civitas.domain.reports import ReportWindow
 from civitas.infrastructure.db.admission import PostgresAdmissionUnitOfWork
+from civitas.infrastructure.db.admin_audit import PostgresAdminAuditUnitOfWork
 from civitas.infrastructure.db.court import PostgresCourtUnitOfWork
 from civitas.infrastructure.db.court_appeals import PostgresCourtAppealUnitOfWork
 from civitas.infrastructure.db.court_cases import PostgresCourtCaseUnitOfWork
@@ -63,7 +68,7 @@ class Clock:
 
 
 @pytest_asyncio.fixture
-async def elected_offices(pg_engine):
+async def elected_offices(pg_engine, request):
     clock = Clock()
     admission = AdmissionService(PostgresAdmissionUnitOfWork(pg_engine), guild_id=GUILD)
     citizens_ids = (PRESIDENT, DEPUTY_1, DEPUTY_2, NOMINEE, RECORDER, CERTIFIER, OBSERVER)
@@ -77,9 +82,13 @@ async def elected_offices(pg_engine):
         guild_id=GUILD,
         authorize=citizens.authorize,
         commissioner_user_ids=(RECORDER, CERTIFIER),
-        rules=ElectionRules(
-            min_eligible=3, quorum_bp=4000, quorum_min=3, parliament_seats=2, term_days=28,
-            voting_hours=48, extension_hours=24, poll_hosts=frozenset({"poll.example.test"}),
+        rules=replace(
+            ElectionRules(
+                min_eligible=3, quorum_bp=4000, quorum_min=3, parliament_seats=2,
+                term_days=28, voting_hours=48, extension_hours=24,
+                poll_hosts=frozenset({"poll.example.test"}),
+            ),
+            **getattr(request, "param", {}),
         ),
         use_persisted_admission=True,
         clock=clock,
@@ -193,7 +202,7 @@ async def test_prosecutor_appointment_removal_and_stale_proposal(pg_engine, elec
 
 
 @pytest_asyncio.fixture
-async def court_docket(pg_engine, elected_offices):
+async def court_docket(pg_engine, elected_offices, request):
     _, clock = elected_offices
     court = CourtService(PostgresCourtUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
     justice = await court.nominate(
@@ -204,7 +213,8 @@ async def court_docket(pg_engine, elected_offices):
 
     prosecutor = ProsecutorService(PostgresProsecutorUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
     motion = await prosecutor.propose(
-        GUILD, PRESIDENT, action=ProsecutorAction.APPOINT, candidate_user_id=RECORDER,
+        GUILD, PRESIDENT, action=ProsecutorAction.APPOINT,
+        candidate_user_id=getattr(request, "param", RECORDER),
         reason="Nominate prosecutor", idempotency_key="docket-prosecutor",
     )
     await prosecutor.approve(GUILD, DEPUTY_1, motion.id, reason="First prosecutor signature")
@@ -213,13 +223,62 @@ async def court_docket(pg_engine, elected_offices):
     return CourtCaseService(PostgresCourtCaseUnitOfWork(pg_engine), guild_id=GUILD, clock=clock), clock
 
 
-async def _register_law(laws, *, number, effective_at):
+async def _register_law(laws, *, number, effective_at, correction_case_id=None):
     return await laws.register(
         GUILD, DEPUTY_1, code="PROC-01", title=f"Notices revision {number}",
         text=f"Published registration requirements, revision {number}.",
         source_url=f"https://discord.com/channels/{GUILD}/701/{800 + number}",
         effective_at=effective_at.isoformat(), idempotency_key=f"docket-law-{number}",
+        correction_case_id=correction_case_id,
     )
+
+
+async def test_early_removal_ends_only_the_target_mandate_and_allows_successor(pg_engine, court_docket):
+    cases, clock = court_docket
+    court = CourtService(PostgresCourtUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    incumbent = await court.current(GUILD)
+    removal = await court.propose_removal(GUILD, PRESIDENT, reason="Fixture", idempotency_key="remove")
+    competing = await court.propose_removal(GUILD, PRESIDENT, reason="Second motion", idempotency_key="competing")
+    assert removal.nomination_id == incumbent.id
+    assert await court.removal_details(GUILD, DEPUTY_2, removal.id) == removal
+    with pytest.raises(CourtError, match="^deputy_required$"):
+        await court.removal_details(GUILD, OBSERVER, removal.id)
+    first = await court.approve_removal(GUILD, DEPUTY_1, removal.id)
+    assert first.second_signed_at is None and await court.current(GUILD) == incumbent
+    assert await court.removal_details(GUILD, PRESIDENT, removal.id) == first
+    assert await court.approve_removal(GUILD, DEPUTY_1, removal.id) == first
+    clock.now += timedelta(minutes=1)
+    final = await court.approve_removal(GUILD, DEPUTY_2, removal.id)
+    assert final.second_signed_at == clock.now and await court.current(GUILD) is None
+    historical = await court.get_nomination(GUILD, incumbent.id)
+    assert historical.removed_at == clock.now and historical.ends_at == incumbent.ends_at
+    assert await court.approve_removal(GUILD, DEPUTY_2, removal.id) == final
+    with pytest.raises(IntegrityError, match="Judicial removal signature history is immutable"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(text(
+                "UPDATE court_removal_proposals SET second_senator_id = NULL, second_signed_at = NULL WHERE id = :id",
+            ), {"id": removal.id})
+    assert await court.current(GUILD) is None
+    async with PostgresAdminAuditUnitOfWork(pg_engine)() as repository:
+        audit = await repository.list_admin_audit(GUILD, limit=100, offset=0)
+    assert [(event.actor_discord_user_id, event.subject_id) for event in audit
+            if event.action == "court.removal.confirm"] == [(DEPUTY_2, incumbent.id)]
+    case = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=CERTIFIER, statement="Filed during vacancy", idempotency_key="vacancy-case",
+    )
+    with pytest.raises(CourtCaseError, match="^judge_required$"):
+        await cases.schedule_hearing(
+            GUILD, NOMINEE, case.id, hearing_at=(clock.now + timedelta(hours=1)).isoformat(),
+            idempotency_key="formerly-judge",
+        )
+    successor = await court.nominate(
+        GUILD, PRESIDENT, candidate_user_id=OBSERVER, reason="New appointment", idempotency_key="early-successor",
+    )
+    await court.approve(GUILD, DEPUTY_1, successor.id, reason="First approval")
+    await court.approve(GUILD, DEPUTY_2, successor.id, reason="Second approval")
+    assert (await court.current(GUILD)).id == successor.id
+    with pytest.raises(CourtError, match="^removal_expired$"):
+        await court.approve_removal(GUILD, DEPUTY_2, competing.id)
 
 
 async def test_only_prosecutor_can_file_charge_under_confirmed_law_in_force_at_event(pg_engine, court_docket):
@@ -254,6 +313,14 @@ async def test_only_prosecutor_can_file_charge_under_confirmed_law_in_force_at_e
     assert filed.law_revision_id == first.id and filed.occurred_at == event_at
     assert await cases.case(GUILD, CERTIFIER, filed.id) == (filed, True)
     assert [entry.id for entry in await cases.list_cases(GUILD)] == [filed.id]
+    assert (await cases.case(GUILD, RECORDER, filed.id))[1]
+    await cases.recuse(GUILD, RECORDER, filed.id, role="PROSECUTOR")
+    assert not (await cases.case(GUILD, RECORDER, filed.id))[1]
+    conflicted = await cases.file_charge(
+        GUILD, RECORDER, **(charge | {
+            "respondent_user_id": OBSERVER, "idempotency_key": "charge-against-future-prosecutor",
+        }),
+    )
 
     prosecutor = ProsecutorService(PostgresProsecutorUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
     removal = await prosecutor.propose(
@@ -268,14 +335,43 @@ async def test_only_prosecutor_can_file_charge_under_confirmed_law_in_force_at_e
         await cases.file_charge(GUILD, RECORDER, **charge)
     summary, may_read_statement = await cases.case(GUILD, RECORDER, filed.id)
     assert isinstance(summary, CaseSummary) and not may_read_statement
+    assert await cases.case(GUILD, CERTIFIER, filed.id) == (filed, True)
+    assert await cases.case(GUILD, NOMINEE, filed.id) == (filed, True)
+    assert await cases.case(GUILD, OBSERVER, filed.id) == (summary, False)
     replacement = await prosecutor.propose(
         GUILD, PRESIDENT, action=ProsecutorAction.APPOINT, candidate_user_id=OBSERVER,
         reason="Nominate replacement", idempotency_key="docket-replacement-prosecutor",
     )
     await prosecutor.approve(GUILD, DEPUTY_1, replacement.id, reason="First replacement signature")
+    assert await cases.case(GUILD, OBSERVER, filed.id) == (summary, False)
     await prosecutor.approve(GUILD, DEPUTY_2, replacement.id, reason="Second replacement signature")
     assert await cases.case(GUILD, OBSERVER, filed.id) == (filed, True)
     assert await cases.case(GUILD, RECORDER, filed.id) == (summary, False)
+    proposal = await cases.propose_case_substitute(
+        GUILD, PRESIDENT, conflicted.id, CERTIFIER, idempotency_key="state-substitute", role="PROSECUTOR",
+    )
+    assert not await cases.approve_case_substitute(GUILD, DEPUTY_1, proposal, role="PROSECUTOR")
+    assert not (await cases.case(GUILD, CERTIFIER, conflicted.id))[1]
+    assert await cases.approve_case_substitute(GUILD, DEPUTY_2, proposal, role="PROSECUTOR")
+    assert await cases.case(GUILD, CERTIFIER, conflicted.id) == (conflicted, True)
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, conflicted.id, hearing_at=hearing.isoformat(),
+        idempotency_key="hearing-with-state-substitute",
+    )
+    clock.now = hearing
+    await cases.decide_merits(
+        GUILD, NOMINEE, conflicted.id, outcome=MeritsOutcome.ACQUITTED, reason="Published decision",
+        idempotency_key="decision-with-state-substitute",
+    )
+    appeals = CourtAppealService(
+        PostgresCourtAppealUnitOfWork(pg_engine), guild_id=GUILD, clock=clock,
+        commissioner_user_ids=(CERTIFIER, DEPUTY_1, DEPUTY_2), quorum_bp=4000, quorum_min=3,
+        poll_hosts={"poll.example.test"},
+    )
+    assert (await appeals.file(GUILD, CERTIFIER, conflicted.id)).case_id == conflicted.id
+    with pytest.raises(CourtAppealError, match="^conflict_of_interest$"):
+        await appeals.open(GUILD, CERTIFIER, conflicted.id, source_url="https://poll.example.test/conflict")
 
 
 async def test_civil_case_statement_stays_private_and_only_disinterested_judge_sets_hearing(court_docket):
@@ -333,6 +429,250 @@ async def test_civil_case_statement_stays_private_and_only_disinterested_judge_s
             GUILD, NOMINEE, filed.id, hearing_at=(clock.now + timedelta(hours=1)).isoformat(),
             idempotency_key="expired-judge-hearing",
         )
+    with pytest.raises(CourtCaseError, match="^judge_required$"):
+        await cases.decide_merits(
+            GUILD, NOMINEE, filed.id, outcome=MeritsOutcome.GRANTED,
+            reason="Former judge attempts to rule", idempotency_key="expired-judge-ruling",
+        )
+    waiting_case = await cases.file_civil(GUILD, PRESIDENT, **(payload | {"idempotency_key": "claim-during-vacancy"}))
+    assert waiting_case.hearing_at is None
+    cases_by_id = {case.id: case for case in await cases.list_cases(GUILD)}
+    assert cases_by_id[filed.id].hearing_at == rescheduled.hearing_at
+    assert cases_by_id[filed.id].merits_outcome is None
+    assert cases_by_id[waiting_case.id].hearing_at is None
+
+
+@pytest.mark.parametrize("elected_offices", [{"term_days": 56}], indirect=True)
+async def test_successor_can_resume_case_after_judicial_vacancy(pg_engine, court_docket):
+    cases, clock = court_docket
+    court = CourtService(PostgresCourtUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    filed = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=CERTIFIER, statement="Evidence submitted before the vacancy.",
+        idempotency_key="successor-case",
+    )
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, filed.id, hearing_at=(clock.now + timedelta(hours=1)).isoformat(),
+        idempotency_key="pre-vacancy-hearing",
+    )
+    clock.now += timedelta(days=29)
+    nominee = await court.nominate(
+        GUILD, PRESIDENT, candidate_user_id=OBSERVER, reason="Nominate successor", idempotency_key="successor",
+    )
+    await court.approve(GUILD, DEPUTY_1, nominee.id, reason="First independent signature")
+    hearing_at = clock.now + timedelta(hours=1)
+    hearing = dict(hearing_at=hearing_at.isoformat(), idempotency_key="successor-hearing")
+    with pytest.raises(CourtCaseError, match="^judge_required$"):
+        await cases.schedule_hearing(GUILD, OBSERVER, filed.id, **hearing)
+    await court.approve(GUILD, DEPUTY_2, nominee.id, reason="Second independent signature")
+    assert (await cases.case(GUILD, OBSERVER, filed.id))[1]
+    updated = await cases.schedule_hearing(GUILD, OBSERVER, filed.id, **hearing)
+    assert updated.id == filed.id and updated.statement == filed.statement
+    clock.now = hearing_at
+    result = await cases.decide_merits(
+        GUILD, OBSERVER, filed.id, outcome=MeritsOutcome.GRANTED,
+        reason="Successor heard the parties", idempotency_key="successor-verdict",
+    )
+    assert result.case_id == filed.id and result.judge_citizen_id == updated.scheduled_by_citizen_id
+    appeals = CourtAppealService(
+        PostgresCourtAppealUnitOfWork(pg_engine), guild_id=GUILD, clock=clock,
+        commissioner_user_ids=(NOMINEE, RECORDER, DEPUTY_1), quorum_bp=4000, quorum_min=3,
+        poll_hosts={"poll.example.test"},
+    )
+    await appeals.file(GUILD, CERTIFIER, filed.id)
+    source = "https://poll.example.test/successor-case"
+    with pytest.raises(CourtAppealError, match="^conflict_of_interest$"):
+        await appeals.open(GUILD, NOMINEE, filed.id, source_url=source)
+    assert (await appeals.open(GUILD, RECORDER, filed.id, source_url=source)).case_id == filed.id
+
+
+async def test_substitute_judge_requires_two_signatures_and_has_case_scope(pg_engine, court_docket):
+    cases, clock = court_docket
+    case = await cases.file_civil(
+        GUILD, NOMINEE, respondent_user_id=CERTIFIER, statement="Case involving the incumbent judge.",
+        idempotency_key="case-substitute",
+    )
+    other = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=CERTIFIER, statement="Unrelated case.",
+        idempotency_key="case-with-incumbent",
+    )
+    with pytest.raises(CourtCaseError, match="^substitute_not_allowed$"):
+        await cases.propose_case_judge(GUILD, PRESIDENT, other.id, OBSERVER, idempotency_key="no-conflict")
+    proposal_id = await cases.propose_case_judge(GUILD, PRESIDENT, case.id, OBSERVER, idempotency_key="substitute")
+    assert await cases.substitute_details(GUILD, DEPUTY_1, proposal_id, role="JUDGE") == (case.id, OBSERVER, 0)
+    with pytest.raises(CitizenshipAccessError):
+        await cases.substitute_details(GUILD, CERTIFIER, proposal_id, role="JUDGE")
+    assert not await cases.approve_case_judge(GUILD, DEPUTY_1, proposal_id)
+    assert not await cases.approve_case_judge(GUILD, DEPUTY_1, proposal_id)
+    hearing_at = clock.now + timedelta(hours=1)
+    hearing = dict(hearing_at=hearing_at.isoformat(), idempotency_key="substitute-hearing")
+    with pytest.raises(CourtCaseError, match="^judge_required$"):
+        await cases.schedule_hearing(GUILD, OBSERVER, case.id, **hearing)
+    assert await cases.approve_case_judge(GUILD, DEPUTY_2, proposal_id)
+    assert await cases.substitute_details(GUILD, PRESIDENT, proposal_id, role="JUDGE") == (case.id, OBSERVER, 2)
+    assert await cases.approve_case_judge(GUILD, DEPUTY_2, proposal_id)
+    async with PostgresAdminAuditUnitOfWork(pg_engine)() as repository:
+        audit = await repository.list_admin_audit(GUILD, limit=100, offset=0)
+    events = [
+        (entry.action.rsplit(".", 1)[-1], entry.actor_discord_user_id, entry.subject_id)
+        for entry in audit if entry.action.startswith("court.substitute.judge.")
+    ]
+    assert sorted(events) == [
+        ("confirm", DEPUTY_2, case.id), ("nominate", PRESIDENT, case.id), ("sign", DEPUTY_1, case.id),
+    ]
+    assert await cases.propose_case_judge(
+        GUILD, PRESIDENT, case.id, OBSERVER, idempotency_key="substitute",
+    ) == proposal_id
+    with pytest.raises(CourtCaseError, match="^invalid_request$"):
+        await cases.propose_case_judge(GUILD, PRESIDENT, case.id, RECORDER, idempotency_key="substitute")
+    assert (await cases.case(GUILD, OBSERVER, case.id))[1]
+    with pytest.raises(CourtCaseError, match="^judge_required$"):
+        await cases.schedule_hearing(GUILD, OBSERVER, other.id, **hearing)
+    updated = await cases.schedule_hearing(GUILD, OBSERVER, case.id, **hearing)
+    clock.now = hearing_at
+    verdict = await cases.decide_merits(
+        GUILD, OBSERVER, case.id, outcome=MeritsOutcome.GRANTED,
+        reason="Substitute heard both parties", idempotency_key="substitute-verdict",
+    )
+    assert verdict.judge_citizen_id == updated.scheduled_by_citizen_id
+
+
+async def test_parallel_case_substitute_approvals_confirm_only_one_nominee(pg_engine, court_docket):
+    cases, _ = court_docket
+    case = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=CERTIFIER, statement="Case with a voluntary recusal.",
+        idempotency_key="parallel-substitute-case",
+    )
+    with pytest.raises(CourtCaseError, match="^substitute_not_allowed$"):
+        await cases.recuse(GUILD, OBSERVER, case.id, role="JUDGE")
+    await cases.recuse(GUILD, NOMINEE, case.id, role="JUDGE")
+    await cases.recuse(GUILD, NOMINEE, case.id, role="JUDGE")
+    for mutation in (
+        "UPDATE court_case_recusals SET recused_at = now() WHERE case_id = :case_id",
+        "DELETE FROM court_case_recusals WHERE case_id = :case_id",
+    ):
+        with pytest.raises(IntegrityError):
+            async with pg_engine.begin() as connection:
+                await connection.execute(text(mutation), {"case_id": case.id})
+    async with PostgresAdminAuditUnitOfWork(pg_engine)() as repository:
+        audit = await repository.list_admin_audit(GUILD, limit=100, offset=0)
+    recusals = [entry for entry in audit if entry.action == "court.recuse.judge"]
+    assert [(entry.actor_discord_user_id, entry.subject_id) for entry in recusals] == [(NOMINEE, case.id)]
+    assert not (await cases.case(GUILD, NOMINEE, case.id))[1]
+    candidates = (OBSERVER, RECORDER)
+    proposals = [
+        await cases.propose_case_judge(GUILD, PRESIDENT, case.id, candidate, idempotency_key=f"proposal-{candidate}")
+        for candidate in candidates
+    ]
+    for proposal in proposals:
+        assert not await cases.approve_case_judge(GUILD, DEPUTY_1, proposal)
+    results = await asyncio.gather(
+        *(cases.approve_case_judge(GUILD, DEPUTY_2, proposal) for proposal in proposals), return_exceptions=True,
+    )
+    assert results.count(True) == 1
+    failure = results[1 - results.index(True)]
+    assert isinstance(failure, CourtCaseError) and failure.reason is CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED
+    for candidate, result in zip(candidates, results, strict=True):
+        assert (await cases.case(GUILD, candidate, case.id))[1] is (result is True)
+
+    def migrate(connection):
+        config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+        config.attributes["connection"] = connection
+        command.downgrade(config, "0043_court_removal_guard")
+        command.upgrade(config, "head")
+
+    async with pg_engine.begin() as connection:
+        await connection.run_sync(migrate)
+
+    assert not (await cases.case(GUILD, NOMINEE, case.id))[1]
+    for candidate, result in zip(candidates, results, strict=True):
+        assert (await cases.case(GUILD, candidate, case.id))[1] is (result is True)
+
+
+async def test_substitute_judge_can_hear_case_when_incumbent_represents_state(pg_engine, court_docket):
+    cases, clock = court_docket
+    prosecutor = ProsecutorService(PostgresProsecutorUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    for action, candidate in ((ProsecutorAction.REMOVE, None), (ProsecutorAction.APPOINT, NOMINEE)):
+        motion = await prosecutor.propose(
+            GUILD, PRESIDENT, action=action, candidate_user_id=candidate, reason="Fixture motion",
+            idempotency_key=f"dual-mandate-{action.value}",
+        )
+        await prosecutor.approve(GUILD, DEPUTY_1, motion.id, reason="First signature")
+        await prosecutor.approve(GUILD, DEPUTY_2, motion.id, reason="Second signature")
+    law_service = LawService(PostgresLawUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    draft = await _register_law(law_service, number=1, effective_at=clock.now)
+    law = await law_service.confirm(GUILD, DEPUTY_2, draft.id)
+    case = await cases.file_challenge(
+        GUILD, CERTIFIER, law_revision_id=law.id, statement="My rights are affected.",
+        idempotency_key="dual-mandate-challenge",
+    )
+    hearing_at = clock.now + timedelta(hours=1)
+    hearing = dict(hearing_at=hearing_at.isoformat(), idempotency_key="dual-mandate-hearing")
+    with pytest.raises(CourtCaseError, match="^conflict_of_interest$"):
+        await cases.schedule_hearing(GUILD, NOMINEE, case.id, **hearing)
+    proposal = await cases.propose_case_judge(GUILD, PRESIDENT, case.id, OBSERVER, idempotency_key="dual-mandate-judge")
+    assert not await cases.approve_case_judge(GUILD, DEPUTY_1, proposal)
+    assert await cases.approve_case_judge(GUILD, DEPUTY_2, proposal)
+    assert (await cases.schedule_hearing(GUILD, OBSERVER, case.id, **hearing)).hearing_at == hearing_at
+
+
+async def test_case_substitute_storage_requires_independent_signatures(pg_engine, court_docket):
+    cases, clock = court_docket
+    case = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=CERTIFIER, statement="Fixture",
+        idempotency_key="substitute-storage-case",
+    )
+    sql = text("""
+        INSERT INTO court_case_substitutes (
+            guild_id, case_id, case_kind, role, candidate_id, proposer_id, proposed_at,
+            request_key, first_senator_id, first_signed_at, second_senator_id, second_signed_at
+        )
+        SELECT :guild, :case_id, 'CIVIL', 'JUDGE', candidate.id, proposer.id, :at,
+            :key, first.id, :at, second.id, :at
+        FROM citizens candidate, citizens proposer, citizens first, citizens second
+        WHERE candidate.discord_user_id = :candidate AND proposer.discord_user_id = :proposer
+            AND first.discord_user_id = :first AND second.discord_user_id = :second
+            AND candidate.guild_id = :guild AND proposer.guild_id = :guild
+            AND first.guild_id = :guild AND second.guild_id = :guild
+        RETURNING id
+    """)
+    values = dict(
+        guild=case.guild_id, case_id=case.id, at=clock.now, key="test-mandate",
+        candidate=OBSERVER, proposer=PRESIDENT, first=DEPUTY_1, second=DEPUTY_2,
+    )
+    with pytest.raises(IntegrityError, match="must be proposed before signing"):
+        async with pg_engine.begin() as connection:
+            await connection.scalar(sql, values)
+
+    async def record_signature(connection, proposal_id, senator, *, stage):
+        columns = {
+            "first": ("first_senator_id", "first_signed_at"),
+            "second": ("second_senator_id", "second_signed_at"),
+        }
+        column, signed_at = columns[stage]
+        await connection.execute(text(
+            f"UPDATE court_case_substitutes SET {column} = (SELECT id FROM citizens "
+            f"WHERE guild_id = :guild AND discord_user_id = :senator), {signed_at} = :at WHERE id = :proposal"
+        ), {"guild": case.guild_id, "senator": senator, "at": clock.now, "proposal": proposal_id})
+
+    draft_sql = text(str(sql).replace(":key, first.id, :at, second.id, :at", ":key, NULL, NULL, NULL, NULL"))
+    async with pg_engine.begin() as connection:
+        proposal = await connection.scalar(draft_sql, values)
+        other = await connection.scalar(draft_sql, values | {"key": "other-proposal"})
+        await record_signature(connection, proposal, DEPUTY_1, stage="first")
+        await record_signature(connection, other, DEPUTY_1, stage="first")
+    with pytest.raises(IntegrityError, match="ck_case_substitutes_independence"):
+        async with pg_engine.begin() as connection:
+            await record_signature(connection, proposal, DEPUTY_1, stage="second")
+    async with pg_engine.begin() as connection:
+        await record_signature(connection, proposal, DEPUTY_2, stage="second")
+    with pytest.raises(IntegrityError, match="uq_case_substitutes_confirmed"):
+        async with pg_engine.begin() as connection:
+            await record_signature(connection, other, DEPUTY_2, stage="second")
+    with pytest.raises(IntegrityError, match="signature history is immutable"):
+        async with pg_engine.begin() as connection:
+            await connection.execute(text(
+                "UPDATE court_case_substitutes SET second_senator_id = NULL, second_signed_at = NULL WHERE id = :id",
+            ), {"id": proposal})
 
 
 async def test_challenge_links_confirmed_revision_and_state_representation_is_scoped(pg_engine, court_docket):
@@ -587,6 +927,24 @@ async def test_granted_challenges_suspend_exact_law_revisions_and_restore_preced
     accepted = await cases.file_charge(GUILD, RECORDER, law_revision_id=original.id, **charge)
     assert accepted.law_revision_id == original.id
 
+    suspended_at = clock.now
+    effective_at = suspended_at + timedelta(hours=1)
+    with pytest.raises(LawError, match=LawErrorReason.CORRECTION_CASE_REQUIRED):
+        await _register_law(laws, number=4, effective_at=effective_at)
+    with pytest.raises(LawError, match=LawErrorReason.INVALID_REQUEST):
+        await _register_law(laws, number=4, effective_at=effective_at, correction_case_id=earlier_decision.case_id)
+    correction = await _register_law(
+        laws, number=4, effective_at=effective_at, correction_case_id=later_decision.case_id,
+    )
+    assert correction.code == latest.code
+    assert await laws.show(GUILD, latest.code) == original
+    corrected = await laws.confirm(GUILD, DEPUTY_2, correction.id)
+    assert await laws.show(GUILD, latest.code) == original
+    clock.now = effective_at
+    assert await laws.show(GUILD, latest.code) == corrected
+    assert await laws.show(GUILD, latest.code, at=suspended_at.isoformat()) == original
+    assert set(await cases.list_returns(GUILD, ActKind.LAW)) == {earlier_decision, later_decision}
+
 
 async def test_decree_returns_to_president_and_does_not_suspend_law_with_same_code(pg_engine, court_docket):
     cases, clock = court_docket
@@ -598,6 +956,12 @@ async def test_decree_returns_to_president_and_does_not_suspend_law_with_same_co
     decree_draft = await decrees.register(GUILD, PRESIDENT, **_decree_options(clock))
     decree = await decrees.confirm(GUILD, DEPUTY_2, decree_draft.id)
     assert law.code == decree.code
+    old_draft = await decrees.register(
+        GUILD, PRESIDENT, **(_decree_options(clock) | {
+            "effective_at": (clock.now + timedelta(hours=5)).isoformat(),
+            "idempotency_key": "pre-suspension-decree-draft",
+        }),
+    )
 
     filed = await cases.file_decree_challenge(
         GUILD, RECORDER, decree_revision_id=decree.id, statement="The decree contradicts the Senate law.",
@@ -617,11 +981,41 @@ async def test_decree_returns_to_president_and_does_not_suspend_law_with_same_co
     assert await cases.list_returns(GUILD, ActKind.DECREE) == (decision,)
     assert not await cases.list_returns(GUILD, ActKind.LAW)
     assert not await decrees.list_effective(GUILD)
+    with pytest.raises(LawError, match=LawErrorReason.CORRECTION_CASE_REQUIRED):
+        await decrees.confirm(GUILD, DEPUTY_2, old_draft.id)
     with pytest.raises(LawError, match=LawErrorReason.REVISION_NOT_FOUND):
         await decrees.show(GUILD, decree.code)
     assert await laws.show(GUILD, law.code) == law
     assert (await decrees.revision(GUILD, OBSERVER, decree.id)).text == decree.text
     assert await decrees.show(GUILD, decree.code, at=(clock.now - timedelta(microseconds=1)).isoformat()) == decree
+
+    suspended_at = clock.now
+    effective_at = suspended_at + timedelta(hours=1)
+    with pytest.raises(LawError, match=LawErrorReason.INVALID_REQUEST):
+        await decrees.register(
+            GUILD, PRESIDENT, **(_decree_options(clock) | {
+                "code": "OTHER-01", "effective_at": effective_at.isoformat(),
+                "idempotency_key": "wrong-correction", "correction_case_id": filed.id,
+            }),
+        )
+    correction = await decrees.register(
+        GUILD, PRESIDENT, **(_decree_options(clock) | {
+            "text": "Corrected published decree within delegated authority.",
+            "source_url": f"https://discord.com/channels/{GUILD}/701/901",
+            "effective_at": effective_at.isoformat(),
+            "idempotency_key": "decree-correction",
+            "correction_case_id": filed.id,
+        }),
+    )
+    corrected = await decrees.confirm(GUILD, DEPUTY_2, correction.id)
+    assert corrected.correction_case_id == filed.id
+    assert not await decrees.list_effective(GUILD)
+    clock.now = effective_at
+    assert await decrees.show(GUILD, decree.code) == corrected
+    with pytest.raises(LawError, match=LawErrorReason.REVISION_NOT_FOUND):
+        await decrees.show(GUILD, decree.code, at=suspended_at.isoformat())
+    assert await cases.list_returns(GUILD, ActKind.DECREE) == (decision,)
+    assert await laws.show(GUILD, law.code) == law
 
 
 @pytest_asyncio.fixture
@@ -639,6 +1033,42 @@ async def appeal_docket(pg_engine, court_docket):
     current = await _register_law(laws, number=2, effective_at=clock.now)
     current = await laws.confirm(GUILD, DEPUTY_2, current.id)
     return cases, appeals, laws, clock, original, current
+
+
+@pytest.mark.parametrize("court_docket", [OBSERVER], indirect=True)
+@pytest.mark.parametrize(
+    "elected_offices", [{"min_eligible": 7, "quorum_min": 2, "voting_hours": 1, "extension_hours": 1}],
+    indirect=True,
+)
+async def test_seven_player_rehearsal_can_certify_criminal_appeal(pg_engine, court_docket):
+    cases, clock = court_docket
+    laws = LawService(PostgresLawUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    draft = await _register_law(laws, number=1, effective_at=clock.now)
+    law = await laws.confirm(GUILD, DEPUTY_2, draft.id)
+    case = await cases.file_charge(
+        GUILD, OBSERVER, respondent_user_id=PRESIDENT, law_revision_id=law.id,
+        occurred_at=clock.now.isoformat(), statement="Rehearsal charge", idempotency_key="rehearsal-charge",
+    )
+    hearing = clock.now + timedelta(hours=1)
+    await cases.schedule_hearing(
+        GUILD, NOMINEE, case.id, hearing_at=hearing.isoformat(), idempotency_key="rehearsal-hearing",
+    )
+    clock.now = hearing
+    await cases.decide_merits(
+        GUILD, NOMINEE, case.id, outcome=MeritsOutcome.GUILTY,
+        reason="Rehearsal judgment", idempotency_key="rehearsal-judgment",
+    )
+    appeals = CourtAppealService(
+        PostgresCourtAppealUnitOfWork(pg_engine), guild_id=GUILD, clock=clock,
+        commissioner_user_ids=(RECORDER, CERTIFIER), quorum_bp=4000, quorum_min=2,
+        poll_hosts={"discord.com"},
+    )
+    await appeals.file(GUILD, PRESIDENT, case.id)
+    opened = await appeals.open(GUILD, RECORDER, case.id, source_url=f"https://discord.com/channels/{GUILD}/701/900")
+    clock.now = opened.closes_at
+    await appeals.record(GUILD, RECORDER, case.id, round_number=1, participants=4, votes_to_cancel=3)
+    result = await appeals.confirm(GUILD, CERTIFIER, case.id, round_number=1)
+    assert result.outcome is AppealOutcome.OVERTURNED
 
 
 @pytest.mark.parametrize("criminal", [False, True])
@@ -1027,12 +1457,50 @@ async def test_custody_and_held_fine_remain_enforceable_after_restore(pg_engine,
         sentence=CourtSentence("7", fine=SanctionTerm(25, 10, 50), custody=SanctionTerm(2, 1, 4)),
     )
     assert await wallet.balance(GUILD, PRESIDENT) == 75
+    pending = await cases.file_civil(
+        GUILD, PRESIDENT, respondent_user_id=DEPUTY_1, statement="Fixture evidence for the substitute judge.",
+        idempotency_key="restore-substitute-case",
+    )
+    await cases.recuse(GUILD, NOMINEE, pending.id, role="JUDGE")
+    nominee = await cases.propose_case_judge(
+        GUILD, PRESIDENT, pending.id, OBSERVER, idempotency_key="restore-substitute-judge",
+    )
+    assert not await cases.approve_case_judge(GUILD, DEPUTY_1, nominee)
+    assert await cases.approve_case_judge(GUILD, DEPUTY_2, nominee)
+    court = CourtService(PostgresCourtUnitOfWork(pg_engine), guild_id=GUILD, clock=clock)
+    removal = await court.propose_removal(GUILD, PRESIDENT, reason="Fixture removal", idempotency_key="restore-removal")
+    await court.approve_removal(GUILD, DEPUTY_1, removal.id)
+    completed_removal = await court.approve_removal(GUILD, DEPUTY_2, removal.id)
     async with restore_database(pg_engine, tmp_path) as restored:
+        restored_court = CourtService(PostgresCourtUnitOfWork(restored), guild_id=GUILD, clock=clock)
+        assert await restored_court.current(GUILD) is None
+        historical = await restored_court.get_nomination(GUILD, removal.nomination_id)
+        assert historical.removed_at == completed_removal.second_signed_at == clock.now
+        assert await restored_court.approve_removal(GUILD, DEPUTY_2, removal.id) == completed_removal
+        successor = await restored_court.nominate(
+            GUILD, PRESIDENT, candidate_user_id=OBSERVER, reason="Fixture successor",
+            idempotency_key="restore-successor",
+        )
+        await restored_court.approve(GUILD, DEPUTY_1, successor.id, reason="First signature")
+        await restored_court.approve(GUILD, DEPUTY_2, successor.id, reason="Second signature")
+        assert (await restored_court.current(GUILD)).id == successor.id
         restored_cases = CourtCaseService(PostgresCourtCaseUnitOfWork(restored), guild_id=GUILD, clock=clock)
         restored_presentation = PresentationService(PostgresPresentationUnitOfWork(restored), guild_id=GUILD)
         assert await restored_presentation.current() == GuildPresentation(custody_role_id=902)
         assert await restored_cases.decision(GUILD, case.id) == decision
         assert await restored_cases.custody_role_assignments() == {PRESIDENT: True}
+        await restored_cases.approve_case_judge(GUILD, DEPUTY_2, nominee)
+        assert not (await restored_cases.case(GUILD, NOMINEE, pending.id))[1]
+        assert await restored_cases.case(GUILD, OBSERVER, pending.id) == (pending, True)
+        hearing_at = (clock.now + timedelta(hours=1)).isoformat()
+        with pytest.raises(CourtCaseError, match="^judge_required$"):
+            await restored_cases.schedule_hearing(
+                GUILD, NOMINEE, pending.id, hearing_at=hearing_at, idempotency_key="restore-recused-hearing",
+            )
+        updated = await restored_cases.schedule_hearing(
+            GUILD, OBSERVER, pending.id, hearing_at=hearing_at, idempotency_key="restore-substitute-hearing",
+        )
+        assert updated.hearing_at == datetime.fromisoformat(hearing_at)
         ledger = PostgresLedgerUnitOfWork(restored)
         async with ledger() as repository:
             receipt = await repository.hold_court_fine(case.guild_id, case.id)
@@ -1182,7 +1650,13 @@ async def test_appeal_reversal_restores_only_its_own_suspension_and_preserves_hi
     assert await laws.show(GUILD, current.code) == original
     assert set(await cases.list_returns(GUILD, ActKind.LAW)) == {first_decision, second_decision}
 
-    clock.now = max(poll.closes_at for poll in open_polls)
+    closes_at = max(poll.closes_at for poll in open_polls)
+    correction_at = closes_at + timedelta(seconds=30)
+    draft = await _register_law(
+        laws, number=3, effective_at=correction_at, correction_case_id=second_decision.case_id,
+    )
+    correction = await laws.confirm(GUILD, DEPUTY_2, draft.id)
+    clock.now = closes_at
     for decision in (first_decision, second_decision):
         await appeals.record(GUILD, CERTIFIER, decision.case_id, round_number=1, participants=4, votes_to_cancel=3)
     overturned, replay = await asyncio.gather(*[
@@ -1195,11 +1669,11 @@ async def test_appeal_reversal_restores_only_its_own_suspension_and_preserves_hi
     clock.now += timedelta(minutes=1)
     restored = await appeals.confirm(GUILD, OBSERVER, second_decision.case_id, round_number=1)
     assert restored.outcome is AppealOutcome.OVERTURNED and restored.resolved_at == clock.now
-    assert await laws.show(GUILD, current.code) == current
-    assert await laws.list_effective(GUILD) == (current,)
-    assert await laws.show(GUILD, current.code, at=(clock.now - timedelta(microseconds=1)).isoformat()) == original
+    assert await laws.show(GUILD, current.code) == correction
+    assert await laws.list_effective(GUILD) == (correction,)
+    assert await laws.show(GUILD, current.code, at=(correction_at - timedelta(microseconds=1)).isoformat()) == original
     assert await laws.show(GUILD, current.code, at=(first_decision.decided_at - timedelta(microseconds=1)).isoformat()) == current
-    assert await laws.show(GUILD, current.code, at=clock.now.isoformat()) == current
+    assert await laws.show(GUILD, current.code, at=clock.now.isoformat()) == correction
     assert not await cases.list_returns(GUILD, ActKind.LAW)
     assert await cases.decision(GUILD, first_decision.case_id) == first_decision
     assert await cases.decision(GUILD, second_decision.case_id) == second_decision

@@ -82,6 +82,31 @@ _AUDIT = text("""
                'court_nomination', nomination_id, 'success', nomination_id
           FROM court_approvals WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL
+        SELECT removal.guild_id, event.actor_id, event.occurred_at, 'court.removal.' || event.stage,
+               'court_nomination', removal.nomination_id, 'success', removal.id
+          FROM court_removal_proposals AS removal
+          CROSS JOIN LATERAL (VALUES
+              (removal.proposer_id, removal.proposed_at, 'propose'),
+              (removal.first_senator_id, removal.first_signed_at, 'sign'),
+              (removal.second_senator_id, removal.second_signed_at, 'confirm')
+          ) AS event(actor_id, occurred_at, stage)
+         WHERE removal.guild_id = (SELECT id FROM guild_scope) AND event.actor_id IS NOT NULL
+        UNION ALL
+        SELECT substitute.guild_id, event.actor_id, event.occurred_at,
+               'court.substitute.' || lower(substitute.role) || '.' || event.stage,
+               'court_case', substitute.case_id, 'success', substitute.id
+          FROM court_case_substitutes AS substitute
+          CROSS JOIN LATERAL (VALUES
+              (substitute.proposer_id, substitute.proposed_at, 'nominate'),
+              (substitute.first_senator_id, substitute.first_signed_at, 'sign'),
+              (substitute.second_senator_id, substitute.second_signed_at, 'confirm')
+          ) AS event(actor_id, occurred_at, stage)
+         WHERE substitute.guild_id = (SELECT id FROM guild_scope) AND event.actor_id IS NOT NULL
+        UNION ALL
+        SELECT guild_id, actor_id, recused_at, 'court.recuse.' || lower(role),
+               'court_case', case_id, 'success', case_id
+          FROM court_case_recusals WHERE guild_id = (SELECT id FROM guild_scope)
+        UNION ALL
         SELECT guild_id, filer_citizen_id, filed_at, 'court.file', 'court_case', id, 'success', id
           FROM court_cases WHERE guild_id = (SELECT id FROM guild_scope)
         UNION ALL

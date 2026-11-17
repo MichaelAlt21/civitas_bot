@@ -64,12 +64,15 @@ def _revision_row(locale: discord.Locale, revision: LawRevision) -> str:
 
 def _revision_header(locale: discord.Locale, revision: LawRevision, *, registry: str) -> tuple[str, ...]:
     state = "confirmed" if revision.confirmed_at is not None else "pending"
-    return (
+    lines = (
         _revision_row(locale, revision),
         message(locale, f"{registry}.state.{state}"),
         message(locale, "law.effective_at", date=discord.utils.format_dt(revision.effective_at, style="f")),
         message(locale, "law.source", link=f"<{revision.source_url}>"),
     )
+    if revision.correction_case_id is not None:
+        return (*lines, message(locale, "law.correction_case", case_id=str(revision.correction_case_id)))
+    return lines
 
 
 async def _send_revision(interaction: discord.Interaction, revision: LawRevision, *, registry: str) -> None:
@@ -89,17 +92,19 @@ def add_law_commands(
         code=command_description(f"{registry}.code"), title=command_description(f"{registry}.title"),
         text=command_description("law.text"), source_url=command_description(f"{registry}.source_url"),
         effective_at=command_description("law.effective_at"),
+        correction_case_id=command_description("law.correction_case"),
     )
     async def register(
         interaction: discord.Interaction, code: app_commands.Range[str, 1, LAW_CODE_MAX_LENGTH],
         title: app_commands.Range[str, 1, LAW_TITLE_MAX_LENGTH], text: app_commands.Range[str, 1, LAW_TEXT_MAX_LENGTH],
-        source_url: str, effective_at: str,
+        source_url: str, effective_at: str, correction_case_id: app_commands.Range[int, 1] | None = None,
     ) -> None:
         async with _law_response(interaction, registry=registry):
             _require_guild(interaction, guild_scope)
+            correction = {"correction_case_id": correction_case_id} if correction_case_id is not None else {}
             revision = await service.register(
                 interaction.guild_id, interaction.user.id, code=code, title=title, text=text, source_url=source_url,
-                effective_at=effective_at, idempotency_key=str(interaction.id),
+                effective_at=effective_at, idempotency_key=str(interaction.id), **correction,
             )
             await send_private_lines(interaction, *_revision_header(interaction.locale, revision, registry=registry))
 

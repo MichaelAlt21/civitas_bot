@@ -9,6 +9,7 @@ from typing import Protocol
 
 from civitas.domain.citizens import Citizen, CitizenStatus
 from civitas.domain.court_sanctions import CourtSentence
+from civitas.domain.government import OfficeKind
 from civitas.domain.ledger import MAX_AMOUNT, MAX_IDEMPOTENCY_KEY_LENGTH
 
 from .citizens import AccessDeniedReason, CitizenshipAccessError, is_discord_id
@@ -109,6 +110,7 @@ class CaseSummary:
 
 
 class CourtCaseErrorReason(StrEnum):
+    SUBSTITUTE_NOT_ALLOWED = "substitute_not_allowed"
     INVALID_REQUEST = "invalid_request"
     INVALID_STATEMENT = "invalid_statement"
     INVALID_TIME = "invalid_time"
@@ -134,6 +136,18 @@ class CourtCaseError(Exception):
 
 
 class CourtCaseRepository(Protocol):
+    async def is_recused(self, case: CourtCase, role: str, actor_id: int) -> bool: ...
+    async def add_recusal(self, case: CourtCase, role: str, actor_id: int, now: datetime) -> None: ...
+    async def has_active_office(self, guild_id: int, citizen_id: int, office: OfficeKind, at: datetime) -> bool: ...
+    async def propose_substitute(self, case: CourtCase, actor_id: int, candidate_id: int, now: datetime, key: str, role: str) -> int: ...
+    async def find_substitute_request(
+        self, case: CourtCase, actor_id: int, candidate_id: int, key: str, role: str,
+    ) -> int | None: ...
+    async def get_substitute_proposal(
+        self, guild_id: int, proposal_id: int, role: str,
+    ) -> tuple[int, int, int, int | None, int | None] | None: ...
+    async def sign_substitute(self, guild_id: int, proposal_id: int, senator_id: int, now: datetime, role: str) -> bool: ...
+    async def get_substitute(self, guild_id: int, case_id: int, role: str = "JUDGE") -> int | None: ...
     async def get_fine_status(self, guild_id: int, case_id: int, respondent_id: int) -> CourtFineStatus | None: ...
     async def custody_role_assignments(self, guild_id: int, *, at: datetime) -> dict[int, bool]: ...
     async def get_profile(self, guild_id: int, user_id: int) -> Citizen | None: ...
@@ -331,11 +345,14 @@ class CourtCaseService:
             if actor is not None:
                 now = self._now()
                 judge = await repository.get_active_court_nomination(self._guild_id, now)
-                if judge is not None and judge.candidate_citizen_id == actor.id:
+                substitute_id = await repository.get_substitute(record.guild_id, record.id)
+                if substitute_id == actor.id or (
+                    substitute_id is None and judge is not None and judge.candidate_citizen_id == actor.id
+                    and not await repository.is_recused(record, "JUDGE", actor.id)
+                ):
                     return record, True
                 if record.for_state or record.against_state:
-                    prosecutor = await repository.get_active_prosecutor(self._guild_id)
-                    if prosecutor is not None and prosecutor.subject_citizen_id == actor.id:
+                    if await self._state_representative(repository, record) == actor.id:
                         return record, True
             return _summary(record), False
 
@@ -475,24 +492,186 @@ class CourtCaseService:
                 self._guild_id, act_kind, limit=CASE_PAGE_SIZE, offset=(page - 1) * CASE_PAGE_SIZE,
             )
 
+    async def recuse(self, guild_id: int | None, user_id: int, case_id: int, *, role: str) -> None:
+        self._require_guild(guild_id)
+        _check_number(case_id, CourtCaseErrorReason.NOT_FOUND)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            now = self._now()
+            case = await self._require_case(repository, case_id)
+            if role == "JUDGE":
+                judge = await repository.get_active_court_nomination(self._guild_id, now)
+                allowed = (
+                    judge is not None and judge.candidate_citizen_id == actor.id
+                    and case.administrative_outcome is None and case.merits_outcome is None
+                )
+            elif role == "PROSECUTOR" and (case.for_state or case.against_state):
+                prosecutor = await repository.get_active_prosecutor(self._guild_id)
+                allowed = prosecutor is not None and prosecutor.subject_citizen_id == actor.id
+            else:
+                allowed = False
+            if not allowed:
+                raise CourtCaseError(CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED)
+            await repository.add_recusal(case, role, actor.id, now)
+
+    async def propose_case_judge(
+        self, guild_id: int | None, user_id: int, case_id: int, candidate_user_id: int, *, idempotency_key: str,
+    ) -> int:
+        return await self.propose_case_substitute(
+            guild_id, user_id, case_id, candidate_user_id, idempotency_key=idempotency_key, role="JUDGE",
+        )
+
+    async def propose_case_substitute(
+        self, guild_id: int | None, user_id: int, case_id: int, candidate_user_id: int, *,
+        idempotency_key: str, role: str,
+    ) -> int:
+        self._require_guild(guild_id)
+        _check_number(case_id, CourtCaseErrorReason.NOT_FOUND)
+        _check_request_key(idempotency_key)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            now = self._now()
+            case = await self._require_case(repository, case_id)
+            candidate = await self._eligible_citizen(repository, candidate_user_id) if is_discord_id(candidate_user_id) else None
+            if (
+                not await repository.has_active_office(actor.guild_id, actor.id, OfficeKind.PRESIDENT, now)
+                or candidate is None or candidate.id == actor.id
+            ):
+                raise CourtCaseError(CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED)
+            prior = await repository.find_substitute_request(case, actor.id, candidate.id, idempotency_key, role)
+            if prior is not None:
+                return prior
+            await self._check_substitute_candidate(repository, case, candidate.id, now, role)
+            return await repository.propose_substitute(case, actor.id, candidate.id, now, idempotency_key, role)
+
+    async def approve_case_judge(self, guild_id: int | None, user_id: int, proposal_id: int) -> bool:
+        return await self.approve_case_substitute(guild_id, user_id, proposal_id, role="JUDGE")
+
+    async def substitute_details(
+        self, guild_id: int | None, user_id: int, proposal_id: int, *, role: str,
+    ) -> tuple[int, int, int]:
+        self._require_guild(guild_id)
+        _check_number(proposal_id, CourtCaseErrorReason.NOT_FOUND)
+        if not is_discord_id(user_id):
+            raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+        async with self._unit_of_work() as repository:
+            actor = await self._eligible_citizen(repository, user_id)
+            if actor is None:
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+            proposal = await repository.get_substitute_proposal(actor.guild_id, proposal_id, role)
+            if proposal is None:
+                raise CourtCaseError(CourtCaseErrorReason.NOT_FOUND)
+            case_id, proposer_id, candidate_user_id, first_signer, second_signer = proposal
+            if actor.id != proposer_id and not await repository.has_active_office(
+                actor.guild_id, actor.id, OfficeKind.PARLIAMENT, self._now(),
+            ):
+                raise CitizenshipAccessError(AccessDeniedReason.NOT_ALLOWED)
+            return case_id, candidate_user_id, sum(signer is not None for signer in (first_signer, second_signer))
+
+    async def approve_case_substitute(
+        self, guild_id: int | None, user_id: int, proposal_id: int, *, role: str,
+    ) -> bool:
+        self._require_guild(guild_id)
+        _check_number(proposal_id, CourtCaseErrorReason.NOT_FOUND)
+        async with self._unit_of_work() as repository:
+            actor = await self._lock_for_actor(repository, user_id)
+            now = self._now()
+            proposal = await repository.get_substitute_proposal(actor.guild_id, proposal_id, role)
+            if proposal is None:
+                raise CourtCaseError(CourtCaseErrorReason.NOT_FOUND)
+            case_id, proposer_id, candidate_user_id, first_signer, second_signer = proposal
+            if actor.id in (first_signer, second_signer):
+                return second_signer is not None
+            candidate = await self._eligible_citizen(repository, candidate_user_id)
+            if (
+                candidate is None or actor.id in (proposer_id, candidate.id)
+                or not await repository.has_active_office(actor.guild_id, actor.id, OfficeKind.PARLIAMENT, now)
+                or not await repository.has_active_office(actor.guild_id, proposer_id, OfficeKind.PRESIDENT, now)
+            ):
+                raise CourtCaseError(CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED)
+            case = await self._require_case(repository, case_id)
+            await self._check_substitute_candidate(repository, case, candidate.id, now, role)
+            return await repository.sign_substitute(actor.guild_id, proposal_id, actor.id, now, role)
+
+    async def _check_substitute_candidate(
+        self, repository: CourtCaseRepository, case: CourtCase, candidate_id: int, now: datetime, role: str,
+    ) -> None:
+        if role == "JUDGE":
+            await self._check_case_judge_candidate(repository, case, candidate_id, now)
+            return
+        prosecutor = await repository.get_active_prosecutor(self._guild_id)
+        if (
+            role != "PROSECUTOR" or not (case.for_state or case.against_state) or prosecutor is None
+            or (
+                prosecutor.subject_citizen_id != case.respondent_citizen_id
+                and not await repository.is_recused(case, role, prosecutor.subject_citizen_id)
+            )
+            or candidate_id in (case.filer_citizen_id, case.respondent_citizen_id)
+            or await repository.is_recused(case, role, candidate_id)
+            or await repository.get_substitute(case.guild_id, case.id, role) is not None
+        ):
+            raise CourtCaseError(CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED)
+        judge = await repository.get_active_court_nomination(self._guild_id, now)
+        if (
+            (judge is not None and judge.candidate_citizen_id == candidate_id)
+            or await repository.get_substitute(case.guild_id, case.id) == candidate_id
+        ):
+            raise CourtCaseError(CourtCaseErrorReason.CONFLICT_OF_INTEREST)
+
+    async def _check_case_judge_candidate(
+        self, repository: CourtCaseRepository, case: CourtCase, candidate_id: int, now: datetime,
+    ) -> None:
+        incumbent = await repository.get_active_court_nomination(self._guild_id, now)
+        if (
+            incumbent is None
+            or case.administrative_outcome is not None or case.merits_outcome is not None
+            or await repository.get_substitute(case.guild_id, case.id) is not None
+            or not await self._has_judicial_conflict(repository, case, incumbent.candidate_citizen_id)
+        ):
+            raise CourtCaseError(CourtCaseErrorReason.SUBSTITUTE_NOT_ALLOWED)
+        if await self._has_judicial_conflict(repository, case, candidate_id):
+            raise CourtCaseError(CourtCaseErrorReason.CONFLICT_OF_INTEREST)
+
     async def _case_for_judge(
         self, repository: CourtCaseRepository, actor: Citizen, case_id: int, now: datetime,
     ) -> CourtCase:
-        judge = await repository.get_active_court_nomination(self._guild_id, now)
-        if judge is None or judge.candidate_citizen_id != actor.id:
-            raise CourtCaseError(CourtCaseErrorReason.JUDGE_REQUIRED)
         record = await self._require_case(repository, case_id)
-        if actor.id in (record.filer_citizen_id, record.respondent_citizen_id):
+        substitute_id = await repository.get_substitute(record.guild_id, case_id)
+        judge = await repository.get_active_court_nomination(self._guild_id, now)
+        authorized_id = substitute_id if substitute_id is not None else judge.candidate_citizen_id if judge else None
+        if actor.id != authorized_id:
+            raise CourtCaseError(CourtCaseErrorReason.JUDGE_REQUIRED)
+        if await self._has_judicial_conflict(repository, record, actor.id):
             raise CourtCaseError(CourtCaseErrorReason.CONFLICT_OF_INTEREST)
+        return record
+
+    async def _has_judicial_conflict(
+        self, repository: CourtCaseRepository, record: CourtCase, citizen_id: int,
+    ) -> bool:
+        if citizen_id in (record.filer_citizen_id, record.respondent_citizen_id) or await repository.is_recused(
+            record, "JUDGE", citizen_id,
+        ):
+            return True
         if record.kind is CaseKind.ADMINISTRATIVE and record.law_revision_id is not None:
             revision = await repository.get_law_revision(self._guild_id, record.law_revision_id)
-            if revision is not None and actor.id in (revision.proposer_citizen_id, revision.confirmed_by_citizen_id):
-                raise CourtCaseError(CourtCaseErrorReason.CONFLICT_OF_INTEREST)
+            if revision is not None and citizen_id in (revision.proposer_citizen_id, revision.confirmed_by_citizen_id):
+                return True
         if record.for_state or record.against_state:
-            prosecutor = await repository.get_active_prosecutor(self._guild_id)
-            if prosecutor is not None and prosecutor.subject_citizen_id == actor.id:
-                raise CourtCaseError(CourtCaseErrorReason.CONFLICT_OF_INTEREST)
-        return record
+            if await self._state_representative(repository, record) == citizen_id:
+                return True
+        return False
+
+    async def _state_representative(self, repository: CourtCaseRepository, case: CourtCase) -> int | None:
+        substitute = await repository.get_substitute(case.guild_id, case.id, "PROSECUTOR")
+        if substitute is not None:
+            return substitute
+        prosecutor = await repository.get_active_prosecutor(self._guild_id)
+        if (
+            prosecutor is not None and prosecutor.subject_citizen_id != case.respondent_citizen_id
+            and not await repository.is_recused(case, "PROSECUTOR", prosecutor.subject_citizen_id)
+        ):
+            return prosecutor.subject_citizen_id
+        return None
 
     async def _lock_for_actor(self, repository: CourtCaseRepository, user_id: int) -> Citizen:
         if not is_discord_id(user_id):
