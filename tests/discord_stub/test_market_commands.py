@@ -169,7 +169,18 @@ async def test_offer_publish_uses_discord_request_key_and_lists_offer(market_com
     )
     service.list_offers.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=1)
     assert "опубликовано" in private_reply(publish)
-    assert "Make a desk · 200 CP" in private_reply(browse)
+    browse.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    payload = browse.edit_original_response.await_args.kwargs
+    assert "Make a desk · 200 CP" in payload["embed"].description
+    select = payload["view"].offer
+    assert select.options[0].value == str(OFFER.id)
+    select._values = [str(OFFER.id)]
+    service.quote_order.return_value = QUOTE
+    click = interaction()
+    await select.callback(click)
+    service.quote_order.assert_awaited_once_with(GUILD_ID, BUYER_ID, OFFER.id, buyer_company_id=None)
+    assert OFFER.terms in click.edit_original_response.await_args.kwargs["content"]
+    service.fund_order.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -295,8 +306,16 @@ async def test_market_pages_pass_through_and_next_hint_preserves_dispute_filter(
 
     service.list_offers.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=2)
     service.list_orders.assert_awaited_once_with(GUILD_ID, ARBITER_ID, page=3, disputes_only=True)
-    assert "Актуальные предложения · Страница 2" in private_reply(offers)
-    assert "`/market list page:3`" in private_reply(offers)
+    payload = offers.edit_original_response.await_args.kwargs
+    assert "Актуальные предложения · Страница 2" in payload["embed"].title
+    service.list_offers.return_value = ()
+    click = interaction()
+    await payload["view"].forward.callback(click)
+    service.list_offers.assert_awaited_with(GUILD_ID, BUYER_ID, page=3)
+    empty_view = click.edit_original_response.await_args.kwargs["view"]
+    assert empty_view.forward.disabled and not empty_view.previous.disabled
+    await empty_view.previous.callback(interaction())
+    service.list_offers.assert_awaited_with(GUILD_ID, BUYER_ID, page=2)
     assert "Disputed orders · Page 3" in private_reply(disputes)
     assert "`/market order disputes_only:true page:4`" in private_reply(disputes)
 
@@ -311,7 +330,7 @@ async def test_market_empty_later_page_and_unprivileged_dispute_filter_are_priva
     await market.get_command("list").callback(empty, page=3)
     await market.get_command("order").callback(denied, disputes_only=True)
 
-    assert private_reply(empty) == "На странице 3 нет записей."
+    assert empty.edit_original_response.await_args.kwargs["embed"].description == "На странице 3 нет записей."
     assert private_reply(denied) == "Для этого действия нужны полномочия арбитра рынка."
     service.list_orders.assert_awaited_once_with(GUILD_ID, BUYER_ID, page=1, disputes_only=True)
 

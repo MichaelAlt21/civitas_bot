@@ -73,7 +73,14 @@ async def test_wallet_balance_is_private_and_uses_request_actor(wallet_commands)
 
     command.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
     service.balance.assert_awaited_once_with(GUILD_ID, SENDER_ID)
-    command.followup.send.assert_awaited_once_with("Your balance: 250 CP.", ephemeral=True)
+    payload = command.followup.send.await_args.kwargs
+    assert payload["ephemeral"] and payload["embed"].description == "**250 CP**"
+    assert payload["view"].history.label == "Transaction history"
+    click = interaction(locale=discord.Locale.german)
+    service.history.return_value = ()
+    await payload["view"].history.callback(click)
+    service.history.assert_awaited_once_with(GUILD_ID, SENDER_ID)
+    assert click.followup.send.await_args.kwargs["ephemeral"]
 
 
 @pytest.mark.asyncio

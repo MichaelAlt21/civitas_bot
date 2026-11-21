@@ -10,6 +10,7 @@ from discord import app_commands
 from civitas.app.citizens import CitizensService, CitizenshipAccessError
 from civitas.domain.ledger import LedgerError, LedgerErrorReason
 
+from .guide import show_guide
 from .localization import CommandTranslator, command_description, message
 from .wallet import add_wallet_commands
 
@@ -57,10 +58,12 @@ async def _register_citizen(service: CitizensService, interaction: discord.Inter
 
 
 class _RegistrationView(discord.ui.View):
-    def __init__(self, service: CitizensService, opening: discord.Interaction) -> None:
+    def __init__(self, service: CitizensService, opening: discord.Interaction, open_guide) -> None:
         super().__init__(timeout=120)
         self._service = service
         self._opening = opening
+        self._open_guide = open_guide
+        self.guide_button.label = message(opening.locale, "guide.title")
         self.register_button.label = message(opening.locale, "start.register_button")
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -72,6 +75,10 @@ class _RegistrationView(discord.ui.View):
     @discord.ui.button(style=discord.ButtonStyle.primary)
     async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await _register_citizen(self._service, interaction)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary)
+    async def guide_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._open_guide(interaction)
 
     async def on_timeout(self) -> None:
         try:
@@ -105,6 +112,8 @@ class CivitasBot(discord.Client):
         self.guild_scope = discord.Object(id=guild_id)
         self._citizens_service = citizens_service
         self.tree = app_commands.CommandTree(self)
+        self._command_ids: dict[str, int] = {}
+        self.guide_staff: dict[str, frozenset[int]] = {}
         self._add_citizen_commands(citizens_service, profile_service)
         if wallet_service is not None:
             add_wallet_commands(
@@ -116,7 +125,8 @@ class CivitasBot(discord.Client):
 
     async def setup_hook(self) -> None:
         await self.tree.set_translator(CommandTranslator())
-        await self.tree.sync(guild=self.guild_scope)
+        synced = await self.tree.sync(guild=self.guild_scope)
+        self._command_ids = {command.name: command.id for command in synced}
 
     async def on_raw_member_remove(self, payload: discord.RawMemberRemoveEvent) -> None:
         if not self.intents.members or payload.guild_id != self.guild_scope.id:
@@ -144,7 +154,7 @@ class CivitasBot(discord.Client):
                 return
             await interaction.edit_original_response(
                 content=message(interaction.locale, "start.welcome"),
-                view=_RegistrationView(service, interaction),
+                view=_RegistrationView(service, interaction, help_command.callback),
             )
 
         @citizen.command(name="register", description=command_description("register"))
@@ -187,17 +197,7 @@ class CivitasBot(discord.Client):
 
         @self.tree.command(name="help", description=command_description("help"), guild=self.guild_scope)
         async def help_command(interaction: discord.Interaction) -> None:
-            if interaction.guild_id != self.guild_scope.id:
-                await interaction.response.send_message(message(interaction.locale, "access.wrong_guild"), ephemeral=True)
-                return
-            visible = []
-            for command in self.tree.walk_commands(guild=self.guild_scope):
-                if isinstance(command, app_commands.Command) and command.name != "help":
-                    if not ({"admin", "staff", "commission"} & set(command.qualified_name.split())):
-                        visible.append(f"`/{command.qualified_name}`")
-            await interaction.response.send_message(
-                message(interaction.locale, "help.commands", commands=", ".join(visible)), ephemeral=True,
-            )
+            await show_guide(interaction, self.tree, self.guild_scope, self._command_ids, self.guide_staff)
 
         @self.tree.error
         async def report_error(

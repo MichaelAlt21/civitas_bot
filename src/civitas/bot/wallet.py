@@ -22,6 +22,17 @@ def _error_reply(
     return message(locale, f"wallet.error.{error.reason.value}")
 
 
+class _HistoryButton(discord.ui.View):
+    def __init__(self, locale, show_history):
+        super().__init__(timeout=600)
+        self.show_history = show_history
+        self.history.label = message(locale, "wallet.history.button")
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary)
+    async def history(self, interaction, button):
+        await self.show_history(interaction)
+
+
 def add_wallet_commands(
     tree: app_commands.CommandTree,
     *,
@@ -39,10 +50,13 @@ def add_wallet_commands(
         try:
             amount = await wallet_service.balance(interaction.guild_id, interaction.user.id)
         except _WALLET_ERRORS as error:
-            reply = _error_reply(locale, error)
-        else:
-            reply = message(locale, "wallet.balance", amount=f"{amount} {currency_symbol}")
-        await interaction.followup.send(reply, ephemeral=True)
+            await interaction.followup.send(_error_reply(locale, error), ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=message(locale, "wallet.balance.title"), description=f"**{amount} {currency_symbol}**",
+            colour=discord.Colour.teal(),
+        )
+        await interaction.followup.send(embed=embed, view=_HistoryButton(locale, history.callback), ephemeral=True)
 
     @wallet.command(name="history", description=command_description("wallet.history"))
     async def history(interaction: discord.Interaction) -> None:

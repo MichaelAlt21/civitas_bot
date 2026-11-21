@@ -62,6 +62,41 @@ async def _show_page(
     await _reply(interaction, *parts)
 
 
+class _OfferBrowser(discord.ui.View):
+    def __init__(self, interaction, offers, page, currency_symbol, show_page, preview):
+        super().__init__(timeout=600)
+        self.page = page
+        self.show_page = show_page
+        self.preview = preview
+        self.previous.label = message(interaction.locale, "guide.previous")
+        self.forward.label = message(interaction.locale, "guide.next")
+        self.previous.disabled = page == 1
+        self.forward.disabled = len(offers) < MARKET_PAGE_SIZE
+        if offers:
+            self.offer.placeholder = message(interaction.locale, "market.list.select")
+            self.offer.options = [
+                discord.SelectOption(
+                    label=" ".join(offer.title.split())[:50], value=str(offer.id),
+                    description=f"#{offer.id} · {offer.price} {currency_symbol}",
+                )
+                for offer in offers
+            ]
+        else:
+            self.remove_item(self.offer)
+
+    @discord.ui.select()
+    async def offer(self, interaction, select):
+        await self.preview(interaction, int(select.values[0]))
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, button):
+        await self.show_page(interaction, self.page - 1, update=True)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary)
+    async def forward(self, interaction, button):
+        await self.show_page(interaction, self.page + 1, update=True)
+
+
 def _text(value: str) -> str:
     return discord.utils.escape_markdown(value)
 
@@ -196,24 +231,34 @@ def add_market_commands(
     @market.command(name="list", description=command_description("market.list"))
     @app_commands.describe(page=command_description("market.page"))
     async def list_offers(interaction: discord.Interaction, page: app_commands.Range[int, 1] = 1) -> None:
+        await show_offers(interaction, page)
+
+    async def show_offers(interaction, page, *, update=False):
         locale = interaction.locale
-        async with _market_response(interaction):
+        # A component update edits the catalogue. A new slash command opens it privately.
+        if update:
+            await interaction.response.defer()
+        else:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
             offers = await market_service.list_offers(interaction.guild_id, interaction.user.id, page=page)
-            await _show_page(
-                interaction,
-                page=page,
-                command="/market list",
-                title_key="market.list.title",
-                empty_key="market.list.empty",
-                rows=[message(
-                    locale,
-                    "market.list.row",
-                    id=str(offer.id),
-                    title=_label(offer.title),
-                    price=f"{offer.price} {currency_symbol}",
-                    seller=str(offer.company_id),
-                ) for offer in offers],
-            )
+        except _MARKET_ERRORS as error:
+            await _reply(interaction, _error_reply(locale, error))
+            return
+        rows = [message(
+            locale, "market.list.row", id=str(offer.id), title=_label(offer.title),
+            price=f"{offer.price} {currency_symbol}", seller=str(offer.company_id),
+        ) for offer in offers]
+        empty = "market.list.empty" if page == 1 else "market.page.empty"
+        embed = discord.Embed(
+            title=message(locale, "market.page.title", title=message(locale, "market.list.title"), page=str(page)),
+            description="\n".join(rows) or message(locale, empty, page=str(page)),
+            colour=discord.Colour.teal(),
+        )
+        view = None
+        if offers or page > 1:
+            view = _OfferBrowser(interaction, offers, page, currency_symbol, show_offers, buy.callback)
+        await interaction.edit_original_response(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
 
     @market.command(name="offer", description=command_description("market.offer"))
     @app_commands.describe(

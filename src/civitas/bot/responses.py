@@ -6,6 +6,15 @@ _NO_MENTIONS = discord.AllowedMentions.none()
 _MESSAGE_LIMIT = 2000
 
 
+def proportion_bar(value: int, total: int) -> str:
+    """Render a ten-cell scale and its percentage using integer arithmetic."""
+    if total <= 0:
+        return "—"
+    percent = value * 100 // total
+    filled = min(10, (20 * value + total) // (2 * total))
+    return f"{'▰' * filled}{'▱' * (10 - filled)}  {percent}%"
+
+
 async def send_private_lines(interaction: discord.Interaction, *parts: str) -> None:
     await send_lines(interaction, *parts, ephemeral=True)
 

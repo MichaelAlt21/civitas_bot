@@ -1,11 +1,13 @@
 from datetime import UTC
 from unittest.mock import AsyncMock
 
+import discord
 import pytest
 from sqlalchemy import func, select
 
 from civitas import __main__ as entrypoint
 from civitas.bot.client import CivitasBot
+from civitas.bot.guide import CommandGuide
 from civitas.config import GovernmentSettings, JobsSettings, MarketSettings, Settings, TreasurySettings, WalletSettings
 from civitas.domain.ledger import TransactionKind
 from civitas.infrastructure.db.admission_models import AdmittedUserRow
@@ -88,6 +90,21 @@ async def test_bot_bootstrap_wires_enabled_modules_without_discord(pg_engine, mo
         asset_commands = {command.name for command in assets.commands}
         resale_commands = {"sell", "resale", "resale_buy", "resale_cancel"}
         assert asset_commands & resale_commands == (resale_commands if asset_resale_tax_bp is not None else set())
+        commands = [cmd for cmd in bot.tree.walk_commands(guild=bot.guild_scope)
+                    if isinstance(cmd, discord.app_commands.Command)]
+        command_ids = {name: 100000000000000001 for name in command_names}
+        guide = CommandGuide(commands, command_ids, discord.Locale.russian, {"election commission"})
+        assert any("/election commission open:" in row for row in guide.sections["staff"])
+        assert all("/admin " not in row for row in guide.sections["staff"])
+        assert len(guide.sections["court"]) > 8
+        for section, rows in guide.sections.items():
+            guide.section = section
+            for page in range((len(rows) + 7) // 8):
+                guide.page = page
+                embed = guide.render()
+                assert all(len(field.value) <= 1024 for field in embed.fields)
+                assert guide.previous.disabled == (page == 0)
+                assert guide.forward.disabled == ((page + 1) * 8 >= len(rows))
         assert not bot.tree.get_commands()
 
     monkeypatch.setattr(entrypoint, "create_db_engine", lambda _url: pg_engine)

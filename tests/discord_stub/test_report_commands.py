@@ -62,11 +62,30 @@ async def test_treasury_report_is_public_and_aggregated(locale, title, label, re
     sent = interaction.followup.send.await_args.kwargs
     assert not sent.get("ephemeral", False)
     assert sent["embed"].title == title
-    assert f"{label} · 20 ₵" in sent["embed"].description
-    assert f"{resale_label} · 4 ₵" in sent["embed"].description
-    assert f"{fine_label} · 35 ₵" in sent["embed"].description
-    assert "SECRET" not in sent["embed"].description
+    body = "\n".join(field.value for field in sent["embed"].fields)
+    assert "7%" in body
+    assert f"{label} · 20 ₵" in body
+    assert f"{resale_label} · 4 ₵" in body
+    assert f"{fine_label} · 35 ₵" in body
+    assert "SECRET" not in body
     assert sent["allowed_mentions"].to_dict() == {"parse": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [None, 0])
+async def test_report_without_positive_budget_has_no_percentage(limit):
+    report = _sample_report()
+    report.budget_limit = limit
+    report.budget_articles = ()
+    command = _report_command(SimpleNamespace(get_report=AsyncMock(return_value=report)), has_existing_treasury=False)
+    interaction = SimpleNamespace(
+        guild_id=GUILD_ID, locale=discord.Locale.american_english,
+        response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()),
+    )
+    await command.callback(interaction)
+    fields = interaction.followup.send.await_args.kwargs["embed"].fields
+    assert not any("%" in field.value for field in fields)
+    assert any("Weekly budget cap" in field.name for field in fields) == (limit == 0)
 
 
 @pytest.mark.asyncio
@@ -100,8 +119,9 @@ async def test_weekly_delivery_uses_bilingual_aggregates_and_reuses_nonce_after_
     first, second = [call.kwargs for call in channel.send.await_args_list]
     assert first["nonce"] == second["nonce"] and len(first["nonce"]) <= 25
     assert second["embed"].title == "Отчёт казны / Treasury report"
-    assert "Налог с продаж / Sales tax · 20 ₵" in second["embed"].description
-    assert "SECRET" not in second["embed"].description
+    body = "\n".join(field.value for field in second["embed"].fields)
+    assert "Налог с продаж / Sales tax · 20 ₵" in body
+    assert "SECRET" not in body
 
 
 @pytest.mark.asyncio

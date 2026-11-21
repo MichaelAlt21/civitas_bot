@@ -14,6 +14,8 @@ from discord import app_commands
 
 from .localization import command_description, message
 
+from .responses import proportion_bar
+
 if TYPE_CHECKING:
     from civitas.app.reports import ReportService
     from civitas.domain.reports import ReportDelivery, TreasuryReport
@@ -37,42 +39,39 @@ def _report_embed(
 
     starts_at = discord.utils.format_dt(report.window.starts_at, style="f")
     as_of = discord.utils.format_dt(report.as_of, style="f")
-    lines = [
-        f"{starts_at} → {as_of}",
-        "",
-        money_line("opening", report.opening_balance),
-        money_line("closing", report.closing_balance),
-        money_line("available", report.available_cash),
-        money_line("reserved", report.cash_reserved),
+    embed = discord.Embed(title=label("title"), description=f"{starts_at} → {as_of}", colour=discord.Colour.teal())
+    embed.add_field(name=label("cash"), inline=False, value="\n".join((
+        money_line("opening", report.opening_balance), money_line("closing", report.closing_balance),
+        money_line("available", report.available_cash), money_line("reserved", report.cash_reserved),
         money_line("escrow", report.open_escrow),
-        "",
-        f"**{money_line('income', report.total_income)}**",
-        money_line("fees", report.company_fees),
-        money_line("tax", report.sales_tax),
-        money_line("assets", report.asset_sales),
-        money_line("asset_resale_tax", report.asset_resale_tax),
-        money_line("court_fines", report.court_fines),
-        money_line("treasury_issuance", report.treasury_issuance),
+    )))
+    embed.add_field(name=money_line("income", report.total_income), value="\n".join((
+        money_line("fees", report.company_fees), money_line("tax", report.sales_tax),
+        money_line("assets", report.asset_sales), money_line("asset_resale_tax", report.asset_resale_tax),
+        money_line("court_fines", report.court_fines), money_line("treasury_issuance", report.treasury_issuance),
         money_line("other_income", report.other_income),
-        f"**{money_line('expenses', report.total_expenses)}**",
-        money_line("npc", report.npc_payouts),
-        money_line("contracts", report.contract_payouts),
+    )))
+    embed.add_field(name=money_line("expenses", report.total_expenses), value="\n".join((
+        money_line("npc", report.npc_payouts), money_line("contracts", report.contract_payouts),
         money_line("other_expenses", report.other_expenses),
-        "",
-        money_line("total_issued", report.total_issued),
-        money_line("starter_grants", report.starter_grants),
-        f"{label('transactions')} · {report.transaction_count}",
-        f"{label('orders')} · {report.settled_orders}",
-        f"{label('asset_count')} · {report.asset_purchases}",
-    ]
+    )))
     if report.budget_limit is not None:
-        lines.extend(("", f"**{money_line('budget', report.budget_limit)}**", label("budget_columns")))
+        committed = sum(article.spent + article.reserved for article in report.budget_articles)
+        lines = [money_line("committed", committed)]
+        if report.budget_limit > 0:
+            lines.append(proportion_bar(committed, report.budget_limit))
+        if report.budget_articles:
+            lines.append(label("budget_columns"))
         for article in report.budget_articles:
-            key = {
-                "npc_work": "npc", "state_contracts": "contracts",
-            }.get(article.code, "budget_other")
+            key = {"npc_work": "npc", "state_contracts": "contracts"}.get(article.code, "budget_other")
             lines.append(f"{label(key)} · {article.cap} / {article.spent} / {article.reserved} {currency_symbol}")
-    return discord.Embed(title=label("title"), description="\n".join(lines))
+        embed.add_field(name=money_line("budget", report.budget_limit), value="\n".join(lines), inline=False)
+    embed.add_field(name=label("activity"), inline=False, value="\n".join((
+        money_line("total_issued", report.total_issued), money_line("starter_grants", report.starter_grants),
+        f"{label('transactions')} · {report.transaction_count}", f"{label('orders')} · {report.settled_orders}",
+        f"{label('asset_count')} · {report.asset_purchases}",
+    )))
+    return embed
 
 
 def add_report_commands(

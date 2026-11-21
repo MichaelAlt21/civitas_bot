@@ -14,7 +14,7 @@ from civitas.app.government import GovernmentError, GovernmentErrorReason, Gover
 from civitas.domain.government import CrisisResolution, Election, ElectionCancellation, Impeachment, OfficeKind, OfficeTerm
 
 from .localization import command_description, message
-from .responses import send_lines, send_private_lines
+from .responses import proportion_bar, send_lines, send_private_lines
 from .roles import safe_assignable_role, set_member_role
 
 logger = logging.getLogger(__name__)
@@ -132,7 +132,11 @@ def _election_details(locale: discord.Locale, election: Election) -> list[str]:
             message(locale, "election.detail.participants", count=str(protocol.participants)),
             message(locale, "election.detail.tally"),
         ))
-        rows.extend(f"<@{tally.candidate_discord_user_id}> · {tally.votes}" for tally in protocol.tallies)
+        for tally in sorted(protocol.tallies, key=lambda item: -item.votes):
+            share = proportion_bar(tally.votes, protocol.participants)
+            rows.append(f"<@{tally.candidate_discord_user_id}> · {tally.votes} · {share}")
+        abstentions = protocol.participants - sum(tally.votes for tally in protocol.tallies)
+        rows.append(message(locale, "election.detail.abstained", count=str(abstentions)))
         winners = set(protocol.winners)
         if winners and election.certified_at is not None:
             rows.append(message(locale, "election.detail.winners"))

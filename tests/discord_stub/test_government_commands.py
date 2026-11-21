@@ -304,9 +304,25 @@ async def test_public_results_use_certified_service_and_hide_audit_metadata(comm
     result = reply(command, private=False)
     assert f"<{SOURCE}>" in result
     assert f"<@{CANDIDATE}> · 2" in result
+    assert "100%" in result and "Воздержались: 0" in result
     assert "Избраны" in result
     assert OPEN.reason not in result
     assert PROTOCOL.reason not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("participants", "votes", "display", "abstained"), [
+    (3, 2, "66%", 1), (0, 0, "—", 0),
+])
+async def test_tally_shares_use_every_participant(commands, participants, votes, display, abstained):
+    service, _, _, election, _ = commands
+    protocol = replace(PROTOCOL, participants=participants, tallies=(CandidateTally(2, votes, CANDIDATE),))
+    service.get_public_result.return_value = replace(CERTIFIED, protocol=protocol)
+    command = interaction(locale=discord.Locale.american_english)
+    await election.get_command("results").callback(command, CERTIFIED.id)
+    body = reply(command, private=False)
+    assert display in body
+    assert f"Abstained: {abstained}" in body
 
 
 @pytest.mark.asyncio

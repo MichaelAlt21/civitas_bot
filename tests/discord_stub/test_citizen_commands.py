@@ -26,6 +26,7 @@ def fake_interaction(guild_id=GUILD_ID, user_id=USER_ID, locale=discord.Locale.r
         guild_id=guild_id,
         locale=locale,
         user=SimpleNamespace(id=user_id),
+        permissions=discord.Permissions.none(),
         response=SimpleNamespace(
             send_message=AsyncMock(),
             defer=AsyncMock(),
@@ -272,10 +273,32 @@ async def test_help_lists_guild_commands_in_interaction_language():
     await get_command(bot, "help").callback(interaction)
 
     response = interaction.response.send_message.await_args
-    assert response.kwargs == {"ephemeral": True}
-    assert "Команды Civitas" in response.args[0]
-    assert "`/citizen register`" in response.args[0]
-    assert "/wallet" not in response.args[0]
+    assert response.kwargs["ephemeral"]
+    embed = response.kwargs["embed"]
+    assert embed.title == "Справочник команд"
+    assert "Оформить гражданство" in embed.fields[0].value
+    assert "`/citizen register`" in embed.fields[0].value
+    assert [option.value for option in response.kwargs["view"].choose.options] == ["citizen"]
+
+
+@pytest.mark.asyncio
+async def test_start_guide_opens_registered_command_mentions_and_changes_section(monkeypatch):
+    bot = create_bot(citizens_service=Mock(spec=CitizensService), guild_id=GUILD_ID, wallet_service=Mock())
+    sync = AsyncMock(return_value=[SimpleNamespace(name="wallet", id=123456789)])
+    monkeypatch.setattr(bot.tree, "sync", sync)
+    await bot.setup_hook()
+    interaction = fake_interaction(locale=discord.Locale.american_english)
+    await get_command(bot, "start").callback(interaction)
+    start_view = interaction.edit_original_response.await_args.kwargs["view"]
+    await start_view.guide_button.callback(interaction)
+    guide = interaction.response.send_message.await_args.kwargs["view"]
+    guide.choose._values = ["wallet"]
+    interaction.response.edit_message = AsyncMock()
+    await guide.choose.callback(interaction)
+    embed = interaction.response.edit_message.await_args.kwargs["embed"]
+    assert embed.title == "Command guide"
+    assert "</wallet balance:123456789>" in embed.fields[0].value
+    assert guide.previous.disabled and guide.forward.disabled
 
 
 @pytest.mark.asyncio

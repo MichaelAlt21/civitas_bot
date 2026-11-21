@@ -123,6 +123,13 @@ async def run_bot(settings: Settings) -> None:
             profile_service=ProfileService(unit_of_work, authorize=service.authorize),
             track_membership=settings.track_membership,
         )
+        bot.guide_staff = {
+            "admin audit": settings.technical_operator_ids,
+            "admin maintenance": settings.technical_operator_ids,
+            "jobs staff": settings.jobs.reviewer_ids if settings.jobs else frozenset(),
+            "assets staff": settings.asset_issuer_ids,
+            "election commission": settings.government.commissioner_ids if settings.government else frozenset(),
+        }
         maintenance = audit = None
         if settings.technical_operator_ids:
             operator_policy = AdminOperatorPolicy(
